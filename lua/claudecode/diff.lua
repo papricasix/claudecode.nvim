@@ -41,9 +41,10 @@ end
 
 ---Find a suitable main editor window to open diffs in.
 ---Excludes terminals, sidebars, and floating windows.
+---@param windows number[]? List of window IDs to search; defaults to all windows
 ---@return number? win_id Window ID of the main editor window, or nil if not found
-local function find_main_editor_window()
-  local windows = vim.api.nvim_list_wins()
+local function find_main_editor_window(windows)
+  windows = windows or vim.api.nvim_list_wins()
 
   for _, win in ipairs(windows) do
     local buf = vim.api.nvim_win_get_buf(win)
@@ -119,6 +120,32 @@ local function find_claudecode_terminal_window()
   end
 
   return floating_fallback
+end
+
+---Find the main editor window in the same tab as the Claude Code terminal.
+---Falls back to a global search when no terminal is visible or it is floating.
+---@return number? win_id Window ID, or nil if not found
+local function find_window_adjacent_to_terminal()
+  local terminal_win = find_claudecode_terminal_window()
+  if terminal_win then
+    local wc = vim.api.nvim_win_get_config(terminal_win)
+    local is_floating = wc.relative and wc.relative ~= ""
+    if not is_floating then
+      -- Search only within the terminal's tab to avoid switching tabs
+      local tab_wins = vim.api.nvim_tabpage_list_wins(vim.api.nvim_win_get_tabpage(terminal_win))
+      local candidates = {}
+      for _, w in ipairs(tab_wins) do
+        if w ~= terminal_win then
+          candidates[#candidates + 1] = w
+        end
+      end
+      local win = find_main_editor_window(candidates)
+      if win then
+        return win
+      end
+    end
+  end
+  return find_main_editor_window()
 end
 
 ---Create a split based on configured layout
@@ -479,8 +506,9 @@ end
 ---@param old_file_path string
 ---@param is_new_file boolean
 ---@param terminal_win_in_new_tab NvimWin|nil
+---@param force_reuse boolean? Always reuse the target window (pre-diff buffer saved by caller)
 ---@return DiffWindowChoice
-local function choose_original_window(target_win, old_file_path, is_new_file, terminal_win_in_new_tab)
+local function choose_original_window(target_win, old_file_path, is_new_file, terminal_win_in_new_tab, force_reuse)
   local in_new_tab = terminal_win_in_new_tab ~= nil
   local current_buf = vim.api.nvim_win_get_buf(target_win)
   local current_buf_path = vim.api.nvim_buf_get_name(current_buf)
@@ -493,6 +521,12 @@ local function choose_original_window(target_win, old_file_path, is_new_file, te
       reused_buf = current_buf,
       in_new_tab = true,
     }
+  end
+
+  -- Always reuse the target window so the diff opens in-place next to the terminal.
+  -- The caller is responsible for saving pre_diff_buffer and restoring it on cleanup.
+  if force_reuse then
+    return { decision = "reuse", original_win = target_win, reused_buf = nil, in_new_tab = false }
   end
 
   if is_new_file then
@@ -906,6 +940,7 @@ end
 ---@param is_new_file boolean Whether this is a new file (doesn't exist yet)
 ---@param terminal_win_in_new_tab NvimWin|nil Terminal window in new tab if created
 ---@param existing_buffer NvimBuf|nil Existing buffer for the file if already loaded
+---@param force_reuse boolean? Always reuse target_window instead of splitting
 ---@return DiffLayoutInfo layout Info about the created diff layout
 function M._create_diff_view_from_window(
   target_window,
@@ -914,7 +949,8 @@ function M._create_diff_view_from_window(
   tab_name,
   is_new_file,
   terminal_win_in_new_tab,
-  existing_buffer
+  existing_buffer,
+  force_reuse
 )
   local original_buffer_created_by_plugin = false
   local target_window_created_by_plugin = false
@@ -944,7 +980,7 @@ function M._create_diff_view_from_window(
   end
 
   -- Decide window placement for the original file
-  local choice = choose_original_window(target_window, old_file_path, is_new_file, terminal_win_in_new_tab)
+  local choice = choose_original_window(target_window, old_file_path, is_new_file, terminal_win_in_new_tab, force_reuse)
 
   local original_window
   if choice.decision == "split" then
@@ -1068,6 +1104,18 @@ function M._cleanup_diff_state(tab_name, reason)
       end
     end
 
+    -- Restore the buffer that was in the target window before the diff opened
+    if
+      not diff_data.target_window_created_by_plugin
+      and diff_data.target_window
+      and vim.api.nvim_win_is_valid(diff_data.target_window)
+      and diff_data.pre_diff_buffer
+      and vim.api.nvim_buf_is_valid(diff_data.pre_diff_buffer)
+      and diff_data.pre_diff_buffer ~= vim.api.nvim_win_get_buf(diff_data.target_window)
+    then
+      pcall(vim.api.nvim_win_set_buf, diff_data.target_window, diff_data.pre_diff_buffer)
+    end
+
     -- After closing the diff in the same tab, restore terminal width if visible.
     -- (We intentionally do not resize floating terminals.)
     local terminal_win = find_claudecode_terminal_window()
@@ -1162,6 +1210,16 @@ function M._setup_blocking_diff(params, resolution_callback)
 
     -- Only look for existing windows if we're NOT in a new tab
     if not created_new_tab then
+      -- Determine the preferred tab (the terminal's tab) to avoid switching tabs
+      local preferred_tab = vim.api.nvim_get_current_tabpage()
+      local _term_win = find_claudecode_terminal_window()
+      if _term_win then
+        local _twc = vim.api.nvim_win_get_config(_term_win)
+        if not (_twc.relative and _twc.relative ~= "") then
+          preferred_tab = vim.api.nvim_win_get_tabpage(_term_win)
+        end
+      end
+
       if old_file_exists then
         for _, buf in ipairs(vim.api.nvim_list_bufs()) do
           if vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_buf_is_loaded(buf) then
@@ -1174,7 +1232,8 @@ function M._setup_blocking_diff(params, resolution_callback)
         end
 
         if existing_buffer then
-          for _, win in ipairs(vim.api.nvim_list_wins()) do
+          -- Only use a window in the preferred tab to avoid switching tabs
+          for _, win in ipairs(vim.api.nvim_tabpage_list_wins(preferred_tab)) do
             if vim.api.nvim_win_get_buf(win) == existing_buffer then
               target_window = win
               break
@@ -1184,7 +1243,7 @@ function M._setup_blocking_diff(params, resolution_callback)
       end
 
       if not target_window then
-        target_window = find_main_editor_window()
+        target_window = find_window_adjacent_to_terminal()
       end
     end
     -- If created_new_tab is true, target_window stays nil and will be created in the new tab
@@ -1218,6 +1277,12 @@ function M._setup_blocking_diff(params, resolution_callback)
     vim.api.nvim_buf_set_option(new_buffer, "buftype", "acwrite") -- Allows saving but stays as scratch-like
     vim.api.nvim_buf_set_option(new_buffer, "modifiable", true)
 
+    -- Save the buffer currently in the target window so we can restore it after the diff closes
+    local pre_diff_buffer = nil
+    if not created_new_tab and target_window and vim.api.nvim_win_is_valid(target_window) then
+      pre_diff_buffer = vim.api.nvim_win_get_buf(target_window)
+    end
+
     local diff_info = M._create_diff_view_from_window(
       target_window,
       params.old_file_path,
@@ -1225,7 +1290,8 @@ function M._setup_blocking_diff(params, resolution_callback)
       tab_name,
       is_new_file,
       terminal_win_in_new_tab,
-      existing_buffer
+      existing_buffer,
+      not created_new_tab -- force_reuse: always reuse window in same-tab mode
     )
 
     local autocmd_ids = register_diff_autocmds(tab_name, new_buffer)
@@ -1243,6 +1309,7 @@ function M._setup_blocking_diff(params, resolution_callback)
       new_window = diff_info.new_window,
       target_window = diff_info.target_window,
       target_window_created_by_plugin = diff_info.target_window_created_by_plugin,
+      pre_diff_buffer = pre_diff_buffer,
       original_buffer = diff_info.original_buffer,
       original_buffer_created_by_plugin = diff_info.original_buffer_created_by_plugin,
       original_cursor_pos = original_cursor_pos,
