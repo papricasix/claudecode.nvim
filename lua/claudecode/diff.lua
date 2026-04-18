@@ -1116,7 +1116,7 @@ function M._cleanup_diff_state(tab_name, reason)
       pcall(vim.api.nvim_win_set_buf, diff_data.target_window, diff_data.pre_diff_buffer)
     end
 
-    -- After closing the diff in the same tab, restore terminal width if visible.
+    -- After closing the diff in the same tab, restore terminal width and focus.
     -- (We intentionally do not resize floating terminals.)
     local terminal_win = find_claudecode_terminal_window()
     if terminal_win and vim.api.nvim_win_is_valid(terminal_win) then
@@ -1130,6 +1130,15 @@ function M._cleanup_diff_state(tab_name, reason)
         local terminal_width = math.floor(total_width * split_width)
         pcall(vim.api.nvim_win_set_width, terminal_win, terminal_width)
       end
+
+      vim.schedule(function()
+        if vim.api.nvim_win_is_valid(terminal_win) then
+          vim.api.nvim_set_current_win(terminal_win)
+          if vim.bo.buftype == "terminal" then
+            vim.cmd("startinsert")
+          end
+        end
+      end)
     end
   end
 
