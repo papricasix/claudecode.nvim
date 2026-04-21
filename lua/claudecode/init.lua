@@ -384,6 +384,11 @@ function M.setup(opts)
     desc = "Automatically stop Claude Code integration when exiting Neovim",
   })
 
+  vim.keymap.set("n", "<leader>aF", "<cmd>ClaudeCodeToggleFileTracking<cr>", {
+    desc = "Toggle Claude Code file tracking",
+    silent = true,
+  })
+
   M.state.initialized = true
   return M
 end
@@ -520,6 +525,30 @@ function M.stop()
   logger.info("init", "Claude Code integration stopped")
 
   return true
+end
+
+---Toggle automatic file/selection tracking at runtime.
+---@return boolean tracking Whether tracking is now enabled
+function M.toggle_file_tracking()
+  if not M.state.config then
+    logger.warn("init", "ClaudeCodeToggleFileTracking: plugin not initialized")
+    return false
+  end
+
+  local selection = require("claudecode.selection")
+  local enabled = not M.state.config.track_selection
+  M.state.config.track_selection = enabled
+
+  if M.state.server then
+    if enabled then
+      selection.enable(M.state.server, M.state.config.visual_demotion_delay_ms)
+    else
+      selection.disable()
+    end
+  end
+
+  logger.info("init", "File tracking " .. (enabled and "enabled" or "disabled"))
+  return enabled
 end
 
 ---Set up user commands
@@ -1048,6 +1077,12 @@ function M._create_commands()
   end, {
     nargs = "*",
     desc = "Select and open Claude terminal with chosen model and optional arguments",
+  })
+
+  vim.api.nvim_create_user_command("ClaudeCodeToggleFileTracking", function()
+    M.toggle_file_tracking()
+  end, {
+    desc = "Toggle automatic file/selection tracking sent to Claude Code",
   })
 end
 
