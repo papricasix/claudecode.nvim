@@ -685,6 +685,10 @@ end
 ---@param tab_name string Name for the diff tab/view
 ---@return table res Result with provider, tab_name, and success status
 function M._open_native_diff(old_file_path, new_file_path, new_file_contents, tab_name)
+  local _target_tab = _G._claudecode_active_tab_id
+  if _target_tab and vim.api.nvim_tabpage_is_valid(_target_tab) then
+    vim.api.nvim_set_current_tabpage(_target_tab)
+  end
   local new_filename = vim.fn.fnamemodify(new_file_path, ":t") .. ".new"
   local tmp_file, err = create_temp_file(new_file_contents, new_filename)
   if not tmp_file then
@@ -1181,6 +1185,11 @@ function M._setup_blocking_diff(params, resolution_callback)
 
   -- Wrap the setup in error handling to ensure cleanup on failure
   local setup_success, setup_error = pcall(function()
+    local _target_tab = _G._claudecode_active_tab_id
+    if _target_tab and vim.api.nvim_tabpage_is_valid(_target_tab) then
+      vim.api.nvim_set_current_tabpage(_target_tab)
+    end
+
     local old_file_exists = vim.fn.filereadable(params.old_file_path) == 1
     local is_new_file = not old_file_exists
 

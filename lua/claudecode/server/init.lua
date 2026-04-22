@@ -105,6 +105,7 @@ local function create_instance(tab_id)
 
     local callbacks = {
       on_message = function(client, message)
+        _G._claudecode_active_tab_id = state.tab_id
         inst._handle_message(client, message)
       end,
       on_connect = function(client)
