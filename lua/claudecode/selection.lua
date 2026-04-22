@@ -19,15 +19,14 @@ M.state = {
 }
 
 ---Enables selection tracking.
----@param server table The server object to use for communication.
+---@param _server any Ignored; server is looked up dynamically per tab.
 ---@param visual_demotion_delay_ms number The delay for visual selection demotion.
-function M.enable(server, visual_demotion_delay_ms)
+function M.enable(_server, visual_demotion_delay_ms)
   if M.state.tracking_enabled then
     return
   end
 
   M.state.tracking_enabled = true
-  M.server = server
   M.state.visual_demotion_delay_ms = visual_demotion_delay_ms
 
   M._create_autocommands()
@@ -47,7 +46,6 @@ function M.disable()
 
   M.state.latest_selection = nil
   M.state.last_active_visual_selection = nil
-  M.server = nil
 
   M._cancel_debounce_timer()
   M._cancel_demotion_timer()
@@ -282,9 +280,7 @@ function M.update_selection()
 
   if changed then
     M.state.latest_selection = current_selection
-    if M.server then
-      M.send_selection_update(current_selection)
-    end
+    M.send_selection_update(current_selection)
   end
 end
 
@@ -338,9 +334,7 @@ function M.handle_selection_demotion(original_bufnr_when_scheduled)
     -- Check if this new cursor position is actually different from the (visual) latest_selection
     if M.has_selection_changed(new_sel_for_demotion) then
       M.state.latest_selection = new_sel_for_demotion
-      if M.server then
-        M.send_selection_update(M.state.latest_selection)
-      end
+      M.send_selection_update(M.state.latest_selection)
     end
     -- No change detected in selection
   end
@@ -587,10 +581,14 @@ function M.has_selection_changed(new_selection)
   return false
 end
 
----Sends the selection update to the Claude server.
+---Sends the selection update to the current tab's Claude server.
 ---@param selection table The selection object to send.
 function M.send_selection_update(selection)
-  M.server.broadcast("selection_changed", selection)
+  local claudecode_main = require("claudecode")
+  local inst = claudecode_main.get_instance()
+  if inst and inst.server then
+    inst.server.broadcast("selection_changed", selection)
+  end
 end
 
 ---Gets the latest recorded selection.
@@ -603,7 +601,9 @@ end
 ---This function is typically invoked by a user command. It forces an immediate
 ---update and sends the latest selection.
 function M.send_current_selection()
-  if not M.state.tracking_enabled or not M.server then
+  local claudecode_main = require("claudecode")
+  local inst = claudecode_main.get_instance()
+  if not M.state.tracking_enabled or not (inst and inst.server) then
     logger.error("selection", "Claude Code is not running")
     return
   end
@@ -685,7 +685,8 @@ function M.send_at_mention_for_visual_selection(line1, line2)
 
   -- Check if Claude Code integration is running (server may or may not have clients)
   local claudecode_main = require("claudecode")
-  if not claudecode_main.state.server then
+  local inst = claudecode_main.get_instance()
+  if not inst or not inst.server then
     logger.error("selection", "Claude Code integration is not running.")
     return false
   end

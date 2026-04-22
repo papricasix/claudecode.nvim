@@ -4,7 +4,7 @@
 
 local M = {}
 
-local claudecode_server_module = require("claudecode.server.init")
+local claudecode_main = require("claudecode")
 
 ---@type ClaudeCodeTerminalConfig
 local defaults = {
@@ -306,7 +306,7 @@ local function get_claude_command_and_env(cmd_args)
     cmd_string = base_cmd
   end
 
-  local sse_port_value = claudecode_server_module.state.port
+  local sse_port_value = claudecode_main.get_instance().port
   local env_table = {
     ENABLE_IDE_INTEGRATION = "true",
     FORCE_CODE_TERMINAL = "true",

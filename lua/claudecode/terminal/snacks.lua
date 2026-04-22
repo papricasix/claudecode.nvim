@@ -5,28 +5,39 @@ local M = {}
 
 local snacks_available, Snacks = pcall(require, "snacks")
 local utils = require("claudecode.utils")
-local terminal = nil
+
+-- Per-tab terminal instances: [tabpage_id] = snacks terminal instance
+local instances = {}
+
+local function get_terminal(tab_id)
+  tab_id = tab_id or vim.api.nvim_get_current_tabpage()
+  return instances[tab_id]
+end
+
+local function set_terminal(tab_id, term)
+  tab_id = tab_id or vim.api.nvim_get_current_tabpage()
+  instances[tab_id] = term
+end
 
 --- @return boolean
 local function is_available()
   return snacks_available and Snacks and Snacks.terminal ~= nil
 end
 
----Setup event handlers for terminal instance
+---Setup event handlers for terminal instance.
 ---@param term_instance table The Snacks terminal instance
 ---@param config table Configuration options
-local function setup_terminal_events(term_instance, config)
+---@param registered_tab number The tabpage this terminal belongs to
+local function setup_terminal_events(term_instance, config, registered_tab)
   local logger = require("claudecode.logger")
 
-  -- Handle command completion/exit - only if auto_close is enabled
   if config.auto_close then
     term_instance:on("TermClose", function()
       if vim.v.event.status ~= 0 then
         logger.error("terminal", "Claude exited with code " .. vim.v.event.status .. ".\nCheck for any errors.")
       end
 
-      -- Clean up
-      terminal = nil
+      set_terminal(registered_tab, nil)
       vim.schedule(function()
         term_instance:close({ buf = true })
         vim.cmd.checktime()
@@ -34,18 +45,17 @@ local function setup_terminal_events(term_instance, config)
     end, { buf = true })
   end
 
-  -- Handle buffer deletion
   term_instance:on("BufWipeout", function()
     logger.debug("terminal", "Terminal buffer wiped")
-    terminal = nil
+    set_terminal(registered_tab, nil)
   end, { buf = true })
 end
 
----Builds Snacks terminal options with focus control
----@param config ClaudeCodeTerminalConfig Terminal configuration
----@param env_table table Environment variables to set for the terminal process
----@param focus boolean|nil Whether to focus the terminal when opened (defaults to true)
----@return snacks.terminal.Opts opts Snacks terminal options with start_insert/auto_insert controlled by focus parameter
+---Builds Snacks terminal options with focus control.
+---@param config ClaudeCodeTerminalConfig
+---@param env_table table
+---@param focus boolean|nil
+---@return snacks.terminal.Opts
 local function build_opts(config, env_table, focus)
   focus = utils.normalize_focus(focus)
   return {
@@ -80,7 +90,7 @@ function M.setup()
   -- No specific setup needed for Snacks provider
 end
 
----Open a terminal using Snacks.nvim
+---Open a terminal using Snacks.nvim.
 ---@param cmd_string string
 ---@param env_table table
 ---@param config ClaudeCodeTerminalConfig
@@ -92,11 +102,11 @@ function M.open(cmd_string, env_table, config, focus)
   end
 
   focus = utils.normalize_focus(focus)
+  local tab_id = vim.api.nvim_get_current_tabpage()
+  local terminal = get_terminal(tab_id)
 
   if terminal and terminal:buf_valid() then
-    -- Check if terminal exists but is hidden (no window)
     if not terminal.win or not vim.api.nvim_win_is_valid(terminal.win) then
-      -- Terminal is hidden, show it using snacks toggle
       terminal:toggle()
       if focus then
         terminal:focus()
@@ -110,12 +120,10 @@ function M.open(cmd_string, env_table, config, focus)
         end
       end
     else
-      -- Terminal is already visible
       if focus then
         terminal:focus()
         local term_buf_id = terminal.buf
         if term_buf_id and vim.api.nvim_buf_get_option(term_buf_id, "buftype") == "terminal" then
-          -- Check if window is valid before calling nvim_win_call
           if terminal.win and vim.api.nvim_win_is_valid(terminal.win) then
             vim.api.nvim_win_call(terminal.win, function()
               vim.cmd("startinsert")
@@ -130,10 +138,10 @@ function M.open(cmd_string, env_table, config, focus)
   local opts = build_opts(config, env_table, focus)
   local term_instance = Snacks.terminal.open(cmd_string, opts)
   if term_instance and term_instance:buf_valid() then
-    setup_terminal_events(term_instance, config)
-    terminal = term_instance
+    setup_terminal_events(term_instance, config, tab_id)
+    set_terminal(tab_id, term_instance)
   else
-    terminal = nil
+    set_terminal(tab_id, nil)
     local logger = require("claudecode.logger")
     local error_details = {}
     if not term_instance then
@@ -159,17 +167,19 @@ function M.open(cmd_string, env_table, config, focus)
   end
 end
 
----Close the terminal
+---Close the terminal.
 function M.close()
   if not is_available() then
     return
   end
+  local tab_id = vim.api.nvim_get_current_tabpage()
+  local terminal = get_terminal(tab_id)
   if terminal and terminal:buf_valid() then
     terminal:close()
   end
 end
 
----Simple toggle: always show/hide terminal regardless of focus
+---Simple toggle: always show/hide terminal regardless of focus.
 ---@param cmd_string string
 ---@param env_table table
 ---@param config table
@@ -180,24 +190,22 @@ function M.simple_toggle(cmd_string, env_table, config)
   end
 
   local logger = require("claudecode.logger")
+  local tab_id = vim.api.nvim_get_current_tabpage()
+  local terminal = get_terminal(tab_id)
 
-  -- Check if terminal exists and is visible
   if terminal and terminal:buf_valid() and terminal:win_valid() then
-    -- Terminal is visible, hide it
     logger.debug("terminal", "Simple toggle: hiding visible terminal")
     terminal:toggle()
   elseif terminal and terminal:buf_valid() and not terminal:win_valid() then
-    -- Terminal exists but not visible, show it
     logger.debug("terminal", "Simple toggle: showing hidden terminal")
     terminal:toggle()
   else
-    -- No terminal exists, create new one
     logger.debug("terminal", "Simple toggle: creating new terminal")
     M.open(cmd_string, env_table, config)
   end
 end
 
----Smart focus toggle: switches to terminal if not focused, hides if currently focused
+---Smart focus toggle: switches to terminal if not focused, hides if currently focused.
 ---@param cmd_string string
 ---@param env_table table
 ---@param config table
@@ -208,21 +216,19 @@ function M.focus_toggle(cmd_string, env_table, config)
   end
 
   local logger = require("claudecode.logger")
+  local tab_id = vim.api.nvim_get_current_tabpage()
+  local terminal = get_terminal(tab_id)
 
-  -- Terminal exists, is valid, but not visible
   if terminal and terminal:buf_valid() and not terminal:win_valid() then
     logger.debug("terminal", "Focus toggle: showing hidden terminal")
     terminal:toggle()
-  -- Terminal exists, is valid, and is visible
   elseif terminal and terminal:buf_valid() and terminal:win_valid() then
     local claude_term_neovim_win_id = terminal.win
     local current_neovim_win_id = vim.api.nvim_get_current_win()
 
-    -- you're IN it
     if claude_term_neovim_win_id == current_neovim_win_id then
       logger.debug("terminal", "Focus toggle: hiding terminal (currently focused)")
       terminal:toggle()
-    -- you're NOT in it
     else
       logger.debug("terminal", "Focus toggle: focusing terminal")
       vim.api.nvim_set_current_win(claude_term_neovim_win_id)
@@ -234,14 +240,13 @@ function M.focus_toggle(cmd_string, env_table, config)
         end
       end
     end
-  -- No terminal exists
   else
     logger.debug("terminal", "Focus toggle: creating new terminal")
     M.open(cmd_string, env_table, config)
   end
 end
 
----Legacy toggle function for backward compatibility (defaults to simple_toggle)
+---Legacy toggle function for backward compatibility (defaults to simple_toggle).
 ---@param cmd_string string
 ---@param env_table table
 ---@param config table
@@ -249,9 +254,11 @@ function M.toggle(cmd_string, env_table, config)
   M.simple_toggle(cmd_string, env_table, config)
 end
 
----Get the active terminal buffer number
+---Get the active terminal buffer number for the current tab.
 ---@return number?
 function M.get_active_bufnr()
+  local tab_id = vim.api.nvim_get_current_tabpage()
+  local terminal = get_terminal(tab_id)
   if terminal and terminal:buf_valid() and terminal.buf then
     if vim.api.nvim_buf_is_valid(terminal.buf) then
       return terminal.buf
@@ -266,10 +273,10 @@ function M.is_available()
   return is_available()
 end
 
----For testing purposes
----@return table? terminal The terminal instance, or nil
+---For testing purposes.
+---@return table? terminal The terminal instance for the current tab, or nil
 function M._get_terminal_for_test()
-  return terminal
+  return get_terminal()
 end
 
 ---@type ClaudeCodeTerminalProvider

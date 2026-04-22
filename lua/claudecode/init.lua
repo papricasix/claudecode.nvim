@@ -25,36 +25,49 @@ M.version = {
   end,
 }
 
--- Module state
+-- Global config state (shared across all tab instances)
 ---@type ClaudeCodeState
 M.state = {
   config = require("claudecode.config").defaults,
-  server = nil,
-  port = nil,
-  auth_token = nil,
   initialized = false,
-  mention_queue = {},
-  mention_timer = nil,
-  connection_timer = nil,
 }
 
----Check if Claude Code is connected to WebSocket server
----@return boolean connected Whether Claude Code has active connections
-function M.is_claude_connected()
-  if not M.state.server then
+-- Per-tab instance registry. Key = tabpage handle (integer).
+-- Each entry: { server, port, auth_token, mention_queue, mention_timer, connection_timer }
+M.instances = {}
+
+---Return the instance for a specific (or current) tabpage. Returns nil if not started.
+---@param tab_id number|nil
+---@return table|nil
+local function get_instance(tab_id)
+  tab_id = tab_id or vim.api.nvim_get_current_tabpage()
+  return M.instances[tab_id]
+end
+
+---Public accessor used by other modules (terminal.lua, selection.lua).
+---@param tab_id number|nil
+---@return table instance (may have server=nil if not running for this tab)
+function M.get_instance(tab_id)
+  tab_id = tab_id or vim.api.nvim_get_current_tabpage()
+  return M.instances[tab_id] or { server = nil, port = nil, auth_token = nil }
+end
+
+---Check if Claude Code is connected for a specific instance.
+---@param inst table
+---@return boolean
+local function is_connected(inst)
+  if not inst or not inst.server then
     return false
   end
 
-  local server_module = require("claudecode.server.init")
-  local status = server_module.get_status()
+  local status = inst.server.get_status()
   if not status.running then
     return false
   end
 
-  -- Prefer handshake-aware check when client info is available; otherwise fall back to client_count
   if status.clients and #status.clients > 0 then
     for _, info in ipairs(status.clients) do
-      if (info.state == "connected" or info.handshake_complete == true) and info.handshake_complete == true then
+      if info.handshake_complete == true then
         return true
       end
     end
@@ -64,69 +77,79 @@ function M.is_claude_connected()
   end
 end
 
----Clear the mention queue and stop any pending timer
-local function clear_mention_queue()
-  -- Initialize mention_queue if it doesn't exist (for test compatibility)
-  if not M.state.mention_queue then
-    M.state.mention_queue = {}
-  else
-    if #M.state.mention_queue > 0 then
-      logger.debug("queue", "Clearing " .. #M.state.mention_queue .. " queued @ mentions")
-    end
-    M.state.mention_queue = {}
-  end
+---Check if Claude Code is connected to the current tab's WebSocket server.
+---@return boolean connected Whether Claude Code has active connections
+function M.is_claude_connected()
+  return is_connected(get_instance())
+end
 
-  if M.state.mention_timer then
-    M.state.mention_timer:stop()
-    M.state.mention_timer:close()
-    M.state.mention_timer = nil
+---Clear the mention queue and stop any pending timer for a specific instance.
+---@param inst table
+local function clear_mention_queue_for(inst)
+  if not inst then
+    return
+  end
+  if inst.mention_queue and #inst.mention_queue > 0 then
+    logger.debug("queue", "Clearing " .. #inst.mention_queue .. " queued @ mentions")
+  end
+  inst.mention_queue = {}
+
+  if inst.mention_timer then
+    inst.mention_timer:stop()
+    inst.mention_timer:close()
+    inst.mention_timer = nil
   end
 end
 
----Process mentions when Claude is connected (debounced mode)
-local function process_connected_mentions()
-  -- Reset the debounce timer
-  if M.state.mention_timer then
-    M.state.mention_timer:stop()
-    M.state.mention_timer:close()
+-- Forward declaration
+local process_mention_queue_for_inst
+
+---Process mentions when Claude is connected (debounced mode) for a specific instance.
+---@param inst table
+local function process_connected_mentions_for(inst)
+  if inst.mention_timer then
+    inst.mention_timer:stop()
+    inst.mention_timer:close()
   end
 
-  -- Set a new timer to process the queue after 50ms of inactivity
-  M.state.mention_timer = vim.loop.new_timer()
-  local debounce_delay = math.max(10, 50) -- Minimum 10ms debounce, 50ms for batching
+  local debounce_delay = math.max(10, 50)
+  inst.mention_timer = vim.loop.new_timer()
 
-  -- Use vim.schedule_wrap if available, otherwise fallback to vim.schedule + function call
-  local wrapped_function = vim.schedule_wrap and vim.schedule_wrap(M.process_mention_queue)
-    or function()
-      vim.schedule(M.process_mention_queue)
-    end
+  local wrapped = vim.schedule_wrap and vim.schedule_wrap(function()
+    process_mention_queue_for_inst(inst, false)
+  end) or function()
+    vim.schedule(function()
+      process_mention_queue_for_inst(inst, false)
+    end)
+  end
 
-  M.state.mention_timer:start(debounce_delay, 0, wrapped_function)
+  inst.mention_timer:start(debounce_delay, 0, wrapped)
 end
 
----Start connection timeout timer if not already started
-local function start_connection_timeout_if_needed()
-  if not M.state.connection_timer then
-    M.state.connection_timer = vim.loop.new_timer()
-    M.state.connection_timer:start(M.state.config.connection_timeout, 0, function()
+---Start connection timeout timer if not already started for a specific instance.
+---@param inst table
+local function start_connection_timeout_for(inst)
+  if not inst.connection_timer then
+    inst.connection_timer = vim.loop.new_timer()
+    inst.connection_timer:start(M.state.config.connection_timeout, 0, function()
       vim.schedule(function()
-        if #M.state.mention_queue > 0 then
-          logger.error("queue", "Connection timeout - clearing " .. #M.state.mention_queue .. " queued @ mentions")
-          clear_mention_queue()
+        if inst.mention_queue and #inst.mention_queue > 0 then
+          logger.error("queue", "Connection timeout - clearing " .. #inst.mention_queue .. " queued @ mentions")
+          clear_mention_queue_for(inst)
         end
       end)
     end)
   end
 end
 
----Add @ mention to queue
----@param file_path string The file path to mention
----@param start_line number|nil Optional start line
----@param end_line number|nil Optional end line
-local function queue_mention(file_path, start_line, end_line)
-  -- Initialize mention_queue if it doesn't exist (for test compatibility)
-  if not M.state.mention_queue then
-    M.state.mention_queue = {}
+---Add @ mention to queue for a specific instance.
+---@param inst table
+---@param file_path string
+---@param start_line number|nil
+---@param end_line number|nil
+local function queue_mention_for(inst, file_path, start_line, end_line)
+  if not inst.mention_queue then
+    inst.mention_queue = {}
   end
 
   local mention_data = {
@@ -136,66 +159,57 @@ local function queue_mention(file_path, start_line, end_line)
     timestamp = vim.loop.now(),
   }
 
-  table.insert(M.state.mention_queue, mention_data)
-  logger.debug("queue", "Queued @ mention: " .. file_path .. " (queue size: " .. #M.state.mention_queue .. ")")
+  table.insert(inst.mention_queue, mention_data)
+  logger.debug("queue", "Queued @ mention: " .. file_path .. " (queue size: " .. #inst.mention_queue .. ")")
 
-  -- Process based on connection state
-  if M.is_claude_connected() then
-    -- Connected: Use debounced processing (old broadcast_queue behavior)
-    process_connected_mentions()
+  if is_connected(inst) then
+    process_connected_mentions_for(inst)
   else
-    -- Disconnected: Start connection timeout timer (old queued_mentions behavior)
-    start_connection_timeout_if_needed()
+    start_connection_timeout_for(inst)
   end
 end
 
----Process the mention queue (handles both connected and disconnected modes)
----@param from_new_connection boolean|nil Whether this is triggered by a new connection (adds delay)
-function M.process_mention_queue(from_new_connection)
-  -- Initialize mention_queue if it doesn't exist (for test compatibility)
-  if not M.state.mention_queue then
-    M.state.mention_queue = {}
+---Process the mention queue for a specific instance.
+---@param inst table
+---@param from_new_connection boolean|nil
+process_mention_queue_for_inst = function(inst, from_new_connection)
+  if not inst or not inst.mention_queue then
     return
   end
 
-  if #M.state.mention_queue == 0 then
+  if #inst.mention_queue == 0 then
     return
   end
 
-  if not M.is_claude_connected() then
-    -- Still disconnected or handshake not complete yet, wait for readiness
-    logger.debug("queue", "Claude not ready (no handshake). Keeping ", #M.state.mention_queue, " mentions queued")
+  if not is_connected(inst) then
+    logger.debug("queue", "Claude not ready (no handshake). Keeping ", #inst.mention_queue, " mentions queued")
 
-    -- If triggered by a new connection, poll until handshake completes (bounded by connection_timeout timer)
     if from_new_connection then
       local retry_delay = math.max(50, math.floor((M.state.config.connection_wait_delay or 200) / 4))
       vim.defer_fn(function()
-        M.process_mention_queue(true)
+        process_mention_queue_for_inst(inst, true)
       end, retry_delay)
     end
     return
   end
 
-  local mentions_to_send = vim.deepcopy(M.state.mention_queue)
-  M.state.mention_queue = {} -- Clear queue
+  local mentions_to_send = vim.deepcopy(inst.mention_queue)
+  inst.mention_queue = {}
 
-  -- Stop any existing timer
-  if M.state.mention_timer then
-    M.state.mention_timer:stop()
-    M.state.mention_timer:close()
-    M.state.mention_timer = nil
+  if inst.mention_timer then
+    inst.mention_timer:stop()
+    inst.mention_timer:close()
+    inst.mention_timer = nil
   end
 
-  -- Stop connection timer since we're now connected
-  if M.state.connection_timer then
-    M.state.connection_timer:stop()
-    M.state.connection_timer:close()
-    M.state.connection_timer = nil
+  if inst.connection_timer then
+    inst.connection_timer:stop()
+    inst.connection_timer:close()
+    inst.connection_timer = nil
   end
 
   logger.debug("queue", "Processing " .. #mentions_to_send .. " queued @ mentions")
 
-  -- Send mentions with a small delay between each to prevent WebSocket/extension overwhelm
   local function send_mention_sequential(index)
     if index > #mentions_to_send then
       logger.debug("queue", "All queued mentions sent successfully")
@@ -203,20 +217,17 @@ function M.process_mention_queue(from_new_connection)
     end
 
     local mention = mentions_to_send[index]
-
-    -- Check if mention has expired (same timeout logic as old system)
     local current_time = vim.loop.now()
     if (current_time - mention.timestamp) > M.state.config.queue_timeout then
       logger.debug("queue", "Skipped expired @ mention: " .. mention.file_path)
     else
-      -- Directly broadcast without going through the queue system to avoid infinite recursion
       local params = {
         filePath = mention.file_path,
         lineStart = mention.start_line,
         lineEnd = mention.end_line,
       }
 
-      local broadcast_success = M.state.server.broadcast("at_mentioned", params)
+      local broadcast_success = inst.server.broadcast("at_mentioned", params)
       if broadcast_success then
         logger.debug("queue", "Sent queued @ mention: " .. mention.file_path)
       else
@@ -224,33 +235,42 @@ function M.process_mention_queue(from_new_connection)
       end
     end
 
-    -- Process next mention with delay
     if index < #mentions_to_send then
-      local inter_message_delay = 25 -- ms
       vim.defer_fn(function()
         send_mention_sequential(index + 1)
-      end, inter_message_delay)
+      end, 25)
     end
   end
 
-  -- Apply delay for new connections, send immediately for debounced processing
   if #mentions_to_send > 0 then
     if from_new_connection then
-      -- Wait for connection_wait_delay when processing queue after new connection
       local initial_delay = (M.state.config and M.state.config.connection_wait_delay) or 200
       logger.debug("queue", "Waiting ", initial_delay, "ms after connect before flushing queue")
       vim.defer_fn(function()
         send_mention_sequential(1)
       end, initial_delay)
     else
-      -- Send immediately for debounced processing (Claude already connected)
       send_mention_sequential(1)
     end
   end
 end
 
----Show terminal if Claude is connected and it's not already visible
----@return boolean success Whether terminal was shown or was already visible
+---Process the mention queue for the current tab (called by on_connect handlers).
+---@param from_new_connection boolean|nil
+function M.process_mention_queue(from_new_connection)
+  process_mention_queue_for_inst(get_instance(), from_new_connection)
+end
+
+---Process the mention queue for a specific tab (called by per-instance on_connect).
+---@param tab_id number|nil
+---@param from_new_connection boolean|nil
+function M.process_mention_queue_for_tab(tab_id, from_new_connection)
+  local inst = tab_id and M.instances[tab_id] or get_instance()
+  process_mention_queue_for_inst(inst, from_new_connection)
+end
+
+---Show terminal if Claude is connected and it's not already visible.
+---@return boolean success
 function M._ensure_terminal_visible_if_connected()
   if not M.is_claude_connected() then
     return false
@@ -273,29 +293,27 @@ function M._ensure_terminal_visible_if_connected()
   return true
 end
 
----Send @ mention to Claude Code, handling connection state automatically
----@param file_path string The file path to send
----@param start_line number|nil Start line (0-indexed for Claude)
----@param end_line number|nil End line (0-indexed for Claude)
----@param context string|nil Context for logging
----@return boolean success Whether the operation was successful
----@return string|nil error Error message if failed
+---Send @ mention to Claude Code, handling connection state automatically.
+---@param file_path string
+---@param start_line number|nil
+---@param end_line number|nil
+---@param context string|nil
+---@return boolean success
+---@return string|nil error
 function M.send_at_mention(file_path, start_line, end_line, context)
   context = context or "command"
 
-  if not M.state.server then
+  local inst = get_instance()
+  if not inst or not inst.server then
     logger.error(context, "Claude Code integration is not running")
     return false, "Claude Code integration is not running"
   end
 
-  -- Check if Claude Code is connected
-  if M.is_claude_connected() then
-    -- Claude is connected, send immediately and ensure terminal is visible
+  if is_connected(inst) then
     local success, error_msg = M._broadcast_at_mention(file_path, start_line, end_line)
     if success then
       local terminal = require("claudecode.terminal")
       if M.state.config and M.state.config.focus_after_send then
-        -- Open focuses the terminal without toggling/hiding if already focused
         terminal.open()
       else
         terminal.ensure_visible()
@@ -303,10 +321,8 @@ function M.send_at_mention(file_path, start_line, end_line, context)
     end
     return success, error_msg
   else
-    -- Claude not connected, queue the mention and launch terminal
-    queue_mention(file_path, start_line, end_line)
+    queue_mention_for(inst, file_path, start_line, end_line)
 
-    -- Launch terminal with Claude Code
     local terminal = require("claudecode.terminal")
     terminal.open()
 
@@ -316,21 +332,18 @@ function M.send_at_mention(file_path, start_line, end_line, context)
   end
 end
 
----Set up the plugin with user configuration
----@param opts PartialClaudeCodeConfig|nil Optional configuration table to override defaults.
----@return table module The plugin module
+---Set up the plugin with user configuration.
+---@param opts PartialClaudeCodeConfig|nil
+---@return table module
 function M.setup(opts)
   opts = opts or {}
 
   local config = require("claudecode.config")
   M.state.config = config.apply(opts)
-  -- vim.g.claudecode_user_config is no longer needed as config values are passed directly.
 
   logger.setup(M.state.config)
 
-  -- Setup terminal module: always try to call setup to pass terminal_cmd and env,
-  -- even if terminal_opts (for split_side etc.) are not provided.
-  -- Map top-level cwd-related aliases into terminal config for convenience
+  -- Map top-level cwd-related aliases into terminal config
   do
     local t = opts.terminal or {}
     local had_alias = false
@@ -353,9 +366,7 @@ function M.setup(opts)
 
   local terminal_setup_ok, terminal_module = pcall(require, "claudecode.terminal")
   if terminal_setup_ok then
-    -- Guard in case tests or user replace the module with a minimal stub without `setup`.
     if type(terminal_module.setup) == "function" then
-      -- terminal_opts might be nil, which the setup function should handle gracefully.
       terminal_module.setup(opts.terminal, M.state.config.terminal_cmd, M.state.config.env)
     end
   else
@@ -366,23 +377,56 @@ function M.setup(opts)
   diff.setup(M.state.config)
 
   if M.state.config.auto_start then
-    M.start(false) -- Suppress notification on auto-start
+    M.start(false)
   end
 
   M._create_commands()
 
+  -- Stop all instances on Neovim exit
   vim.api.nvim_create_autocmd("VimLeavePre", {
     group = vim.api.nvim_create_augroup("ClaudeCodeShutdown", { clear = true }),
     callback = function()
-      if M.state.server then
-        M.stop()
-      else
-        -- Clear queue even if server isn't running
-        clear_mention_queue()
+      for tab_id, inst in pairs(M.instances) do
+        if inst.server then
+          M._stop_instance(tab_id)
+        else
+          clear_mention_queue_for(inst)
+        end
       end
     end,
     desc = "Automatically stop Claude Code integration when exiting Neovim",
   })
+
+  -- Clean up instance when a tab is closed
+  vim.api.nvim_create_autocmd("TabClosed", {
+    group = vim.api.nvim_create_augroup("ClaudeCodeTabLifecycle", { clear = true }),
+    callback = function()
+      for tab_id, inst in pairs(M.instances) do
+        if not vim.api.nvim_tabpage_is_valid(tab_id) then
+          if inst.server then
+            M._stop_instance(tab_id)
+          else
+            clear_mention_queue_for(inst)
+            M.instances[tab_id] = nil
+          end
+        end
+      end
+    end,
+    desc = "Stop Claude Code instance when its tab is closed",
+  })
+
+  -- Auto-start in new tabs if configured
+  if M.state.config.auto_start then
+    vim.api.nvim_create_autocmd("TabNew", {
+      group = vim.api.nvim_create_augroup("ClaudeCodeTabAutoStart", { clear = true }),
+      callback = function()
+        vim.schedule(function()
+          M.start(false)
+        end)
+      end,
+      desc = "Auto-start Claude Code integration in new tabs",
+    })
+  end
 
   vim.keymap.set("n", "<leader>aF", "<cmd>ClaudeCodeToggleFileTracking<cr>", {
     desc = "Toggle Claude Code file tracking",
@@ -393,24 +437,68 @@ function M.setup(opts)
   return M
 end
 
----Start the Claude Code integration
----@param show_startup_notification? boolean Whether to show a notification upon successful startup (defaults to true)
----@return boolean success Whether the operation was successful
----@return number|string port_or_error The WebSocket port if successful, or error message if failed
+---Stop the Claude Code integration for a specific tab (internal helper).
+---@param tab_id number
+function M._stop_instance(tab_id)
+  local inst = M.instances[tab_id]
+  if not inst then
+    return
+  end
+
+  local lockfile = require("claudecode.lockfile")
+  lockfile.remove(inst.port)
+
+  -- Disable selection tracking only if this is the last running instance
+  if M.state.config.track_selection then
+    local any_remaining = false
+    for t, i in pairs(M.instances) do
+      if t ~= tab_id and i.server then
+        any_remaining = true
+        break
+      end
+    end
+    if not any_remaining then
+      local selection = require("claudecode.selection")
+      selection.disable()
+    end
+  end
+
+  inst.server.stop()
+
+  clear_mention_queue_for(inst)
+
+  if inst.connection_timer then
+    inst.connection_timer:stop()
+    inst.connection_timer:close()
+    inst.connection_timer = nil
+  end
+
+  M.instances[tab_id] = nil
+  logger.info("init", "Claude Code integration stopped (tab " .. tostring(tab_id) .. ")")
+end
+
+---Start the Claude Code integration for the current tab.
+---@param show_startup_notification? boolean
+---@return boolean success
+---@return number|string port_or_error
 function M.start(show_startup_notification)
   if show_startup_notification == nil then
     show_startup_notification = true
   end
-  if M.state.server then
-    local msg = "Claude Code integration is already running on port " .. tostring(M.state.port)
+
+  local tab_id = vim.api.nvim_get_current_tabpage()
+
+  local existing = M.instances[tab_id]
+  if existing and existing.server then
+    local msg = "Claude Code integration is already running on port " .. tostring(existing.port)
     logger.warn("init", msg)
     return false, "Already running"
   end
 
-  local server = require("claudecode.server.init")
+  local server_module = require("claudecode.server.init")
   local lockfile = require("claudecode.lockfile")
 
-  -- Generate auth token first so we can pass it to the server
+  -- Generate auth token
   local auth_token
   local auth_success, auth_result = pcall(function()
     return lockfile.generate_auth_token()
@@ -424,14 +512,15 @@ function M.start(show_startup_notification)
 
   auth_token = auth_result
 
-  -- Validate the generated auth token
   if not auth_token or type(auth_token) ~= "string" or #auth_token < 10 then
     local error_msg = "Invalid authentication token generated"
     logger.error("init", error_msg)
     return false, error_msg
   end
 
-  local success, result = server.start(M.state.config, auth_token)
+  -- Create a fresh server instance for this tab
+  local srv = server_module.new_instance(tab_id)
+  local success, result = srv.start(M.state.config, auth_token)
 
   if not success then
     local error_msg = "Failed to start Claude Code server: " .. (result or "unknown error")
@@ -442,18 +531,12 @@ function M.start(show_startup_notification)
     return false, error_msg
   end
 
-  M.state.server = server
-  M.state.port = tonumber(result)
-  M.state.auth_token = auth_token
+  local port = tonumber(result)
 
-  local lock_success, lock_result, returned_auth_token = lockfile.create(M.state.port, auth_token)
+  local lock_success, lock_result, returned_auth_token = lockfile.create(port, auth_token)
 
   if not lock_success then
-    server.stop()
-    M.state.server = nil
-    M.state.port = nil
-    M.state.auth_token = nil
-
+    srv.stop()
     local error_msg = "Failed to create lock file: " .. (lock_result or "unknown error")
     if lock_result and lock_result:find("auth") then
       error_msg = error_msg .. " (authentication token issue)"
@@ -462,68 +545,50 @@ function M.start(show_startup_notification)
     return false, error_msg
   end
 
-  -- Verify that the auth token in the lock file matches what we generated
   if returned_auth_token ~= auth_token then
-    server.stop()
-    M.state.server = nil
-    M.state.port = nil
-    M.state.auth_token = nil
-
+    srv.stop()
     local error_msg = "Authentication token mismatch between server and lock file"
     logger.error("init", error_msg)
     return false, error_msg
   end
 
+  -- Store the instance for this tab
+  M.instances[tab_id] = {
+    server = srv,
+    port = port,
+    auth_token = auth_token,
+    mention_queue = {},
+    mention_timer = nil,
+    connection_timer = nil,
+  }
+
   if M.state.config.track_selection then
     local selection = require("claudecode.selection")
-    selection.enable(M.state.server, M.state.config.visual_demotion_delay_ms)
+    selection.enable(nil, M.state.config.visual_demotion_delay_ms)
   end
 
   if show_startup_notification then
-    logger.info("init", "Claude Code integration started on port " .. tostring(M.state.port))
+    logger.info("init", "Claude Code integration started on port " .. tostring(port) .. " (tab " .. tostring(tab_id) .. ")")
   end
 
-  return true, M.state.port
+  return true, port
 end
 
----Stop the Claude Code integration
----@return boolean success Whether the operation was successful
----@return string|nil error Error message if operation failed
+---Stop the Claude Code integration for the current tab.
+---@return boolean success
+---@return string|nil error
 function M.stop()
-  if not M.state.server then
-    logger.warn("init", "Claude Code integration is not running")
+  local tab_id = vim.api.nvim_get_current_tabpage()
+  local inst = M.instances[tab_id]
+
+  if not inst or not inst.server then
+    logger.warn("init", "Claude Code integration is not running on current tab")
     return false, "Not running"
   end
 
-  local lockfile = require("claudecode.lockfile")
-  local lock_success, lock_error = lockfile.remove(M.state.port)
-
-  if not lock_success then
-    logger.warn("init", "Failed to remove lock file: " .. lock_error)
-    -- Continue with shutdown even if lock file removal fails
-  end
-
-  if M.state.config.track_selection then
-    local selection = require("claudecode.selection")
-    selection.disable()
-  end
-
-  local success, error = M.state.server.stop()
-
-  if not success then
-    logger.error("init", "Failed to stop Claude Code integration: " .. error)
-    return false, error
-  end
-
-  M.state.server = nil
-  M.state.port = nil
-  M.state.auth_token = nil
-
-  -- Clear any queued @ mentions when server stops
-  clear_mention_queue()
+  M._stop_instance(tab_id)
 
   logger.info("init", "Claude Code integration stopped")
-
   return true
 end
 
@@ -539,9 +604,10 @@ function M.toggle_file_tracking()
   local enabled = not M.state.config.track_selection
   M.state.config.track_selection = enabled
 
-  if M.state.server then
+  local inst = get_instance()
+  if inst and inst.server then
     if enabled then
-      selection.enable(M.state.server, M.state.config.visual_demotion_delay_ms)
+      selection.enable(nil, M.state.config.visual_demotion_delay_ms)
     else
       selection.disable()
     end
@@ -551,35 +617,43 @@ function M.toggle_file_tracking()
   return enabled
 end
 
----Set up user commands
+---Set up user commands.
 ---@private
 function M._create_commands()
   vim.api.nvim_create_user_command("ClaudeCodeStart", function()
     M.start()
   end, {
-    desc = "Start Claude Code integration",
+    desc = "Start Claude Code integration for current tab",
   })
 
   vim.api.nvim_create_user_command("ClaudeCodeStop", function()
     M.stop()
   end, {
-    desc = "Stop Claude Code integration",
+    desc = "Stop Claude Code integration for current tab",
   })
 
   vim.api.nvim_create_user_command("ClaudeCodeStatus", function()
-    if M.state.server and M.state.port then
-      logger.info("command", "Claude Code integration is running on port " .. tostring(M.state.port))
+    local inst = get_instance()
+    if inst and inst.server and inst.port then
+      logger.info(
+        "command",
+        "Claude Code integration is running on port "
+          .. tostring(inst.port)
+          .. " (tab "
+          .. tostring(vim.api.nvim_get_current_tabpage())
+          .. ")"
+      )
     else
-      logger.info("command", "Claude Code integration is not running")
+      logger.info("command", "Claude Code integration is not running on current tab")
     end
   end, {
-    desc = "Show Claude Code integration status",
+    desc = "Show Claude Code integration status for current tab",
   })
 
-  ---@param file_paths table List of file paths to add
-  ---@param options table|nil Optional settings: { delay?: number, show_summary?: boolean, context?: string }
-  ---@return number success_count Number of successfully added files
-  ---@return number total_count Total number of files attempted
+  ---@param file_paths table
+  ---@param options table|nil
+  ---@return number success_count
+  ---@return number total_count
   local function add_paths_to_claude(file_paths, options)
     options = options or {}
     local delay = options.delay or 0
@@ -711,14 +785,12 @@ function M._create_commands()
 
     local selection_module_ok, selection_module = pcall(require, "claudecode.selection")
     if selection_module_ok then
-      -- Pass range information if available (for :'<,'> commands)
       local line1, line2 = nil, nil
       if opts and opts.range and opts.range > 0 then
         line1, line2 = opts.line1, opts.line2
       end
       local sent_successfully = selection_module.send_at_mention_for_visual_selection(line1, line2)
       if sent_successfully then
-        -- Exit any potential visual mode (for consistency)
         pcall(function()
           if vim.api and vim.api.nvim_feedkeys then
             local esc = vim.api.nvim_replace_termcodes("<Esc>", true, false, true)
@@ -732,7 +804,6 @@ function M._create_commands()
   end
 
   local function handle_send_visual(visual_data, opts)
-    -- Check if we're in a tree buffer first
     local current_ft = (vim.bo and vim.bo.filetype) or ""
     local current_bufname = (vim.api and vim.api.nvim_buf_get_name and vim.api.nvim_buf_get_name(0)) or ""
 
@@ -750,7 +821,6 @@ function M._create_commands()
       local visual_cmd_module = require("claudecode.visual_commands")
       local files, error
 
-      -- For mini.files, try to get the range from visual marks for accuracy
       if current_ft == "minifiles" or string.match(current_bufname, "minifiles://") then
         local start_line = vim.fn.line("'<")
         local end_line = vim.fn.line("'>")
@@ -758,14 +828,11 @@ function M._create_commands()
         if start_line > 0 and end_line > 0 and start_line <= end_line then
           files, error = integrations._get_mini_files_selection_with_range(start_line, end_line)
         else
-          -- If range invalid, try visual selection fallback (uses pre-captured visual_data)
           files, error = visual_cmd_module.get_files_from_visual_selection(visual_data)
         end
       else
-        -- Use visual selection-aware extraction for tree buffers (neo-tree, nvim-tree, oil)
         files, error = visual_cmd_module.get_files_from_visual_selection(visual_data)
         if (not files or #files == 0) and not error then
-          -- Fallback: try generic selection if visual data was unavailable
           files, error = integrations.get_selected_files_from_tree()
         end
       end
@@ -784,7 +851,6 @@ function M._create_commands()
       return
     end
 
-    -- Fall back to old visual selection logic for non-tree buffers
     if visual_data then
       local visual_commands = require("claudecode.visual_commands")
       local files, error = visual_commands.get_files_from_visual_selection(visual_data)
@@ -804,13 +870,11 @@ function M._create_commands()
       end
     end
 
-    -- Handle regular text selection using range from visual mode
     local selection_module_ok, selection_module = pcall(require, "claudecode.selection")
     if not selection_module_ok then
       return
     end
 
-    -- Use the marks left by visual mode instead of trying to get current visual selection
     local line1, line2 = vim.fn.line("'<"), vim.fn.line("'>")
     if line1 and line2 and line1 > 0 and line2 > 0 then
       selection_module.send_at_mention_for_visual_selection(line1, line2)
@@ -828,7 +892,8 @@ function M._create_commands()
   })
 
   local function handle_tree_add_normal()
-    if not M.state.server then
+    local inst = get_instance()
+    if not inst or not inst.server then
       logger.error("command", "ClaudeCodeTreeAdd: Claude Code integration is not running.")
       return
     end
@@ -846,7 +911,6 @@ function M._create_commands()
       return
     end
 
-    -- Use connection-aware broadcasting for each file
     local success_count = 0
     local total_count = #files
 
@@ -875,7 +939,8 @@ function M._create_commands()
   end
 
   local function handle_tree_add_visual(visual_data)
-    if not M.state.server then
+    local inst = get_instance()
+    if not inst or not inst.server then
       logger.error("command", "ClaudeCodeTreeAdd_visual: Claude Code integration is not running.")
       return
     end
@@ -893,7 +958,6 @@ function M._create_commands()
       return
     end
 
-    -- Use connection-aware broadcasting for each file
     local success_count = 0
     local total_count = #files
 
@@ -930,7 +994,8 @@ function M._create_commands()
   })
 
   vim.api.nvim_create_user_command("ClaudeCodeAdd", function(opts)
-    if not M.state.server then
+    local inst = get_instance()
+    if not inst or not inst.server then
       logger.error("command", "ClaudeCodeAdd: Claude Code integration is not running.")
       return
     end
@@ -1021,7 +1086,7 @@ function M._create_commands()
       terminal.simple_toggle({}, cmd_args)
     end, {
       nargs = "*",
-      desc = "Toggle the Claude Code terminal window (simple show/hide) with optional arguments",
+      desc = "Toggle the Claude Code terminal window for current tab",
     })
 
     vim.api.nvim_create_user_command("ClaudeCodeFocus", function(opts)
@@ -1056,7 +1121,6 @@ function M._create_commands()
     )
   end
 
-  -- Diff management commands
   vim.api.nvim_create_user_command("ClaudeCodeDiffAccept", function()
     local diff = require("claudecode.diff")
     diff.accept_current_diff()
@@ -1101,7 +1165,7 @@ M.open_with_model = function(additional_args)
     end,
   }, function(choice)
     if not choice then
-      return -- User cancelled
+      return
     end
 
     if not choice.value or type(choice.value) ~= "string" then
@@ -1115,7 +1179,7 @@ M.open_with_model = function(additional_args)
   end)
 end
 
----Get version information
+---Get version information.
 ---@return { version: string, major: integer, minor: integer, patch: integer, prerelease: string|nil }
 function M.get_version()
   return {
@@ -1127,18 +1191,15 @@ function M.get_version()
   }
 end
 
----Format file path for at mention (exposed for testing)
----@param file_path string The file path to format
----@return string formatted_path The formatted path
----@return boolean is_directory Whether the path is a directory
+---Format file path for at mention (exposed for testing).
+---@param file_path string
+---@return string formatted_path
+---@return boolean is_directory
 function M._format_path_for_at_mention(file_path)
-  -- Input validation
   if not file_path or type(file_path) ~= "string" or file_path == "" then
     error("format_path_for_at_mention: file_path must be a non-empty string")
   end
 
-  -- Only check path existence in production (not tests)
-  -- This allows tests to work with mock paths while still providing validation in real usage
   if not package.loaded["busted"] then
     if vim.fn.filereadable(file_path) == 0 and vim.fn.isdirectory(file_path) == 0 then
       error("format_path_for_at_mention: path does not exist: " .. file_path)
@@ -1174,17 +1235,20 @@ function M._format_path_for_at_mention(file_path)
   return formatted_path, is_directory
 end
 
----Test helper functions (exposed for testing)
+---Broadcast an at_mention for a file path (exposed for testing).
+---@param file_path string
+---@param start_line number|nil
+---@param end_line number|nil
 function M._broadcast_at_mention(file_path, start_line, end_line)
-  if not M.state.server then
+  local inst = get_instance()
+  if not inst or not inst.server then
     return false, "Claude Code integration is not running"
   end
 
-  -- Safely format the path and handle validation errors
   local formatted_path, is_directory
   local format_success, format_result, is_dir_result = pcall(M._format_path_for_at_mention, file_path)
   if not format_success then
-    return false, format_result -- format_result contains the error message
+    return false, format_result
   end
   formatted_path, is_directory = format_result, is_dir_result
 
@@ -1200,12 +1264,11 @@ function M._broadcast_at_mention(file_path, start_line, end_line)
     lineEnd = end_line,
   }
 
-  -- For tests or when explicitly configured, broadcast immediately without queuing
   if
     (M.state.config and M.state.config.disable_broadcast_debouncing)
     or (package.loaded["busted"] and not (M.state.config and M.state.config.enable_broadcast_debouncing_in_tests))
   then
-    local broadcast_success = M.state.server.broadcast("at_mentioned", params)
+    local broadcast_success = inst.server.broadcast("at_mentioned", params)
     if broadcast_success then
       return true, nil
     else
@@ -1215,11 +1278,7 @@ function M._broadcast_at_mention(file_path, start_line, end_line)
     end
   end
 
-  -- Use mention queue system for debounced broadcasting
-  queue_mention(formatted_path, start_line, end_line)
-
-  -- Always return success since we're queuing the message
-  -- The actual broadcast result will be logged in the queue processing
+  queue_mention_for(inst, formatted_path, start_line, end_line)
   return true, nil
 end
 
@@ -1272,7 +1331,6 @@ function M._add_paths_to_claude(file_paths, options)
         return
       end
 
-      -- Process a batch of files
       local end_index = math.min(start_index + batch_size - 1, total_count)
       local batch_success = 0
 

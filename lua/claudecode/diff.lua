@@ -44,7 +44,7 @@ end
 ---@param windows number[]? List of window IDs to search; defaults to all windows
 ---@return number? win_id Window ID of the main editor window, or nil if not found
 local function find_main_editor_window(windows)
-  windows = windows or vim.api.nvim_list_wins()
+  windows = windows or vim.api.nvim_tabpage_list_wins(vim.api.nvim_get_current_tabpage())
 
   for _, win in ipairs(windows) do
     local buf = vim.api.nvim_win_get_buf(win)
