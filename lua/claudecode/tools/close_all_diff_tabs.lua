@@ -15,8 +15,14 @@ local schema = {
 local function handler(params)
   local closed_count = 0
 
-  -- Get all windows
-  local windows = vim.api.nvim_list_wins()
+  -- Scope to the calling server's tab to avoid closing diffs owned by other Claude instances
+  local target_tab = _G._claudecode_active_tab_id
+  if not target_tab or not vim.api.nvim_tabpage_is_valid(target_tab) then
+    target_tab = vim.api.nvim_get_current_tabpage()
+  end
+
+  -- Get windows only in the owning tab
+  local windows = vim.api.nvim_tabpage_list_wins(target_tab)
   local windows_to_close = {} -- Use set to avoid duplicates
 
   for _, win in ipairs(windows) do
@@ -58,6 +64,11 @@ local function handler(params)
   end
 
   -- Also check for buffers that might be diff-related but not currently in windows
+  -- Only consider buffers that were visible in the owning tab's windows
+  local tab_win_set = {}
+  for _, w in ipairs(windows) do
+    tab_win_set[w] = true
+  end
   local buffers = vim.api.nvim_list_bufs()
   for _, buf in ipairs(buffers) do
     if vim.api.nvim_buf_is_loaded(buf) then
@@ -70,9 +81,16 @@ local function handler(params)
         or buf_name:match("diff://")
         or (buftype == "nofile" and buf_name:match("^fugitive://"))
       then
-        -- Delete the buffer if it's not in any window
+        -- Only delete if not shown in any window of the owning tab
         local buf_windows = vim.fn.win_findbuf(buf)
-        if #buf_windows == 0 then
+        local in_other_tab = false
+        for _, w in ipairs(buf_windows) do
+          if not tab_win_set[w] then
+            in_other_tab = true
+            break
+          end
+        end
+        if not in_other_tab then
           local success = pcall(vim.api.nvim_buf_delete, buf, { force = true })
           if success then
             closed_count = closed_count + 1
