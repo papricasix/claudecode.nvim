@@ -39,6 +39,40 @@ local function get_autocmd_group()
   return autocmd_group
 end
 
+---Count running Claude Code instances across tabs.
+---@return number count
+local function count_running_instances()
+  local ok, main = pcall(require, "claudecode")
+  if not ok or type(main.instances) ~= "table" then
+    return 0
+  end
+  local n = 0
+  for _, inst in pairs(main.instances) do
+    if inst and inst.server then
+      n = n + 1
+    end
+  end
+  return n
+end
+
+---Switch to the tab that owns the active Claude Code WebSocket message,
+---but only when more than one instance is running. Returns whether a switch happened.
+---@return boolean switched
+local function switch_to_owning_tab_if_multi()
+  if count_running_instances() < 2 then
+    return false
+  end
+  local target = _G._claudecode_active_tab_id
+  if not target or not vim.api.nvim_tabpage_is_valid(target) then
+    return false
+  end
+  if vim.api.nvim_get_current_tabpage() == target then
+    return false
+  end
+  vim.api.nvim_set_current_tabpage(target)
+  return true
+end
+
 ---Find a suitable main editor window to open diffs in.
 ---Excludes terminals, sidebars, and floating windows.
 ---@param windows number[]? List of window IDs to search; defaults to all windows
@@ -686,14 +720,11 @@ end
 ---@return table res Result with provider, tab_name, and success status
 function M._open_native_diff(old_file_path, new_file_path, new_file_contents, tab_name)
   local _user_tab = vim.api.nvim_get_current_tabpage()
-  local _target_tab = _G._claudecode_active_tab_id
-  if _target_tab and vim.api.nvim_tabpage_is_valid(_target_tab) then
-    vim.api.nvim_set_current_tabpage(_target_tab)
-  end
+  local _switched = switch_to_owning_tab_if_multi()
   local new_filename = vim.fn.fnamemodify(new_file_path, ":t") .. ".new"
   local tmp_file, err = create_temp_file(new_file_contents, new_filename)
   if not tmp_file then
-    if _user_tab and vim.api.nvim_tabpage_is_valid(_user_tab) then
+    if _switched and vim.api.nvim_tabpage_is_valid(_user_tab) then
       vim.api.nvim_set_current_tabpage(_user_tab)
     end
     return { provider = "native", tab_name = tab_name, success = false, error = err, temp_file = nil }
@@ -746,7 +777,7 @@ function M._open_native_diff(old_file_path, new_file_path, new_file_contents, ta
     once = true,
   })
 
-  if _user_tab and vim.api.nvim_tabpage_is_valid(_user_tab) then
+  if _switched and vim.api.nvim_tabpage_is_valid(_user_tab) then
     vim.api.nvim_set_current_tabpage(_user_tab)
   end
   return {
@@ -1191,12 +1222,10 @@ function M._setup_blocking_diff(params, resolution_callback)
   logger.debug("diff", "Setting up diff for:", params.old_file_path)
 
   local _user_tab = vim.api.nvim_get_current_tabpage()
+  local _switched = false
   -- Wrap the setup in error handling to ensure cleanup on failure
   local setup_success, setup_error = pcall(function()
-    local _target_tab = _G._claudecode_active_tab_id
-    if _target_tab and vim.api.nvim_tabpage_is_valid(_target_tab) then
-      vim.api.nvim_set_current_tabpage(_target_tab)
-    end
+    _switched = switch_to_owning_tab_if_multi()
 
     local old_file_exists = vim.fn.filereadable(params.old_file_path) == 1
     local is_new_file = not old_file_exists
@@ -1353,7 +1382,7 @@ function M._setup_blocking_diff(params, resolution_callback)
     })
   end) -- End of pcall
 
-  if _user_tab and vim.api.nvim_tabpage_is_valid(_user_tab) then
+  if _switched and vim.api.nvim_tabpage_is_valid(_user_tab) then
     vim.api.nvim_set_current_tabpage(_user_tab)
   end
 
