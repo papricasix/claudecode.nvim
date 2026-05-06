@@ -306,7 +306,17 @@ local function get_claude_command_and_env(cmd_args)
     cmd_string = base_cmd
   end
 
-  local sse_port_value = claudecode_main.get_instance().port
+  -- Ensure a server exists for this tab before launching the CLI. Otherwise
+  -- CLAUDE_CODE_SSE_PORT is unset and the CLI scans lock files, often
+  -- connecting to another tab's server and routing all requests there.
+  local instance = claudecode_main.get_instance()
+  if not instance.server then
+    local started = pcall(claudecode_main.start, false)
+    if started then
+      instance = claudecode_main.get_instance()
+    end
+  end
+  local sse_port_value = instance.port
   local env_table = {
     ENABLE_IDE_INTEGRATION = "true",
     FORCE_CODE_TERMINAL = "true",

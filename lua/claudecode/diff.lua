@@ -39,29 +39,10 @@ local function get_autocmd_group()
   return autocmd_group
 end
 
----Count running Claude Code instances across tabs.
----@return number count
-local function count_running_instances()
-  local ok, main = pcall(require, "claudecode")
-  if not ok or type(main.instances) ~= "table" then
-    return 0
-  end
-  local n = 0
-  for _, inst in pairs(main.instances) do
-    if inst and inst.server then
-      n = n + 1
-    end
-  end
-  return n
-end
-
----Switch to the tab that owns the active Claude Code WebSocket message,
----but only when more than one instance is running. Returns whether a switch happened.
+---Switch to the tab that owns the active Claude Code WebSocket message.
+---Returns whether a switch happened.
 ---@return boolean switched
-local function switch_to_owning_tab_if_multi()
-  if count_running_instances() < 2 then
-    return false
-  end
+local function switch_to_owning_tab_if_needed()
   local target = _G._claudecode_active_tab_id
   if not target or not vim.api.nvim_tabpage_is_valid(target) then
     return false
@@ -666,15 +647,21 @@ local function setup_new_buffer(
   if config and config.diff_opts and config.diff_opts.keep_terminal_focus then
     vim.schedule(function()
       if terminal_win_in_new_tab and vim.api.nvim_win_is_valid(terminal_win_in_new_tab) then
-        vim.api.nvim_set_current_win(terminal_win_in_new_tab)
-        vim.cmd("startinsert")
+        local tnt_tab = vim.api.nvim_win_get_tabpage(terminal_win_in_new_tab)
+        if tnt_tab == vim.api.nvim_get_current_tabpage() then
+          vim.api.nvim_set_current_win(terminal_win_in_new_tab)
+          vim.cmd("startinsert")
+        end
         return
       end
 
       local terminal_win = find_claudecode_terminal_window()
       if terminal_win then
-        vim.api.nvim_set_current_win(terminal_win)
-        vim.cmd("startinsert")
+        local term_tab = vim.api.nvim_win_get_tabpage(terminal_win)
+        if term_tab == vim.api.nvim_get_current_tabpage() then
+          vim.api.nvim_set_current_win(terminal_win)
+          vim.cmd("startinsert")
+        end
       end
     end)
   end
@@ -720,7 +707,7 @@ end
 ---@return table res Result with provider, tab_name, and success status
 function M._open_native_diff(old_file_path, new_file_path, new_file_contents, tab_name)
   local _user_tab = vim.api.nvim_get_current_tabpage()
-  local _switched = switch_to_owning_tab_if_multi()
+  local _switched = switch_to_owning_tab_if_needed()
   local new_filename = vim.fn.fnamemodify(new_file_path, ":t") .. ".new"
   local tmp_file, err = create_temp_file(new_file_contents, new_filename)
   if not tmp_file then
@@ -1175,9 +1162,12 @@ function M._cleanup_diff_state(tab_name, reason)
 
       vim.schedule(function()
         if vim.api.nvim_win_is_valid(terminal_win) then
-          vim.api.nvim_set_current_win(terminal_win)
-          if vim.bo.buftype == "terminal" then
-            vim.cmd("startinsert")
+          local term_tab = vim.api.nvim_win_get_tabpage(terminal_win)
+          if term_tab == vim.api.nvim_get_current_tabpage() then
+            vim.api.nvim_set_current_win(terminal_win)
+            if vim.bo.buftype == "terminal" then
+              vim.cmd("startinsert")
+            end
           end
         end
       end)
@@ -1221,12 +1211,27 @@ function M._setup_blocking_diff(params, resolution_callback)
   local tab_name = params.tab_name
   logger.debug("diff", "Setting up diff for:", params.old_file_path)
 
-  local _user_tab = vim.api.nvim_get_current_tabpage()
-  local _switched = false
+  -- Determine target tab from the active Claude instance without switching the current tab.
+  -- Falls back to current tab when no active-tab hint is available.
+  local raw_active = _G._claudecode_active_tab_id
+  local target_tab = raw_active
+  if not target_tab or not vim.api.nvim_tabpage_is_valid(target_tab) then
+    target_tab = vim.api.nvim_get_current_tabpage()
+  end
+  logger.debug(
+    "diff",
+    "target tab resolution - raw _claudecode_active_tab_id:",
+    tostring(raw_active),
+    "resolved target_tab:",
+    tostring(target_tab),
+    "user_current_tab:",
+    tostring(vim.api.nvim_get_current_tabpage()),
+    "all tabs:",
+    vim.inspect(vim.api.nvim_list_tabpages())
+  )
+
   -- Wrap the setup in error handling to ensure cleanup on failure
   local setup_success, setup_error = pcall(function()
-    _switched = switch_to_owning_tab_if_multi()
-
     local old_file_exists = vim.fn.filereadable(params.old_file_path) == 1
     local is_new_file = not old_file_exists
 
@@ -1241,7 +1246,7 @@ function M._setup_blocking_diff(params, resolution_callback)
       end
     end
 
-    local original_tab_number = vim.api.nvim_get_current_tabpage()
+    local original_tab_number = target_tab
     local created_new_tab = false
     local terminal_win_in_new_tab = nil
     local existing_buffer = nil
@@ -1265,16 +1270,8 @@ function M._setup_blocking_diff(params, resolution_callback)
 
     -- Only look for existing windows if we're NOT in a new tab
     if not created_new_tab then
-      -- Determine the preferred tab (the terminal's tab) to avoid switching tabs
-      local preferred_tab = vim.api.nvim_get_current_tabpage()
-      local _term_win = find_claudecode_terminal_window()
-      if _term_win then
-        local _twc = vim.api.nvim_win_get_config(_term_win)
-        if not (_twc.relative and _twc.relative ~= "") then
-          preferred_tab = vim.api.nvim_win_get_tabpage(_term_win)
-        end
-      end
-
+      -- Search for existing buffer and target window directly in target_tab
+      -- without switching the current tab.
       if old_file_exists then
         for _, buf in ipairs(vim.api.nvim_list_bufs()) do
           if vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_buf_is_loaded(buf) then
@@ -1287,8 +1284,8 @@ function M._setup_blocking_diff(params, resolution_callback)
         end
 
         if existing_buffer then
-          -- Only use a window in the preferred tab to avoid switching tabs
-          for _, win in ipairs(vim.api.nvim_tabpage_list_wins(preferred_tab)) do
+          -- Find the window showing this buffer inside target_tab
+          for _, win in ipairs(vim.api.nvim_tabpage_list_wins(target_tab)) do
             if vim.api.nvim_win_get_buf(win) == existing_buffer then
               target_window = win
               break
@@ -1298,17 +1295,9 @@ function M._setup_blocking_diff(params, resolution_callback)
       end
 
       if not target_window then
-        target_window = find_window_adjacent_to_terminal()
+        -- Find the best main editor window in target_tab directly
+        target_window = find_main_editor_window(vim.api.nvim_tabpage_list_wins(target_tab))
       end
-    end
-    -- If created_new_tab is true, target_window stays nil and will be created in the new tab
-    -- If we still can't find a suitable window AND we're not in a new tab, error out
-    if not target_window and not created_new_tab then
-      error({
-        code = -32000,
-        message = "No suitable editor window found",
-        data = "Could not find a main editor window to display the diff",
-      })
     end
 
     local new_buffer = vim.api.nvim_create_buf(false, true) -- unlisted, scratch
@@ -1338,16 +1327,84 @@ function M._setup_blocking_diff(params, resolution_callback)
       pre_diff_buffer = vim.api.nvim_win_get_buf(target_window)
     end
 
-    local diff_info = M._create_diff_view_from_window(
-      target_window,
-      params.old_file_path,
-      new_buffer,
-      tab_name,
-      is_new_file,
-      terminal_win_in_new_tab,
-      existing_buffer,
-      not created_new_tab -- force_reuse: always reuse window in same-tab mode
-    )
+    -- For the non-new-tab path use nvim_win_call so that all vim window operations
+    -- (diffthis, vsplit, wincmd) run in the context of the target tab without
+    -- permanently changing the user's current tab/window.
+    -- Use target_window as the entry point when available; otherwise fall back to
+    -- any window in target_tab (e.g. the Claude terminal) and let
+    -- _create_diff_view_from_window create a split next to it.
+    local diff_info
+    if not created_new_tab then
+      local entry_win = target_window
+      if not entry_win then
+        local all_tab_wins = vim.api.nvim_tabpage_list_wins(target_tab)
+        entry_win = all_tab_wins[1]
+      end
+      if not entry_win then
+        error({
+          code = -32000,
+          message = "No suitable editor window found",
+          data = "Could not find any window in the target tab to display the diff",
+        })
+      end
+      vim.api.nvim_win_call(entry_win, function()
+        diff_info = M._create_diff_view_from_window(
+          target_window, -- may be nil; _create_diff_view_from_window will create a split
+          params.old_file_path,
+          new_buffer,
+          tab_name,
+          is_new_file,
+          terminal_win_in_new_tab,
+          existing_buffer,
+          target_window ~= nil -- force_reuse only when we found a real target window
+        )
+      end)
+
+      -- Diagnostic: capture which tab the diff actually landed in vs. the intended target.
+      logger.debug(
+        "diff",
+        "post-create tabs - target_tab:",
+        tostring(target_tab),
+        "user_current_tab:",
+        tostring(vim.api.nvim_get_current_tabpage()),
+        "new_window:",
+        tostring(diff_info and diff_info.new_window),
+        "new_window_tab:",
+        diff_info and diff_info.new_window and tostring(vim.api.nvim_win_get_tabpage(diff_info.new_window)) or "nil"
+      )
+
+      -- nvim_win_call restores focus to wherever the user was. If the diff opened in the
+      -- user's active tab, focus the proposed ("theirs") window so they can review it
+      -- immediately. For background tabs, leave focus unchanged.
+      --
+      -- Tab guard: only follow focus to new_window if it is genuinely in the user's tab.
+      -- If new_window ended up in a different tab (a routing bug elsewhere), we must not
+      -- yank the user across tabs by setting current win.
+      if not (config and config.diff_opts and config.diff_opts.keep_terminal_focus) then
+        if diff_info and diff_info.new_window then
+          vim.schedule(function()
+            if vim.api.nvim_win_is_valid(diff_info.new_window) then
+              local new_win_tab = vim.api.nvim_win_get_tabpage(diff_info.new_window)
+              if new_win_tab == vim.api.nvim_get_current_tabpage() then
+                vim.api.nvim_set_current_win(diff_info.new_window)
+              end
+            end
+          end)
+        end
+      end
+    else
+      -- new-tab path: we already switched to the new tab via display_terminal_in_new_tab
+      diff_info = M._create_diff_view_from_window(
+        target_window,
+        params.old_file_path,
+        new_buffer,
+        tab_name,
+        is_new_file,
+        terminal_win_in_new_tab,
+        existing_buffer,
+        not created_new_tab
+      )
+    end
 
     local autocmd_ids = register_diff_autocmds(tab_name, new_buffer)
 
@@ -1381,10 +1438,6 @@ function M._setup_blocking_diff(params, resolution_callback)
       is_new_file = is_new_file,
     })
   end) -- End of pcall
-
-  if _switched and vim.api.nvim_tabpage_is_valid(_user_tab) then
-    vim.api.nvim_set_current_tabpage(_user_tab)
-  end
 
   -- Handle setup errors
   if not setup_success then

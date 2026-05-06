@@ -415,14 +415,16 @@ function M.setup(opts)
     desc = "Stop Claude Code instance when its tab is closed",
   })
 
-  -- Auto-start in new tabs if configured
+  -- Auto-start in new tabs if configured.
+  -- Run synchronously (no vim.schedule): otherwise a user toggling the Claude terminal
+  -- in the new tab before the schedule fires would launch the CLI without a SSE port,
+  -- causing it to connect to whichever lock file it finds (usually another tab's server)
+  -- and routing all of that tab's messages — including openDiff — to the wrong server.
   if M.state.config.auto_start then
     vim.api.nvim_create_autocmd("TabNew", {
       group = vim.api.nvim_create_augroup("ClaudeCodeTabAutoStart", { clear = true }),
       callback = function()
-        vim.schedule(function()
-          M.start(false)
-        end)
+        M.start(false)
       end,
       desc = "Auto-start Claude Code integration in new tabs",
     })
