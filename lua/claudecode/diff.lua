@@ -1358,6 +1358,9 @@ function M._setup_blocking_diff_unified(params, resolution_callback)
       local line_count = vim.api.nvim_buf_line_count(new_buffer)
       local row = math.max(1, math.min(first_hunk_line, line_count))
       pcall(vim.api.nvim_win_set_cursor, target_window, { row, 0 })
+      pcall(vim.api.nvim_win_call, target_window, function()
+        vim.cmd("normal! zz")
+      end)
     end
 
     vim.b[new_buffer].claudecode_diff_tab_name = tab_name
