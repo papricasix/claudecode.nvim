@@ -214,7 +214,7 @@ You can edit Claude's suggestions before accepting them.
 
 | value | behavior |
 | --- | --- |
-| `"auto"` (default) | Use [unified.nvim](https://github.com/axkirillov/unified.nvim) if it is installed; otherwise fall back to `native`. |
+| `"auto"` (default) | Use [unified.nvim](https://github.com/papricasix/unified.nvim) if it is installed; otherwise fall back to `native`. |
 | `"native"` | Built-in side-by-side vimdiff: original on the left, proposed on the right. |
 | `"unified"` | One buffer containing the proposed content with inline +/- marks for the diff against the on-disk original. Marks auto-refresh as you edit. Requires unified.nvim. |
 
