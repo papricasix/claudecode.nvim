@@ -201,12 +201,30 @@ Configure the plugin with the detected path:
 
 ## Working with Diffs
 
-When Claude proposes changes, the plugin opens a native Neovim diff view:
+When Claude proposes changes, the plugin opens a diff view:
 
 - **Accept**: `:w` (save) or `<leader>aa`
 - **Reject**: `:q` or `<leader>ad`
 
 You can edit Claude's suggestions before accepting them.
+
+### Diff providers
+
+`diff_opts.provider` selects the rendering backend:
+
+| value | behavior |
+| --- | --- |
+| `"auto"` (default) | Use [unified.nvim](https://github.com/axkirillov/unified.nvim) if it is installed; otherwise fall back to `native`. |
+| `"native"` | Built-in side-by-side vimdiff: original on the left, proposed on the right. |
+| `"unified"` | One buffer containing the proposed content with inline +/- marks for the diff against the on-disk original. Marks auto-refresh as you edit. Requires unified.nvim. |
+
+The unified provider ignores `diff_opts.open_in_new_tab` — proposals always open in the current tab.
+
+`:ClaudeCodeDiffToggleProvider` (or `require("claudecode.diff").toggle_provider()`) flips the active provider for subsequent diffs. Any currently open diff keeps its existing view; the change takes effect on the next proposal. Suggested keymap:
+
+```lua
+vim.keymap.set("n", "<leader>aD", "<cmd>ClaudeCodeDiffToggleProvider<cr>", { desc = "Claude: toggle diff provider" })
+```
 
 ## How It Works
 
@@ -277,8 +295,9 @@ For deep technical details, see [ARCHITECTURE.md](./ARCHITECTURE.md).
 
     -- Diff Integration
     diff_opts = {
-      layout = "vertical", -- "vertical" or "horizontal"
-      open_in_new_tab = false,
+      provider = "auto", -- "auto" (unified.nvim if installed, else native), "native", or "unified"
+      layout = "vertical", -- "vertical" or "horizontal" (native provider only)
+      open_in_new_tab = false, -- ignored by the unified provider
       keep_terminal_focus = false, -- If true, moves focus back to terminal after diff opens
       hide_terminal_in_new_tab = false,
       -- on_new_file_reject = "keep_empty", -- "keep_empty" or "close_window"

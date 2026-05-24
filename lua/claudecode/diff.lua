@@ -363,6 +363,55 @@ function M.setup(user_config)
   config = user_config
 end
 
+---Toggle the configured diff provider between "native" and "unified".
+---Affects subsequent diffs only; any currently open diff keeps its view.
+---"auto" is resolved first, then flipped.
+---@return string new_provider The provider that will be used for the next diff
+function M.toggle_provider()
+  if not (config and config.diff_opts) then
+    vim.notify("ClaudeCode: diff config not initialized", vim.log.levels.WARN)
+    return "native"
+  end
+  local current = M._resolve_provider()
+  local next_provider = current == "unified" and "native" or "unified"
+  if next_provider == "unified" then
+    local ok = pcall(require, "unified.diff")
+    if not ok then
+      vim.notify("ClaudeCode: unified.nvim is not installed; staying on native", vim.log.levels.WARN)
+      config.diff_opts.provider = "native"
+      return "native"
+    end
+  end
+  config.diff_opts.provider = next_provider
+  vim.notify("ClaudeCode: diff provider set to '" .. next_provider .. "'", vim.log.levels.INFO)
+  return next_provider
+end
+
+---Resolve the configured diff provider to a concrete implementation.
+---"auto" picks "unified" if unified.nvim is loadable, else "native".
+---@return "native"|"unified"
+function M._resolve_provider()
+  local choice = "auto"
+  if config and config.diff_opts and type(config.diff_opts.provider) == "string" then
+    choice = config.diff_opts.provider
+  end
+  if choice == "native" then
+    return "native"
+  end
+  local ok = pcall(require, "unified.diff")
+  if choice == "unified" then
+    if not ok then
+      error({
+        code = -32000,
+        message = "unified.nvim not available",
+        data = "diff_opts.provider = 'unified' requires unified.nvim to be installed",
+      })
+    end
+    return "unified"
+  end
+  return ok and "unified" or "native"
+end
+
 ---Open a diff view between two files
 ---@param old_file_path string Path to the original file
 ---@param new_file_path string Path to the new file (used for naming)
@@ -1204,6 +1253,186 @@ function M._cleanup_all_active_diffs(reason)
   end
 end
 
+---Read a file's contents from disk; returns empty string if the file is missing.
+---@param path string
+---@return string contents
+local function read_file_contents_or_empty(path)
+  local f = io.open(path, "rb")
+  if not f then
+    return ""
+  end
+  local data = f:read("*a") or ""
+  f:close()
+  return data
+end
+
+---Lazily initialize unified.nvim's diff namespace/highlights/signs.
+---Safe to call multiple times — unified.config.setup is idempotent and merges
+---over current values.
+local function ensure_unified_initialized()
+  local cfg_ok, unified_config = pcall(require, "unified.config")
+  if cfg_ok and unified_config and unified_config.ns_id then
+    return
+  end
+  pcall(function()
+    require("unified").setup({ file_tree = { enabled = false } })
+  end)
+end
+
+---Set up the blocking diff using unified.nvim's inline renderer.
+---Single buffer containing the proposed content, inline +/- marks for the diff
+---against the on-disk original. open_in_new_tab is intentionally ignored here.
+---@param params table Parameters for the diff
+---@param resolution_callback function Callback to call when diff resolves
+function M._setup_blocking_diff_unified(params, resolution_callback)
+  local tab_name = params.tab_name
+  logger.debug("diff", "Setting up unified diff for:", params.old_file_path)
+
+  local setup_success, setup_error = pcall(function()
+    ensure_unified_initialized()
+    local unified_diff = require("unified.diff")
+
+    local old_file_exists = vim.fn.filereadable(params.old_file_path) == 1
+    local is_new_file = not old_file_exists
+
+    if old_file_exists and is_buffer_dirty(params.old_file_path) then
+      error({
+        code = -32000,
+        message = "Cannot create diff: file has unsaved changes",
+        data = "Please save (:w) or discard (:e!) changes to " .. params.old_file_path .. " before creating diff",
+      })
+    end
+
+    local old_text = is_new_file and "" or read_file_contents_or_empty(params.old_file_path)
+
+    local target_window = find_window_adjacent_to_terminal()
+    if not target_window then
+      target_window = find_main_editor_window()
+    end
+    if not target_window then
+      error({
+        code = -32000,
+        message = "No suitable editor window found",
+        data = "Could not find a window to display the unified diff",
+      })
+    end
+
+    local pre_diff_buffer = vim.api.nvim_win_get_buf(target_window)
+
+    local new_buffer = vim.api.nvim_create_buf(false, true)
+    if new_buffer == 0 then
+      error({
+        code = -32000,
+        message = "Buffer creation failed",
+        data = "Could not create proposed-changes buffer",
+      })
+    end
+
+    local unique_name = is_new_file and (tab_name .. " (NEW FILE - proposed)") or (tab_name .. " (proposed)")
+    pcall(vim.api.nvim_buf_set_name, new_buffer, unique_name)
+
+    local lines = vim.split(params.new_file_contents, "\n")
+    if #lines > 0 and lines[#lines] == "" then
+      table.remove(lines, #lines)
+    end
+    vim.api.nvim_buf_set_lines(new_buffer, 0, -1, false, lines)
+
+    vim.api.nvim_buf_set_option(new_buffer, "buftype", "acwrite")
+    vim.api.nvim_buf_set_option(new_buffer, "bufhidden", "hide")
+    vim.api.nvim_buf_set_option(new_buffer, "swapfile", false)
+    vim.api.nvim_buf_set_option(new_buffer, "modifiable", true)
+    vim.api.nvim_buf_set_option(new_buffer, "modified", false)
+
+    local ft = detect_filetype(params.old_file_path, nil)
+    if ft and ft ~= "" then
+      vim.api.nvim_set_option_value("filetype", ft, { buf = new_buffer })
+    end
+
+    local original_cursor_pos = vim.api.nvim_win_get_cursor(target_window)
+    vim.api.nvim_win_set_buf(target_window, new_buffer)
+
+    unified_diff.show_against_text(new_buffer, old_text)
+
+    local first_hunk_line = (vim.b[new_buffer].unified_hunks or {})[1]
+    if first_hunk_line and vim.api.nvim_win_is_valid(target_window) then
+      local line_count = vim.api.nvim_buf_line_count(new_buffer)
+      local row = math.max(1, math.min(first_hunk_line, line_count))
+      pcall(vim.api.nvim_win_set_cursor, target_window, { row, 0 })
+    end
+
+    vim.b[new_buffer].claudecode_diff_tab_name = tab_name
+    vim.b[new_buffer].claudecode_diff_new_win = target_window
+    vim.b[new_buffer].claudecode_diff_target_win = target_window
+
+    local autocmd_ids = register_diff_autocmds(tab_name, new_buffer)
+
+    local refresh_id = vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, {
+      group = get_autocmd_group(),
+      buffer = new_buffer,
+      callback = function()
+        pcall(unified_diff.show_against_text, new_buffer, old_text)
+      end,
+    })
+    autocmd_ids[#autocmd_ids + 1] = refresh_id
+
+    if not (config and config.diff_opts and config.diff_opts.keep_terminal_focus) then
+      vim.schedule(function()
+        if vim.api.nvim_win_is_valid(target_window) and vim.api.nvim_win_get_buf(target_window) == new_buffer then
+          vim.api.nvim_set_current_win(target_window)
+        end
+      end)
+    end
+
+    M._register_diff_state(tab_name, {
+      old_file_path = params.old_file_path,
+      new_file_path = params.new_file_path,
+      new_file_contents = params.new_file_contents,
+      new_buffer = new_buffer,
+      new_window = nil, -- no separate diff window; we reused target_window
+      target_window = target_window,
+      target_window_created_by_plugin = false,
+      pre_diff_buffer = pre_diff_buffer,
+      original_buffer = nil,
+      original_buffer_created_by_plugin = false,
+      original_cursor_pos = original_cursor_pos,
+      original_tab_number = vim.api.nvim_get_current_tabpage(),
+      created_new_tab = false,
+      new_tab_number = nil,
+      had_terminal_in_original = false,
+      terminal_win_in_new_tab = nil,
+      autocmd_ids = autocmd_ids,
+      created_at = vim.fn.localtime(),
+      status = "pending",
+      resolution_callback = resolution_callback,
+      result_content = nil,
+      is_new_file = is_new_file,
+      provider = "unified",
+    })
+  end)
+
+  if not setup_success then
+    local error_msg
+    if type(setup_error) == "table" and setup_error.message then
+      error_msg = "Failed to setup diff operation: " .. setup_error.message
+      if setup_error.data then
+        error_msg = error_msg .. " (" .. setup_error.data .. ")"
+      end
+    else
+      error_msg = "Failed to setup diff operation: " .. tostring(setup_error)
+    end
+
+    if active_diffs[tab_name] then
+      M._cleanup_diff_state(tab_name, "setup failed")
+    end
+
+    error({
+      code = -32000,
+      message = "Diff setup failed",
+      data = error_msg,
+    })
+  end
+end
+
 ---Set up blocking diff operation with simpler approach
 ---@param params table Parameters for the diff
 ---@param resolution_callback function Callback to call when diff resolves
@@ -1497,8 +1726,14 @@ function M.open_diff_blocking(old_file_path, new_file_path, new_file_contents, t
 
   logger.debug("diff", "Starting diff setup for", tab_name)
 
-  -- Use native diff implementation
-  local success, err = pcall(M._setup_blocking_diff, {
+  local provider_ok, provider = pcall(M._resolve_provider)
+  if not provider_ok then
+    error(provider)
+  end
+  local setup_fn = provider == "unified" and M._setup_blocking_diff_unified or M._setup_blocking_diff
+  logger.debug("diff", "Using diff provider:", provider)
+
+  local success, err = pcall(setup_fn, {
     old_file_path = old_file_path,
     new_file_path = new_file_path,
     new_file_contents = new_file_contents,

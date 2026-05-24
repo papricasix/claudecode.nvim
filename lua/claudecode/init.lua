@@ -1137,6 +1137,13 @@ function M._create_commands()
     desc = "Deny/reject the current diff changes",
   })
 
+  vim.api.nvim_create_user_command("ClaudeCodeDiffToggleProvider", function()
+    local diff = require("claudecode.diff")
+    diff.toggle_provider()
+  end, {
+    desc = "Toggle the diff provider between native and unified.nvim (affects next diff)",
+  })
+
   vim.api.nvim_create_user_command("ClaudeCodeSelectModel", function(opts)
     local cmd_args = opts.args and opts.args ~= "" and opts.args or nil
     M.open_with_model(cmd_args)

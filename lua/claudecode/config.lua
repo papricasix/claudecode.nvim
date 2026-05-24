@@ -21,8 +21,9 @@ M.defaults = {
   connection_timeout = 10000, -- Maximum time to wait for Claude Code to connect (milliseconds)
   queue_timeout = 5000, -- Maximum time to keep @ mentions in queue (milliseconds)
   diff_opts = {
+    provider = "auto", -- "auto" (use unified.nvim if installed, else native), "native", or "unified"
     layout = "vertical",
-    open_in_new_tab = false, -- Open diff in a new tab (false = use current tab)
+    open_in_new_tab = false, -- Open diff in a new tab (false = use current tab). Ignored by the unified provider.
     keep_terminal_focus = false, -- If true, moves focus back to terminal after diff opens (including floating terminals)
     hide_terminal_in_new_tab = false, -- If true and opening in a new tab, do not show Claude terminal there
     on_new_file_reject = "keep_empty", -- "keep_empty" leaves an empty buffer; "close_window" closes the placeholder split
@@ -113,6 +114,13 @@ function M.validate(config)
   assert(type(config.queue_timeout) == "number" and config.queue_timeout > 0, "queue_timeout must be a positive number")
 
   assert(type(config.diff_opts) == "table", "diff_opts must be a table")
+  if config.diff_opts.provider ~= nil then
+    local p = config.diff_opts.provider
+    assert(
+      type(p) == "string" and (p == "auto" or p == "native" or p == "unified"),
+      "diff_opts.provider must be 'auto', 'native', or 'unified'"
+    )
+  end
   -- New diff options (optional validation to allow backward compatibility)
   if config.diff_opts.layout ~= nil then
     assert(
