@@ -465,6 +465,14 @@ local vim = {
       return (vim._windows[winid] and vim._windows[winid].width) or 80
     end,
 
+    nvim_list_tabpages = function()
+      local tabs = {}
+      for tab, _ in pairs(vim._tabs) do
+        table.insert(tabs, tab)
+      end
+      return tabs
+    end,
+
     nvim_get_current_tabpage = function()
       return vim._current_tabpage
     end,

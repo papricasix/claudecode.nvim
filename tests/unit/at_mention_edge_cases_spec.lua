@@ -150,11 +150,10 @@ describe("At Mention Edge Cases", function()
   describe("broadcast_at_mention error handling", function()
     it("should handle format_path_for_at_mention errors gracefully", function()
       -- Mock a running server
-      init_module.state = { server = {
-        broadcast = function()
-          return true
-        end,
-      } }
+      init_module.instances[1] = { server = {
+        broadcast = function() return true end,
+        get_status = function() return { running = true, client_count = 1 } end,
+      }, mention_queue = {} }
 
       -- Temporarily simulate production environment
       local old_busted = package.loaded["busted"]
@@ -170,7 +169,7 @@ describe("At Mention Edge Cases", function()
     end)
 
     it("should handle server not running", function()
-      init_module.state = { server = nil }
+      init_module.instances[1] = nil
 
       local success, error_msg = init_module._broadcast_at_mention("/Users/test/project/config.lua")
       expect(success).to_be_false()
@@ -180,11 +179,10 @@ describe("At Mention Edge Cases", function()
 
     it("should handle broadcast failures", function()
       -- Mock a server that fails to broadcast
-      init_module.state = { server = {
-        broadcast = function()
-          return false
-        end,
-      } }
+      init_module.instances[1] = { server = {
+        broadcast = function() return false end,
+        get_status = function() return { running = true, client_count = 1 } end,
+      }, mention_queue = {} }
 
       local success, error_msg = init_module._broadcast_at_mention("/Users/test/project/config.lua")
       expect(success).to_be_false()
@@ -195,11 +193,10 @@ describe("At Mention Edge Cases", function()
 
   describe("add_paths_to_claude error scenarios", function()
     it("should handle empty file list", function()
-      init_module.state = { server = {
-        broadcast = function()
-          return true
-        end,
-      } }
+      init_module.instances[1] = { server = {
+        broadcast = function() return true end,
+        get_status = function() return { running = true, client_count = 1 } end,
+      }, mention_queue = {} }
 
       local success_count, total_count = init_module._add_paths_to_claude({})
       expect(success_count).to_be(0)
@@ -207,11 +204,10 @@ describe("At Mention Edge Cases", function()
     end)
 
     it("should handle nil file list", function()
-      init_module.state = { server = {
-        broadcast = function()
-          return true
-        end,
-      } }
+      init_module.instances[1] = { server = {
+        broadcast = function() return true end,
+        get_status = function() return { running = true, client_count = 1 } end,
+      }, mention_queue = {} }
 
       local success_count, total_count = init_module._add_paths_to_claude(nil)
       expect(success_count).to_be(0)
@@ -219,14 +215,12 @@ describe("At Mention Edge Cases", function()
     end)
 
     it("should handle mixed success and failure", function()
-      init_module.state = {
-        server = {
-          broadcast = function(event, params)
-            -- Fail for files with "fail" in the name
-            return not string.match(params.filePath, "fail")
-          end,
-        },
-      }
+      init_module.instances[1] = { server = {
+        broadcast = function(event, params)
+          return not string.match(params.filePath, "fail")
+        end,
+        get_status = function() return { running = true, client_count = 1 } end,
+      }, mention_queue = {} }
 
       local files = {
         "/Users/test/project/success.lua",
@@ -240,13 +234,12 @@ describe("At Mention Edge Cases", function()
     end)
 
     it("should provide user notifications for mixed results", function()
-      init_module.state = {
-        server = {
-          broadcast = function(event, params)
-            return not string.match(params.filePath, "fail")
-          end,
-        },
-      }
+      init_module.instances[1] = { server = {
+        broadcast = function(event, params)
+          return not string.match(params.filePath, "fail")
+        end,
+        get_status = function() return { running = true, client_count = 1 } end,
+      }, mention_queue = {} }
 
       local files = {
         "/Users/test/project/success.lua",
@@ -266,11 +259,10 @@ describe("At Mention Edge Cases", function()
     end)
 
     it("should handle all failures", function()
-      init_module.state = { server = {
-        broadcast = function()
-          return false
-        end,
-      } }
+      init_module.instances[1] = { server = {
+        broadcast = function() return false end,
+        get_status = function() return { running = true, client_count = 1 } end,
+      }, mention_queue = {} }
 
       local files = {
         "/Users/test/project/file1.lua",

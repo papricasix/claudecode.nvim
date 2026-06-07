@@ -28,6 +28,9 @@ describe("focus_after_send behavior", function()
       broadcast = spy.new(function()
         return true
       end),
+      get_status = function()
+        return { running = true, client_count = 1 }
+      end,
     }
 
     local mock_config = {
@@ -94,7 +97,7 @@ describe("focus_after_send behavior", function()
     claudecode.setup({})
 
     -- Mark server as present and stub low-level broadcast to succeed
-    claudecode.state.server = mock_server_facade
+    claudecode.instances[1] = { server = mock_server_facade, port = 12345, mention_queue = {} }
     claudecode._broadcast_at_mention = spy.new(function()
       return true, nil
     end)
@@ -115,7 +118,7 @@ describe("focus_after_send behavior", function()
     claudecode = require("claudecode")
     claudecode.setup({})
 
-    claudecode.state.server = mock_server_facade
+    claudecode.instances[1] = { server = mock_server_facade, port = 12345, mention_queue = {} }
     claudecode._broadcast_at_mention = spy.new(function()
       return true, nil
     end)

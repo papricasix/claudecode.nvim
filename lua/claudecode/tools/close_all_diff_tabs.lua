@@ -20,14 +20,8 @@ local function handler(params)
   local diff = require("claudecode.diff")
   closed_count = closed_count + diff.close_all_diffs("closeAllDiffTabs tool")
 
-  -- Scope to the calling server's tab to avoid closing diffs owned by other Claude instances
-  local target_tab = _G._claudecode_active_tab_id
-  if not target_tab or not vim.api.nvim_tabpage_is_valid(target_tab) then
-    target_tab = vim.api.nvim_get_current_tabpage()
-  end
-
-  -- Get windows only in the owning tab (catches any untracked diff windows, e.g. fugitive)
-  local windows = vim.api.nvim_tabpage_list_wins(target_tab)
+  -- Get all windows (catches any untracked diff windows, e.g. fugitive)
+  local windows = vim.api.nvim_list_wins()
   local windows_to_close = {} -- Use set to avoid duplicates
 
   for _, win in ipairs(windows) do

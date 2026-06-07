@@ -391,12 +391,10 @@ describe("Selection module", function()
     selection.enable(mock_server)
 
     assert(selection.state.tracking_enabled == true)
-    assert(mock_server == selection.server)
 
     selection.disable()
 
     assert(selection.state.tracking_enabled == false)
-    assert(selection.server == nil)
     assert(selection.state.latest_selection == nil)
   end)
 
@@ -808,6 +806,12 @@ describe("Range Selection Tests", function()
         state = {
           server = mock_server,
         },
+        get_instance = function()
+          if mock_claudecode_main.state.server then
+            return { server = mock_claudecode_main.state.server }
+          end
+          return nil
+        end,
         send_at_mention = function(file_path, start_line, end_line, context)
           -- Convert to the format expected by tests (1-indexed to 0-indexed conversion done here)
           local params = {

@@ -12,6 +12,9 @@ describe("ClaudeCodeAdd command", function()
       broadcast = spy.new(function()
         return true
       end),
+      get_status = function()
+        return { running = true, client_count = 1 }
+      end,
     }
 
     mock_logger = {
@@ -116,9 +119,8 @@ describe("ClaudeCodeAdd command", function()
 
     claudecode = require("claudecode")
 
-    -- Set up the server state manually for testing
-    claudecode.state.server = mock_server
-    claudecode.state.port = 12345
+    -- Set up the server instance for the current tab (tabpage 1 in mock)
+    claudecode.instances[1] = { server = mock_server, port = 12345, mention_queue = {} }
   end)
 
   after_each(function()
@@ -167,7 +169,7 @@ describe("ClaudeCodeAdd command", function()
 
     describe("validation", function()
       it("should error when server is not running", function()
-        claudecode.state.server = nil
+        claudecode.instances[1] = nil
 
         command_handler({ args = "/existing/file.lua" })
 
