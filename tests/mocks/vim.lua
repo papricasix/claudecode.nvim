@@ -303,6 +303,17 @@ local vim = {
       return wins
     end,
 
+    nvim_tabpage_list_wins = function(tabpage)
+      local wins = {}
+      local list = vim._tab_windows[tabpage] or {}
+      for _, winid in ipairs(list) do
+        if vim._windows[winid] then
+          table.insert(wins, winid)
+        end
+      end
+      return wins
+    end,
+
     nvim_win_set_buf = function(winid, bufnr)
       if not vim._windows[winid] then
         vim._windows[winid] = {}
@@ -372,11 +383,25 @@ local vim = {
     end,
 
     nvim_win_call = function(winid, callback)
-      -- Mock implementation - just call the callback
-      if vim._windows[winid] then
-        return callback()
+      if not vim._windows[winid] then
+        error("Invalid window id: " .. tostring(winid))
       end
-      error("Invalid window id: " .. tostring(winid))
+      -- Temporarily set current window/tab to the target so that callers can
+      -- run vim commands "as if" inside that window — mirroring real nvim.
+      local saved_win = vim._current_window
+      local saved_tab = vim._current_tabpage
+      vim._current_window = winid
+      local target_tab = vim._win_tab[winid]
+      if target_tab and vim._tabs[target_tab] then
+        vim._current_tabpage = target_tab
+      end
+      local ok, result = pcall(callback)
+      vim._current_window = saved_win
+      vim._current_tabpage = saved_tab
+      if not ok then
+        error(result)
+      end
+      return result
     end,
 
     nvim_win_get_config = function(winid)

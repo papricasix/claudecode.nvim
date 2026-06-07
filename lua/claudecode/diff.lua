@@ -39,8 +39,47 @@ local function get_autocmd_group()
   return autocmd_group
 end
 
+---Resolve the tab that owns the currently active Claude Code WebSocket message.
+---The server sets `_G._claudecode_active_tab_id` on every incoming message; we
+---fall back to the user's current tab when no owner is known (e.g. tests).
+---@return integer owning_tab Tabpage handle of the owning Claude instance
+local function get_owning_tab()
+  local target = _G._claudecode_active_tab_id
+  if target and vim.api.nvim_tabpage_is_valid(target) then
+    return target
+  end
+  return vim.api.nvim_get_current_tabpage()
+end
+
+---Run `fn` in the context of the tab that owns the active Claude message.
+---Internally uses `nvim_win_call` so that all vim ex-commands and "current
+---tab/window" lookups inside `fn` see the owning tab — without permanently
+---moving the user away from whichever tab they are looking at. After `fn`
+---returns, the user's view is restored.
+---
+---This is the canonical entry point for any diff/UI work triggered by a
+---Claude tool call. Use it instead of reading `_G._claudecode_active_tab_id`
+---directly so future code paths route correctly by default.
+---@generic T
+---@param fn fun(owning_tab: integer): T
+---@return T result Value returned by `fn`
+local function in_owning_tab(fn)
+  local tab = get_owning_tab()
+  local wins = vim.api.nvim_tabpage_list_wins(tab)
+  if #wins == 0 then
+    return fn(vim.api.nvim_get_current_tabpage())
+  end
+  return vim.api.nvim_win_call(wins[1], function()
+    return fn(tab)
+  end)
+end
+
 ---Switch to the tab that owns the active Claude Code WebSocket message.
 ---Returns whether a switch happened.
+---
+---Prefer `in_owning_tab(fn)` for new code — it scopes work to the owning tab
+---without yanking the user across tabs. This destructive variant is kept for
+---the legacy `_open_native_diff` path which still needs it.
 ---@return boolean switched
 local function switch_to_owning_tab_if_needed()
   local target = _G._claudecode_active_tab_id
@@ -1305,82 +1344,100 @@ function M._setup_blocking_diff_unified(params, resolution_callback)
 
     local old_text = is_new_file and "" or read_file_contents_or_empty(params.old_file_path)
 
-    local target_window = find_window_adjacent_to_terminal()
-    if not target_window then
-      target_window = find_main_editor_window()
-    end
-    if not target_window then
-      error({
-        code = -32000,
-        message = "No suitable editor window found",
-        data = "Could not find a window to display the unified diff",
+    -- All window discovery, buffer placement, and cursor positioning must
+    -- happen in the tab that owns the active Claude message — otherwise the
+    -- diff lands in whichever tab the user is currently looking at. The
+    -- helpers below all read "current tab" implicitly, so we wrap the work in
+    -- `in_owning_tab` which sets the owning tab as current for the duration.
+    local target_window, pre_diff_buffer, new_buffer, original_cursor_pos, autocmd_ids
+    local owning_tab = in_owning_tab(function(tab)
+      target_window = find_window_adjacent_to_terminal()
+      if not target_window then
+        target_window = find_main_editor_window()
+      end
+      if not target_window then
+        error({
+          code = -32000,
+          message = "No suitable editor window found",
+          data = "Could not find a window to display the unified diff",
+        })
+      end
+
+      pre_diff_buffer = vim.api.nvim_win_get_buf(target_window)
+
+      new_buffer = vim.api.nvim_create_buf(false, true)
+      if new_buffer == 0 then
+        error({
+          code = -32000,
+          message = "Buffer creation failed",
+          data = "Could not create proposed-changes buffer",
+        })
+      end
+
+      local unique_name = is_new_file and (tab_name .. " (NEW FILE - proposed)") or (tab_name .. " (proposed)")
+      pcall(vim.api.nvim_buf_set_name, new_buffer, unique_name)
+
+      local lines = vim.split(params.new_file_contents, "\n")
+      if #lines > 0 and lines[#lines] == "" then
+        table.remove(lines, #lines)
+      end
+      vim.api.nvim_buf_set_lines(new_buffer, 0, -1, false, lines)
+
+      vim.api.nvim_buf_set_option(new_buffer, "buftype", "acwrite")
+      vim.api.nvim_buf_set_option(new_buffer, "bufhidden", "hide")
+      vim.api.nvim_buf_set_option(new_buffer, "swapfile", false)
+      vim.api.nvim_buf_set_option(new_buffer, "modifiable", true)
+      vim.api.nvim_buf_set_option(new_buffer, "modified", false)
+
+      local ft = detect_filetype(params.old_file_path, nil)
+      if ft and ft ~= "" then
+        vim.api.nvim_set_option_value("filetype", ft, { buf = new_buffer })
+      end
+
+      original_cursor_pos = vim.api.nvim_win_get_cursor(target_window)
+      vim.api.nvim_win_set_buf(target_window, new_buffer)
+
+      unified_diff.show_against_text(new_buffer, old_text)
+
+      local first_hunk_line = (vim.b[new_buffer].unified_hunks or {})[1]
+      if first_hunk_line and vim.api.nvim_win_is_valid(target_window) then
+        local line_count = vim.api.nvim_buf_line_count(new_buffer)
+        local row = math.max(1, math.min(first_hunk_line, line_count))
+        pcall(vim.api.nvim_win_set_cursor, target_window, { row, 0 })
+        pcall(vim.api.nvim_win_call, target_window, function()
+          vim.cmd("normal! zz")
+        end)
+      end
+
+      vim.b[new_buffer].claudecode_diff_tab_name = tab_name
+      vim.b[new_buffer].claudecode_diff_new_win = target_window
+      vim.b[new_buffer].claudecode_diff_target_win = target_window
+
+      autocmd_ids = register_diff_autocmds(tab_name, new_buffer)
+
+      local refresh_id = vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, {
+        group = get_autocmd_group(),
+        buffer = new_buffer,
+        callback = function()
+          pcall(unified_diff.show_against_text, new_buffer, old_text)
+        end,
       })
-    end
+      autocmd_ids[#autocmd_ids + 1] = refresh_id
 
-    local pre_diff_buffer = vim.api.nvim_win_get_buf(target_window)
+      return tab
+    end)
 
-    local new_buffer = vim.api.nvim_create_buf(false, true)
-    if new_buffer == 0 then
-      error({
-        code = -32000,
-        message = "Buffer creation failed",
-        data = "Could not create proposed-changes buffer",
-      })
-    end
-
-    local unique_name = is_new_file and (tab_name .. " (NEW FILE - proposed)") or (tab_name .. " (proposed)")
-    pcall(vim.api.nvim_buf_set_name, new_buffer, unique_name)
-
-    local lines = vim.split(params.new_file_contents, "\n")
-    if #lines > 0 and lines[#lines] == "" then
-      table.remove(lines, #lines)
-    end
-    vim.api.nvim_buf_set_lines(new_buffer, 0, -1, false, lines)
-
-    vim.api.nvim_buf_set_option(new_buffer, "buftype", "acwrite")
-    vim.api.nvim_buf_set_option(new_buffer, "bufhidden", "hide")
-    vim.api.nvim_buf_set_option(new_buffer, "swapfile", false)
-    vim.api.nvim_buf_set_option(new_buffer, "modifiable", true)
-    vim.api.nvim_buf_set_option(new_buffer, "modified", false)
-
-    local ft = detect_filetype(params.old_file_path, nil)
-    if ft and ft ~= "" then
-      vim.api.nvim_set_option_value("filetype", ft, { buf = new_buffer })
-    end
-
-    local original_cursor_pos = vim.api.nvim_win_get_cursor(target_window)
-    vim.api.nvim_win_set_buf(target_window, new_buffer)
-
-    unified_diff.show_against_text(new_buffer, old_text)
-
-    local first_hunk_line = (vim.b[new_buffer].unified_hunks or {})[1]
-    if first_hunk_line and vim.api.nvim_win_is_valid(target_window) then
-      local line_count = vim.api.nvim_buf_line_count(new_buffer)
-      local row = math.max(1, math.min(first_hunk_line, line_count))
-      pcall(vim.api.nvim_win_set_cursor, target_window, { row, 0 })
-      pcall(vim.api.nvim_win_call, target_window, function()
-        vim.cmd("normal! zz")
-      end)
-    end
-
-    vim.b[new_buffer].claudecode_diff_tab_name = tab_name
-    vim.b[new_buffer].claudecode_diff_new_win = target_window
-    vim.b[new_buffer].claudecode_diff_target_win = target_window
-
-    local autocmd_ids = register_diff_autocmds(tab_name, new_buffer)
-
-    local refresh_id = vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, {
-      group = get_autocmd_group(),
-      buffer = new_buffer,
-      callback = function()
-        pcall(unified_diff.show_against_text, new_buffer, old_text)
-      end,
-    })
-    autocmd_ids[#autocmd_ids + 1] = refresh_id
-
+    -- Focus shift runs on the next event loop tick. By then we are no longer
+    -- inside in_owning_tab, so unconditionally setting target_window as
+    -- current would yank the user to the owning tab. Only follow focus when
+    -- the owning tab is already the user's current tab.
     if not (config and config.diff_opts and config.diff_opts.keep_terminal_focus) then
       vim.schedule(function()
-        if vim.api.nvim_win_is_valid(target_window) and vim.api.nvim_win_get_buf(target_window) == new_buffer then
+        if not (vim.api.nvim_win_is_valid(target_window) and vim.api.nvim_win_get_buf(target_window) == new_buffer) then
+          return
+        end
+        local win_tab = vim.api.nvim_win_get_tabpage(target_window)
+        if win_tab == vim.api.nvim_get_current_tabpage() then
           vim.api.nvim_set_current_win(target_window)
         end
       end)
@@ -1398,7 +1455,7 @@ function M._setup_blocking_diff_unified(params, resolution_callback)
       original_buffer = nil,
       original_buffer_created_by_plugin = false,
       original_cursor_pos = original_cursor_pos,
-      original_tab_number = vim.api.nvim_get_current_tabpage(),
+      original_tab_number = owning_tab,
       created_new_tab = false,
       new_tab_number = nil,
       had_terminal_in_original = false,
@@ -1446,10 +1503,7 @@ function M._setup_blocking_diff(params, resolution_callback)
   -- Determine target tab from the active Claude instance without switching the current tab.
   -- Falls back to current tab when no active-tab hint is available.
   local raw_active = _G._claudecode_active_tab_id
-  local target_tab = raw_active
-  if not target_tab or not vim.api.nvim_tabpage_is_valid(target_tab) then
-    target_tab = vim.api.nvim_get_current_tabpage()
-  end
+  local target_tab = get_owning_tab()
   logger.debug(
     "diff",
     "target tab resolution - raw _claudecode_active_tab_id:",
