@@ -355,10 +355,7 @@ describe("claudecode.init", function()
           command_found = true
           local config = call.vals[3]
           assert.is_equal("*", config.nargs)
-          assert.is_true(
-            string.find(config.desc, "Claude Code") ~= nil,
-            "Description should mention Claude Code"
-          )
+          assert.is_true(string.find(config.desc, "Claude Code") ~= nil, "Description should mention Claude Code")
           break
         end
       end

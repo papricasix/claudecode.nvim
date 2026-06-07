@@ -69,18 +69,24 @@ local function create_instance(tab_id)
           return result_or_error_table
         end
 
-        logger.debug("server", "Response - tools/call", params and params.name .. ":", vim.inspect(result_or_error_table))
+        logger.debug(
+          "server",
+          "Response - tools/call",
+          params and params.name .. ":",
+          vim.inspect(result_or_error_table)
+        )
 
         if result_or_error_table.error then
           return nil, result_or_error_table.error
         elseif result_or_error_table.result then
           return result_or_error_table.result, nil
         else
-          return nil, {
-            code = -32603,
-            message = "Internal error",
-            data = "Tool handler returned unexpected format",
-          }
+          return nil,
+            {
+              code = -32603,
+              message = "Internal error",
+              data = "Tool handler returned unexpected format",
+            }
         end
       end,
     }

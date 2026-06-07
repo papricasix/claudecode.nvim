@@ -115,13 +115,15 @@ local function process_connected_mentions_for(inst)
   local debounce_delay = math.max(10, 50)
   inst.mention_timer = vim.loop.new_timer()
 
-  local wrapped = vim.schedule_wrap and vim.schedule_wrap(function()
-    process_mention_queue_for_inst(inst, false)
-  end) or function()
-    vim.schedule(function()
-      process_mention_queue_for_inst(inst, false)
-    end)
-  end
+  local wrapped = vim.schedule_wrap
+      and vim.schedule_wrap(function()
+        process_mention_queue_for_inst(inst, false)
+      end)
+    or function()
+      vim.schedule(function()
+        process_mention_queue_for_inst(inst, false)
+      end)
+    end
 
   inst.mention_timer:start(debounce_delay, 0, wrapped)
 end
@@ -575,7 +577,10 @@ function M.start(show_startup_notification)
   end
 
   if show_startup_notification then
-    logger.info("init", "Claude Code integration started on port " .. tostring(port) .. " (tab " .. tostring(tab_id) .. ")")
+    logger.info(
+      "init",
+      "Claude Code integration started on port " .. tostring(port) .. " (tab " .. tostring(tab_id) .. ")"
+    )
   end
 
   return true, port

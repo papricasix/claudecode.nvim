@@ -687,7 +687,15 @@ function M.show(file_path, opts)
     end
 
     scroll_into_view(win, s, e - s + 1)
-    logger.debug("live_cursor", "painted", file_path, "lines", tostring(s) .. "-" .. tostring(e), "in win", tostring(win))
+    logger.debug(
+      "live_cursor",
+      "painted",
+      file_path,
+      "lines",
+      tostring(s) .. "-" .. tostring(e),
+      "in win",
+      tostring(win)
+    )
   else
     logger.debug("live_cursor", "opened", file_path, "(no line range to highlight)")
   end
@@ -798,10 +806,7 @@ function M.toggle(arg)
 
   if config.enabled and not (config.mode == "preview" or config.mode == "open") then
     config.enabled = false
-    vim.notify(
-      "Claude live cursor: set a mode first — :ClaudeCodeLiveCursor preview  (or open)",
-      vim.log.levels.WARN
-    )
+    vim.notify("Claude live cursor: set a mode first — :ClaudeCodeLiveCursor preview  (or open)", vim.log.levels.WARN)
     return false
   end
 
