@@ -129,6 +129,7 @@ local function find_main_editor_window(windows)
         or filetype == "aerial"
         or filetype == "tagbar"
         or filetype == "snacks_picker_list"
+        or filetype == "snacks_layout_box"
       )
     then
       is_suitable = false
@@ -141,6 +142,9 @@ local function find_main_editor_window(windows)
 
   return nil
 end
+
+-- Exposed for testing the sidebar/explorer exclusion logic.
+M._find_main_editor_window = find_main_editor_window
 
 ---Find the Claude Code terminal window to keep focus there.
 ---Uses the terminal provider to get the active terminal buffer, then finds its window.
@@ -1086,7 +1090,13 @@ function M._create_diff_view_from_window(
       local buftype = vim.api.nvim_buf_get_option(buf, "buftype")
       local filetype = vim.api.nvim_buf_get_option(buf, "filetype")
 
-      if buftype == "terminal" or buftype == "prompt" or filetype == "neo-tree" or filetype == "snacks_picker_list" then
+      if
+        buftype == "terminal"
+        or buftype == "prompt"
+        or filetype == "neo-tree"
+        or filetype == "snacks_picker_list"
+        or filetype == "snacks_layout_box"
+      then
         create_split()
       end
 
@@ -1204,6 +1214,12 @@ function M._cleanup_diff_state(tab_name, reason)
     -- Close new diff window if still open (only if not in a new tab)
     if diff_data.new_window and vim.api.nvim_win_is_valid(diff_data.new_window) then
       pcall(vim.api.nvim_win_close, diff_data.new_window, true)
+    end
+
+    -- Close the fallback window we created when no editor window existed (issue #231); it's reused
+    -- as the original pane, so target_window_created_by_plugin below doesn't cover it.
+    if diff_data.fallback_window and vim.api.nvim_win_is_valid(diff_data.fallback_window) then
+      pcall(vim.api.nvim_win_close, diff_data.fallback_window, false)
     end
 
     -- If we created an extra window/split for the diff, close it. Otherwise just disable diff mode.
@@ -1516,6 +1532,12 @@ function M._setup_blocking_diff(params, resolution_callback)
     vim.inspect(vim.api.nvim_list_tabpages())
   )
 
+  -- Hoisted so the error handler can clean them up if setup fails before the diff state is
+  -- registered: otherwise the terminal-only fallback split and the proposed buffer are stranded
+  -- (the state-based cleanup is gated on a registered diff). Issue #231.
+  local fallback_window = nil
+  local new_buffer = nil
+
   -- Wrap the setup in error handling to ensure cleanup on failure
   local setup_success, setup_error = pcall(function()
     local old_file_exists = vim.fn.filereadable(params.old_file_path) == 1
@@ -1585,8 +1607,26 @@ function M._setup_blocking_diff(params, resolution_callback)
         target_window = find_main_editor_window(vim.api.nvim_tabpage_list_wins(target_tab))
       end
     end
+    -- If created_new_tab is true, target_window stays nil and will be created in the new tab.
+    -- Otherwise, if no editor window is suitable (e.g. the Claude terminal is the only window --
+    -- issue #231), create one by splitting the current window instead of erroring out, mirroring
+    -- the fallback in lua/claudecode/tools/open_file.lua.
+    if not target_window and not created_new_tab then
+      create_split()
+      local scratch_buf = vim.api.nvim_create_buf(false, true) -- unlisted, scratch
+      if scratch_buf ~= 0 then
+        -- wipe it once it leaves the window so it isn't leaked when the diff reuses it (new file)
+        -- or :edit replaces it with the real file (existing file)
+        vim.api.nvim_buf_set_option(scratch_buf, "bufhidden", "wipe")
+        vim.api.nvim_win_set_buf(vim.api.nvim_get_current_win(), scratch_buf)
+      end
+      target_window = vim.api.nvim_get_current_win()
+      -- Track it so _cleanup_diff_state closes it; the reused scratch buffer means it won't be
+      -- flagged target_window_created_by_plugin.
+      fallback_window = target_window
+    end
 
-    local new_buffer = vim.api.nvim_create_buf(false, true) -- unlisted, scratch
+    new_buffer = vim.api.nvim_create_buf(false, true) -- unlisted, scratch (hoisted above the pcall)
     if new_buffer == 0 then
       error({
         code = -32000,
@@ -1708,6 +1748,7 @@ function M._setup_blocking_diff(params, resolution_callback)
       target_window = diff_info.target_window,
       target_window_created_by_plugin = diff_info.target_window_created_by_plugin,
       pre_diff_buffer = pre_diff_buffer,
+      fallback_window = fallback_window,
       original_buffer = diff_info.original_buffer,
       original_buffer_created_by_plugin = diff_info.original_buffer_created_by_plugin,
       original_cursor_pos = original_cursor_pos,
@@ -1722,6 +1763,7 @@ function M._setup_blocking_diff(params, resolution_callback)
       resolution_callback = resolution_callback,
       result_content = nil,
       is_new_file = is_new_file,
+      client_id = params.client_id,
     })
   end) -- End of pcall
 
@@ -1742,6 +1784,16 @@ function M._setup_blocking_diff(params, resolution_callback)
     -- Clean up any partial state that might have been created
     if active_diffs[tab_name] then
       M._cleanup_diff_state(tab_name, "setup failed")
+    else
+      -- Errored before the diff state was registered, so the state-based cleanup can't run. Close
+      -- the fallback split we may have created (its bufhidden=wipe scratch self-cleans) and delete
+      -- the proposed buffer; neither is owned by a registered diff.
+      if fallback_window and vim.api.nvim_win_is_valid(fallback_window) then
+        pcall(vim.api.nvim_win_close, fallback_window, true)
+      end
+      if new_buffer and vim.api.nvim_buf_is_valid(new_buffer) then
+        pcall(vim.api.nvim_buf_delete, new_buffer, { force = true })
+      end
     end
 
     -- Re-throw the error for MCP compliance
@@ -1758,8 +1810,9 @@ end
 ---@param new_file_path string Path to the new file (used for naming)
 ---@param new_file_contents string Contents of the new file
 ---@param tab_name string Name for the diff tab/view
+---@param client_id string|nil Id of the MCP client opening the diff (so it can be cleaned up if that client disconnects)
 ---@return table response MCP-compliant response with content array
-function M.open_diff_blocking(old_file_path, new_file_path, new_file_contents, tab_name)
+function M.open_diff_blocking(old_file_path, new_file_path, new_file_contents, tab_name, client_id)
   -- Check for existing diff with same tab_name
   if active_diffs[tab_name] then
     local existing_diff = active_diffs[tab_name]
@@ -1795,6 +1848,7 @@ function M.open_diff_blocking(old_file_path, new_file_path, new_file_contents, t
     new_file_path = new_file_path,
     new_file_contents = new_file_contents,
     tab_name = tab_name,
+    client_id = client_id,
   }, function(result)
     -- Resume the coroutine with the result
     local resume_success, resume_result = coroutine.resume(co, result)
@@ -1897,6 +1951,77 @@ function M.close_diff_by_tab_name(tab_name)
   end
 
   return false
+end
+
+---Close every active diff matching an optional filter.
+---Reuses close_diff_by_tab_name, which resolves still-pending diffs as rejected
+---(resuming their coroutine) before tearing down the UI.
+---@param filter_fn (fun(diff_data: table): boolean)|nil Only close diffs for which this returns true (nil = all)
+---@param reason string Human-readable reason (for logging)
+---@return number count Number of diffs closed
+local function close_active_diffs(filter_fn, reason)
+  local count = 0
+  -- Snapshot the tab names first: close_diff_by_tab_name nils out entries as it
+  -- goes, and mutating a table while iterating it with pairs() is undefined.
+  local tab_names = {}
+  for tab_name, diff_data in pairs(active_diffs) do
+    if not filter_fn or filter_fn(diff_data) then
+      tab_names[#tab_names + 1] = tab_name
+    end
+  end
+  for _, tab_name in ipairs(tab_names) do
+    if M.close_diff_by_tab_name(tab_name) then
+      count = count + 1
+    end
+  end
+  if count > 0 then
+    logger.debug("diff", "Closed", count, "active diff(s):", reason)
+  end
+  return count
+end
+
+---Close all active diffs, resolving any still pending as rejected.
+---Closes diffs in ANY state (including saved), so its only caller is the
+---closeAllDiffTabs tool, where Claude is the connected client and has written
+---accepted files. Automatic cleanup and the :ClaudeCodeCloseAllDiffs command
+---deliberately use close_pending_diffs / close_diffs_for_client instead, to
+---leave already-saved diffs alone -- see close_pending_diffs for why.
+---@param reason string Human-readable reason (for logging)
+---@return number count Number of diffs closed
+function M.close_all_diffs(reason)
+  return close_active_diffs(nil, reason or "close all diffs")
+end
+
+-- Automatic teardown (client disconnect, server stop) must only touch *pending*
+-- diffs. A diff with status == "saved" has been :w'd by the user -- its edits
+-- live only in the proposed buffer until Claude writes them to disk -- so closing
+-- it would run close_diff_by_tab_name's saved-branch, wiping the proposed buffer
+-- and reloading the file from unchanged disk, silently destroying the edits if
+-- Claude died before writing. Pending diffs carry no such accepted content.
+
+---Close every still-pending diff (e.g. on server stop, which bypasses
+---on_disconnect). Leaves saved/rejected diffs for client-driven finalization.
+---@param reason string Human-readable reason (for logging)
+---@return number count Number of diffs closed
+function M.close_pending_diffs(reason)
+  return close_active_diffs(function(diff_data)
+    return diff_data.status == "pending"
+  end, reason or "close pending diffs")
+end
+
+---Close the still-pending diffs opened by a specific MCP client, used when that
+---client disconnects so its orphaned diff windows don't linger (e.g. the Claude
+---session that opened them exited or moved to remote control).
+---@param client_id string The id of the client whose diffs should be closed
+---@param reason string Human-readable reason (for logging)
+---@return number count Number of diffs closed
+function M.close_diffs_for_client(client_id, reason)
+  if not client_id then
+    return 0
+  end
+  return close_active_diffs(function(diff_data)
+    return diff_data.client_id == client_id and diff_data.status == "pending"
+  end, reason or ("client " .. tostring(client_id)))
 end
 
 ---Test helper function (only for testing)

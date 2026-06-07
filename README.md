@@ -198,6 +198,7 @@ Configure the plugin with the detected path:
 - `:ClaudeCodeAdd <file-path> [start-line] [end-line]` - Add specific file to Claude context with optional line range
 - `:ClaudeCodeDiffAccept` - Accept diff changes
 - `:ClaudeCodeDiffDeny` - Reject diff changes
+- `:ClaudeCodeCloseAllDiffs` - Close pending Claude diffs (leaves accepted/saved diffs intact)
 - `:ClaudeCodeLiveCursor [preview|open|off]` - Toggle the live Claude cursor (see [Live Claude Cursor](#live-claude-cursor))
 
 ## Working with Diffs
@@ -226,6 +227,8 @@ The unified provider ignores `diff_opts.open_in_new_tab` — proposals always op
 ```lua
 vim.keymap.set("n", "<leader>aD", "<cmd>ClaudeCodeDiffToggleProvider<cr>", { desc = "Claude: toggle diff provider" })
 ```
+
+If a diff is resolved outside this Neovim (for example via Claude remote control on another device) the diff windows would otherwise stay open. They are now closed automatically when the Claude session that opened them disconnects. If you resolve diffs remotely while the session is still connected, run `:ClaudeCodeCloseAllDiffs` to clear the leftover pending proposals — it leaves any diff you have already accepted (`:w`) but whose file has not been written yet untouched, so your saved edits are never discarded.
 
 ## How It Works
 
@@ -283,6 +286,10 @@ For deep technical details, see [ARCHITECTURE.md](./ARCHITECTURE.md).
       provider = "auto", -- "auto", "snacks", "native", "external", "none", or custom provider table
       auto_close = true,
       snacks_win_opts = {}, -- Opts to pass to `Snacks.terminal.open()` - see Floating Window section below
+      -- Work around a Neovim core bug (< 0.12.2) that fragments large pastes into
+      -- the terminal, making Cmd+V appear to truncate ([#161]). true | false | "auto"
+      -- ("auto", the default, enables it only on affected Neovim versions).
+      fix_streamed_paste = "auto",
 
       -- Provider-specific options
       provider_opts = {
@@ -842,7 +849,7 @@ opts = {
 
 ## Contributing
 
-See [DEVELOPMENT.md](./DEVELOPMENT.md) for build instructions and development guidelines. Tests can be run with `make test`.
+See [DEVELOPMENT.md](./DEVELOPMENT.md) for build instructions and development guidelines. Tests can be run with `mise run test`.
 
 ## License
 
