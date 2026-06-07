@@ -146,9 +146,11 @@ describe("live_cursor", function()
     end)
 
     it("suppresses an edit when a review diff owns the file", function()
-      package.loaded["claudecode.diff"] = { is_live_for_file = function()
-        return true
-      end }
+      package.loaded["claudecode.diff"] = {
+        is_live_for_file = function()
+          return true
+        end,
+      }
       live_cursor.dispatch({
         hook_event_name = "PreToolUse",
         tool_name = "Edit",
@@ -158,9 +160,11 @@ describe("live_cursor", function()
     end)
 
     it("paints an edit, preferring new_string with old_string as fallback", function()
-      package.loaded["claudecode.diff"] = { is_live_for_file = function()
-        return false
-      end }
+      package.loaded["claudecode.diff"] = {
+        is_live_for_file = function()
+          return false
+        end,
+      }
       live_cursor.dispatch({
         hook_event_name = "PreToolUse",
         tool_name = "Edit",
@@ -332,8 +336,10 @@ describe("live_cursor", function()
 
   describe("common_context (changed-line trimming)", function()
     it("counts shared leading and trailing lines", function()
-      local prefix, suffix =
-        live_cursor._common_context({ "ctx1", "ctx2", "OLD", "ctx3" }, { "ctx1", "ctx2", "NEW", "ctx3" })
+      local prefix, suffix = live_cursor._common_context(
+        { "ctx1", "ctx2", "OLD", "ctx3" },
+        { "ctx1", "ctx2", "NEW", "ctx3" }
+      )
       expect(prefix).to_be(2)
       expect(suffix).to_be(1)
     end)
@@ -369,6 +375,190 @@ describe("live_cursor", function()
       local s, e = live_cursor._locate_in_array({ "a", "x", "y", "b" }, { "x", "y" })
       expect(s).to_be(2)
       expect(e).to_be(3)
+    end)
+  end)
+
+  -- Preview mode owns a dedicated split: it must be created on demand (a *new*
+  -- window, never the editor window itself) and torn down when Claude goes idle.
+  describe("preview own-split lifecycle", function()
+    before_each(function()
+      -- A single main editor window (1000) in tab 1. reset() leaves _next_winid
+      -- at 1000, so bump it past our hand-placed window or :vsplit would reuse id
+      -- 1000 and collide with the editor window.
+      vim._tabs = { [1] = true }
+      vim._current_tabpage = 1
+      vim._mock.add_window(1000, 1, { 1, 0 })
+      vim._win_tab[1000] = 1
+      vim._tab_windows[1] = { 1000 }
+      vim._current_window = 1000
+      vim._next_winid = 2000
+
+      -- A loaded file buffer for /x so show() can paint into it.
+      vim._mock.add_buffer(
+        50,
+        "/x",
+        { "line1", "line2", "line3", "line4", "line5" },
+        { buftype = "", modified = false }
+      )
+
+      -- bufadd/bufload are not in the shared mock; stub them for the file open.
+      vim.fn.bufadd = function()
+        return 50
+      end
+      vim.fn.bufload = function() end
+
+      -- diff module supplies the canonical window finder and reports that no
+      -- review diff owns the file (so the edit path is not suppressed here).
+      package.loaded["claudecode.diff"] = {
+        find_main_editor_window = function()
+          return 1000
+        end,
+        is_live_for_file = function()
+          return false
+        end,
+      }
+    end)
+
+    after_each(function()
+      vim.fn.bufadd = nil
+      vim.fn.bufload = nil
+      package.loaded["claudecode.diff"] = nil
+    end)
+
+    it("read: opens a dedicated preview split, then the idle handler closes it", function()
+      live_cursor.setup(base_config({ enabled = true, mode = "preview", clear_delay_ms = 0 }))
+
+      live_cursor.dispatch({
+        hook_event_name = "PreToolUse",
+        tool_name = "Read",
+        tool_input = { file_path = "/x", offset = 2, limit = 2 },
+      })
+
+      local pw = live_cursor._state.preview_win
+      assert.is_not_nil(pw)
+      assert.are_not.equal(1000, pw) -- a NEW window, not the editor window
+      expect(vim.api.nvim_win_is_valid(pw)).to_be_true()
+
+      -- Auto-close when Claude goes idle (the timer calls _close_idle_preview).
+      live_cursor._close_idle_preview()
+      expect(vim.api.nvim_win_is_valid(pw)).to_be_false()
+      expect(live_cursor._state.preview_win).to_be_nil()
+    end)
+
+    it("write (edit): opens a dedicated preview split, then the idle handler closes it", function()
+      live_cursor.setup(base_config({ enabled = true, mode = "preview", clear_delay_ms = 0, diff_suppress_ms = 0 }))
+
+      live_cursor.dispatch({
+        hook_event_name = "PreToolUse",
+        tool_name = "Edit",
+        tool_input = { file_path = "/x", old_string = "line2", new_string = "line2-changed" },
+      })
+
+      local pw = live_cursor._state.preview_win
+      assert.is_not_nil(pw)
+      assert.are_not.equal(1000, pw)
+      expect(vim.api.nvim_win_is_valid(pw)).to_be_true()
+
+      live_cursor._close_idle_preview()
+      expect(vim.api.nvim_win_is_valid(pw)).to_be_false()
+      expect(live_cursor._state.preview_win).to_be_nil()
+    end)
+
+    it("opens a new window for its own split rather than hijacking the editor window", function()
+      live_cursor.setup(base_config({ enabled = true, mode = "preview", clear_delay_ms = 0 }))
+
+      local before = vim.api.nvim_get_current_win()
+      live_cursor.show("/x", { start_line = 1 })
+
+      local pw = live_cursor._state.preview_win
+      assert.is_not_nil(pw)
+      assert.are_not.equal(before, pw) -- split lives in its own window
+      expect(vim.api.nvim_win_is_valid(pw)).to_be_true()
+      -- Focus is not stolen: the user stays in the window they were in.
+      expect(vim.api.nvim_get_current_win()).to_be(before)
+    end)
+
+    it("reuses its own preview window across events instead of opening another", function()
+      live_cursor.setup(base_config({ enabled = true, mode = "preview", clear_delay_ms = 0 }))
+
+      live_cursor.show("/x", { start_line = 1 })
+      local first = live_cursor._state.preview_win
+      assert.is_not_nil(first)
+
+      live_cursor.show("/x", { start_line = 3 })
+      expect(live_cursor._state.preview_win).to_be(first)
+    end)
+
+    it("the idle clear timer auto-closes the preview (timer wiring)", function()
+      -- clear_delay_ms > 0 arms the timer; the mock fires deferred callbacks
+      -- immediately, so the split is created and then auto-closed within show().
+      live_cursor.setup(base_config({ enabled = true, mode = "preview", clear_delay_ms = 50 }))
+
+      live_cursor.show("/x", { start_line = 1 })
+
+      expect(live_cursor._state.preview_win).to_be_nil()
+    end)
+  end)
+
+  -- In non-auto-accept mode Claude's edit lands behind a pending review diff that
+  -- already visualizes the change; the live preview must stand down so the two
+  -- don't fight over the same file.
+  describe("review-diff suppression (non-auto-accept diff)", function()
+    local diff
+    local calls
+
+    before_each(function()
+      package.loaded["claudecode.diff"] = nil
+      diff = require("claudecode.diff")
+      local active = diff._get_active_diffs()
+      for k in pairs(active) do
+        active[k] = nil
+      end
+
+      live_cursor.setup(base_config({ enabled = true, mode = "preview", diff_suppress_ms = 0 }))
+
+      calls = { show = 0, show_diff = 0 }
+      live_cursor.show = function()
+        calls.show = calls.show + 1
+      end
+      live_cursor.show_diff = function()
+        calls.show_diff = calls.show_diff + 1
+        return false
+      end
+    end)
+
+    after_each(function()
+      local active = diff._get_active_diffs()
+      for k in pairs(active) do
+        active[k] = nil
+      end
+      package.loaded["claudecode.diff"] = nil
+    end)
+
+    it("does NOT trigger a live preview when a pending review diff owns the file", function()
+      diff._get_active_diffs()["t1"] = { new_file_path = "/x", old_file_path = "/x.orig", status = "pending" }
+
+      live_cursor.dispatch({
+        hook_event_name = "PreToolUse",
+        tool_name = "Edit",
+        tool_input = { file_path = "/x", old_string = "a", new_string = "b" },
+      })
+
+      expect(calls.show).to_be(0)
+      expect(calls.show_diff).to_be(0)
+    end)
+
+    it("does trigger a live preview when no review diff owns the file", function()
+      -- No active diff registered for /x.
+      live_cursor.dispatch({
+        hook_event_name = "PreToolUse",
+        tool_name = "Edit",
+        tool_input = { file_path = "/x", old_string = "a", new_string = "b" },
+      })
+
+      -- show_diff is attempted first (returns false here), then show is the fallback.
+      expect(calls.show_diff).to_be(1)
+      expect(calls.show).to_be(1)
     end)
   end)
 end)
