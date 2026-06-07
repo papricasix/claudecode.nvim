@@ -198,6 +198,7 @@ Configure the plugin with the detected path:
 - `:ClaudeCodeAdd <file-path> [start-line] [end-line]` - Add specific file to Claude context with optional line range
 - `:ClaudeCodeDiffAccept` - Accept diff changes
 - `:ClaudeCodeDiffDeny` - Reject diff changes
+- `:ClaudeCodeLiveCursor [preview|open|off]` - Toggle the live Claude cursor (see [Live Claude Cursor](#live-claude-cursor))
 
 ## Working with Diffs
 
@@ -306,12 +307,53 @@ For deep technical details, see [ARCHITECTURE.md](./ARCHITECTURE.md).
       -- vertical_split = true,
       -- open_in_current_tab = true,
     },
+
+    -- Live Claude cursor (opt-in): a real-time view of what Claude is reading/editing
+    live_cursor = {
+      enabled = false, -- master switch
+      mode = nil, -- REQUIRED when enabled: "preview" or "open"
+      layout = "horizontal", -- "vertical" or "horizontal" split for the preview window
+      split_size_percentage = 0.5, -- preview split size as a fraction of the screen (0..1): height (horizontal) or width (vertical)
+      highlight = "ClaudeCodeLiveCursor", -- highlight group (defaults to a link to Visual)
+      clear_delay_ms = 4000, -- clear the highlight after this much inactivity (0 = never)
+      diff_suppress_ms = 250, -- delay before painting an edit, to detect a review diff first
+      preview_winbar = true, -- colored winbar label marking the preview window
+      preview_divider = true, -- tint the preview window's split divider
+      preview_label = "● Claude live preview", -- winbar text
+      preview_highlight = "ClaudeCodeLivePreview", -- marker color (defaults to a link to DiagnosticOk / green)
+    },
   },
   keys = {
     -- Your keymaps here
   },
 }
 ```
+
+#### Live Claude Cursor
+
+A "ride-along" view: as Claude uses its `Read`/`Edit`/`Write` tools, claudecode.nvim opens or previews the touched file and highlights the exact line range — a live picture of what the agent is doing.
+
+This works by injecting a Claude Code `PreToolUse` hook at launch via `claude --settings` (your own settings files are never modified) that reports each tool event back to the running Neovim over its RPC socket. It requires the `claude` CLI's hook support and an `nvim` on `PATH`.
+
+- `enabled` — off by default; set to `true` to turn it on.
+- `mode` — **required** when enabled:
+  - `"preview"` — load the file into a single reserved split, leaving your layout and focus untouched (the "live camera"). The split is `horizontal` (below) by default; set `layout = "vertical"` for a split beside instead. When Claude goes idle for `clear_delay_ms`, the preview split auto-closes — unless your cursor is in it, in which case it stays until you leave. Set `clear_delay_ms = 0` to keep it open.
+  - `"open"` — load the file into your current editor window.
+- Focus never moves — the file updates passively while you keep working.
+- Reads highlight the read range. Edits are shown only when **no review diff** is open for that file (i.e. in auto / accept-edits mode); when a normal diff is shown, that already visualizes the change and the live cursor stays out of the way.
+- **Edits render a real inline diff** when [unified.nvim](https://github.com/papricasix/unified.nvim) is installed: the live cursor reconstructs the pre-edit file (post-edit content with the edit reversed) and shows the precise added/removed lines, rather than a heuristic highlight. Without unified.nvim it falls back to highlighting the changed line range.
+- **Multi-tab aware:** each Claude is stamped with the tab it launched in, and its reads/edits only drive the preview when you are viewing that tab. A Claude running in a background tab never opens previews in the tab you are currently working in.
+- `highlight` — the highlight group used for the range. Define your own group of this (or another) name to customize colors.
+- In `preview` mode the window is marked so you can tell it apart from a normal split: a colored winbar label (`preview_winbar`) and a tinted split divider (`preview_divider`), both on by default. `preview_label` sets the winbar text and `preview_highlight` sets the color — it defaults to a link to `DiagnosticOk` (green); point it at a different group (e.g. `Function`, `Directory`) for blue, or define `ClaudeCodeLivePreview` yourself.
+- Neovim splits have no true border, so a window can only recolor the separators it *owns* (right/bottom edges). The divider tint is therefore most effective with `layout = "vertical"` (it colors the separator beside the preview); with `layout = "horizontal"` the top divider belongs to the window above and stays uncolored, so the **winbar** is the reliable marker there. If you run a winbar plugin (dropbar, barbecue, lualine winbar, …), the live-preview label intentionally overrides it inside the preview window.
+
+Toggle it at runtime with `:ClaudeCodeLiveCursor`:
+
+- `:ClaudeCodeLiveCursor` — flip enabled/disabled (requires a `mode` to already be set).
+- `:ClaudeCodeLiveCursor preview` / `:ClaudeCodeLiveCursor open` — enable in that mode.
+- `:ClaudeCodeLiveCursor off` — disable and clear any highlight.
+
+Because the hook is injected when Claude launches, enabling mid-session takes effect the next time you start Claude; disabling stops the highlighting immediately.
 
 ### Working Directory Control
 

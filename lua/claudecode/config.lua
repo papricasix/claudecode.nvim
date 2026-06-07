@@ -28,6 +28,20 @@ M.defaults = {
     hide_terminal_in_new_tab = false, -- If true and opening in a new tab, do not show Claude terminal there
     on_new_file_reject = "keep_empty", -- "keep_empty" leaves an empty buffer; "close_window" closes the placeholder split
   },
+  live_cursor = {
+    enabled = false, -- master switch (opt-in)
+    mode = nil, -- REQUIRED when enabled: "preview" (reserved split) or "open" (current window)
+    layout = "horizontal", -- "vertical" or "horizontal" split for the preview window (preview mode only)
+    split_size_percentage = 0.5, -- preview split size as a fraction of the screen (0..1): height for horizontal, width for vertical
+    highlight = "ClaudeCodeLiveCursor", -- highlight group; defaults to a link to Visual
+    clear_delay_ms = 4000, -- auto-clear the highlight after this much inactivity (0 disables)
+    diff_suppress_ms = 250, -- wait window to detect an openDiff before painting an edit
+    -- Visual markers so you can tell a split is a live preview (preview mode only):
+    preview_winbar = true, -- show a colored winbar label at the top of the preview window
+    preview_divider = true, -- tint the preview window's split divider (WinSeparator)
+    preview_label = "● Claude live preview", -- winbar text
+    preview_highlight = "ClaudeCodeLivePreview", -- highlight group for the marker; defaults to a link to DiagnosticOk (green)
+  },
   models = {
     { name = "Claude Opus 4.1 (Latest)", value = "opus" },
     { name = "Claude Sonnet 4.5 (Latest)", value = "sonnet" },
@@ -162,6 +176,54 @@ function M.validate(config)
   end
   if config.diff_opts.open_in_current_tab ~= nil then
     assert(type(config.diff_opts.open_in_current_tab) == "boolean", "diff_opts.open_in_current_tab must be a boolean")
+  end
+
+  -- Validate live_cursor (optional; apply() supplies defaults)
+  if config.live_cursor ~= nil then
+    local lc = config.live_cursor
+    assert(type(lc) == "table", "live_cursor must be a table")
+
+    local function check(field, ok, msg)
+      if lc[field] ~= nil then
+        assert(ok(lc[field]), "live_cursor." .. field .. " " .. msg)
+      end
+    end
+    local function is_bool(v)
+      return type(v) == "boolean"
+    end
+    local function is_nonempty_string(v)
+      return type(v) == "string" and v ~= ""
+    end
+    local function is_nonneg(v)
+      return type(v) == "number" and v >= 0
+    end
+
+    check("enabled", is_bool, "must be a boolean")
+    check("mode", function(v)
+      return v == "preview" or v == "open"
+    end, "must be 'preview' or 'open'")
+    check("layout", function(v)
+      return v == "vertical" or v == "horizontal"
+    end, "must be 'vertical' or 'horizontal'")
+    check("split_size_percentage", function(v)
+      return type(v) == "number" and v > 0 and v <= 1
+    end, "must be a number between 0 and 1")
+    check("highlight", is_nonempty_string, "must be a non-empty string")
+    check("preview_winbar", is_bool, "must be a boolean")
+    check("preview_divider", is_bool, "must be a boolean")
+    check("preview_label", function(v)
+      return type(v) == "string"
+    end, "must be a string")
+    check("preview_highlight", is_nonempty_string, "must be a non-empty string")
+    check("clear_delay_ms", is_nonneg, "must be a non-negative number")
+    check("diff_suppress_ms", is_nonneg, "must be a non-negative number")
+
+    if lc.enabled == true then
+      assert(
+        lc.mode == "preview" or lc.mode == "open",
+        "live_cursor.mode is required when live_cursor.enabled is true (set it to 'preview' or 'open')"
+      )
+    end
   end
 
   -- Validate env

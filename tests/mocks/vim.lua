@@ -89,6 +89,41 @@ local vim = {
       return name
     end,
 
+    nvim_create_namespace = function(name)
+      vim._namespaces = vim._namespaces or {}
+      if not vim._namespaces[name] then
+        vim._namespaces[name] = #vim._namespaces + 1
+      end
+      return vim._namespaces[name]
+    end,
+
+    nvim_set_hl = function(_ns, name, opts)
+      vim._highlights = vim._highlights or {}
+      vim._highlights[name] = opts
+    end,
+
+    nvim_buf_set_extmark = function(bufnr, ns, row, col, opts)
+      vim._extmarks = vim._extmarks or {}
+      table.insert(vim._extmarks, { bufnr = bufnr, ns = ns, row = row, col = col, opts = opts })
+      return #vim._extmarks
+    end,
+
+    nvim_buf_clear_namespace = function(bufnr, ns, _start, _end)
+      vim._extmarks = vim._extmarks or {}
+      for i = #vim._extmarks, 1, -1 do
+        local m = vim._extmarks[i]
+        if m.bufnr == bufnr and (ns == -1 or m.ns == ns) then
+          table.remove(vim._extmarks, i)
+        end
+      end
+    end,
+
+    nvim_win_set_cursor = function(winid, pos)
+      if vim._windows[winid] then
+        vim._windows[winid].cursor = pos
+      end
+    end,
+
     nvim_create_autocmd = function(events, opts)
       local group = opts.group or "default"
       if not vim._autocmds[group] then
@@ -131,8 +166,16 @@ local vim = {
       end
 
       local lines = vim._buffers[bufnr].lines or {}
-      local result = {}
+      local n = #lines
+      -- Negative indices count from the end (e.g. -1 == n), matching Neovim.
+      if end_line < 0 then
+        end_line = n + end_line + 1
+      end
+      if start < 0 then
+        start = n + start + 1
+      end
 
+      local result = {}
       for i = start + 1, end_line do
         table.insert(result, lines[i] or "")
       end
@@ -546,6 +589,14 @@ local vim = {
       return "/tmp/nvim_mock_tempfile_" .. math.random(1, 100000)
     end,
 
+    serverstart = function(addr)
+      return addr or "/tmp/nvim_mock_server.sock"
+    end,
+
+    shellescape = function(str)
+      return "'" .. tostring(str):gsub("'", "'\\''") .. "'"
+    end,
+
     writefile = function(lines, filename, flags)
       -- Mock implementation - just record that it was called
       vim._written_files = vim._written_files or {}
@@ -947,6 +998,22 @@ local vim = {
   schedule = function(callback)
     callback()
   end,
+
+  v = {
+    servername = "/tmp/nvim_mock_server.sock",
+  },
+
+  -- Window-local options: vim.wo[win].<opt> = value
+  wo = setmetatable({}, {
+    __index = function(t, win)
+      local existing = rawget(t, win)
+      if not existing then
+        existing = {}
+        rawset(t, win, existing)
+      end
+      return existing
+    end,
+  }),
 
   defer_fn = function(fn, timeout)
     -- For testing purposes, this mock executes the deferred function immediately

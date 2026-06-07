@@ -1,0 +1,409 @@
+-- luacheck: globals expect
+require("tests.busted_setup")
+
+describe("live_cursor", function()
+  local live_cursor
+
+  local function base_config(live)
+    return {
+      port_range = { min = 10000, max = 65535 },
+      auto_start = true,
+      log_level = "info",
+      track_selection = true,
+      visual_demotion_delay_ms = 50,
+      connection_wait_delay = 200,
+      connection_timeout = 10000,
+      queue_timeout = 5000,
+      diff_opts = {},
+      env = {},
+      models = { { name = "Test Model", value = "test" } },
+      terminal = { provider = "native" },
+      live_cursor = live,
+    }
+  end
+
+  before_each(function()
+    if vim and vim._mock and vim._mock.reset then
+      vim._mock.reset()
+    end
+    package.loaded["claudecode.live_cursor"] = nil
+    live_cursor = require("claudecode.live_cursor")
+  end)
+
+  describe("config validation", function()
+    local config
+
+    before_each(function()
+      package.loaded["claudecode.config"] = nil
+      config = require("claudecode.config")
+    end)
+
+    it("rejects enabled=true without a mode", function()
+      local cfg = base_config({ enabled = true })
+      local ok, err = pcall(config.validate, cfg)
+      expect(ok).to_be_false()
+      assert.is_truthy(tostring(err):match("live_cursor.mode is required"))
+    end)
+
+    it("accepts enabled with a valid mode", function()
+      local ok = pcall(config.validate, base_config({ enabled = true, mode = "preview" }))
+      expect(ok).to_be_true()
+      ok = pcall(config.validate, base_config({ enabled = true, mode = "open" }))
+      expect(ok).to_be_true()
+    end)
+
+    it("rejects an unknown mode", function()
+      local ok = pcall(config.validate, base_config({ enabled = true, mode = "sideways" }))
+      expect(ok).to_be_false()
+    end)
+
+    it("accepts disabled with no mode", function()
+      local ok = pcall(config.validate, base_config({ enabled = false }))
+      expect(ok).to_be_true()
+    end)
+
+    it("accepts valid layouts and rejects unknown ones", function()
+      expect(pcall(config.validate, base_config({ enabled = true, mode = "preview", layout = "vertical" }))).to_be_true()
+      expect(pcall(config.validate, base_config({ enabled = true, mode = "preview", layout = "horizontal" }))).to_be_true()
+      expect(pcall(config.validate, base_config({ enabled = true, mode = "preview", layout = "diagonal" }))).to_be_false()
+    end)
+
+    it("accepts a split_size_percentage between 0 and 1 and rejects others", function()
+      expect(pcall(config.validate, base_config({ enabled = true, mode = "preview", split_size_percentage = 0.5 }))).to_be_true()
+      expect(pcall(config.validate, base_config({ enabled = true, mode = "preview", split_size_percentage = 1 }))).to_be_true()
+      expect(pcall(config.validate, base_config({ enabled = true, mode = "preview", split_size_percentage = 0 }))).to_be_false()
+      expect(pcall(config.validate, base_config({ enabled = true, mode = "preview", split_size_percentage = 1.5 }))).to_be_false()
+    end)
+  end)
+
+  describe("build_launch_injection", function()
+    it("returns nil when disabled", function()
+      live_cursor.setup(base_config({ enabled = false }))
+      expect(live_cursor.build_launch_injection()).to_be_nil()
+    end)
+
+    it("returns --settings args and the RPC env var when enabled", function()
+      live_cursor.setup(base_config({ enabled = true, mode = "preview" }))
+      local injection = live_cursor.build_launch_injection()
+      assert.is_not_nil(injection)
+      assert.is_truthy(injection.args:match("%-%-settings"))
+      expect(injection.env.CLAUDECODE_NVIM_SERVER).to_be("/tmp/nvim_mock_server.sock")
+      assert.is_not_nil(injection.env.CLAUDECODE_NVIM_TAB)
+    end)
+
+    it("writes a settings file containing the PreToolUse hook", function()
+      live_cursor.setup(base_config({ enabled = true, mode = "open" }))
+      local injection = live_cursor.build_launch_injection()
+      -- args look like: --settings '<path>'
+      local path = injection.args:match("%-%-settings%s+'?([^']+)'?")
+      assert.is_not_nil(path)
+      local f = io.open(path, "r")
+      assert.is_not_nil(f)
+      local contents = f:read("*a")
+      f:close()
+      assert.is_truthy(contents:match("PreToolUse"))
+      assert.is_truthy(contents:match("Read|Edit|Write|MultiEdit"))
+      assert.is_truthy(contents:match("claudecode_live_cursor_hook%.sh"))
+    end)
+  end)
+
+  describe("dispatch", function()
+    local shown
+
+    before_each(function()
+      live_cursor.setup(base_config({ enabled = true, mode = "open", clear_delay_ms = 0, diff_suppress_ms = 0 }))
+      shown = {}
+      live_cursor.show = function(file, opts)
+        table.insert(shown, { file = file, opts = opts })
+      end
+    end)
+
+    it("ignores non-PreToolUse events", function()
+      live_cursor.dispatch({ hook_event_name = "PostToolUse", tool_name = "Read", tool_input = { file_path = "/x" } })
+      expect(#shown).to_be(0)
+    end)
+
+    it("paints the read range from offset/limit", function()
+      live_cursor.dispatch({
+        hook_event_name = "PreToolUse",
+        tool_name = "Read",
+        tool_input = { file_path = "/x", offset = 10, limit = 5 },
+      })
+      expect(#shown).to_be(1)
+      expect(shown[1].file).to_be("/x")
+      expect(shown[1].opts.start_line).to_be(10)
+      expect(shown[1].opts.end_line).to_be(14)
+    end)
+
+    it("defaults a read with no range to line 1", function()
+      live_cursor.dispatch({
+        hook_event_name = "PreToolUse",
+        tool_name = "Read",
+        tool_input = { file_path = "/x" },
+      })
+      expect(shown[1].opts.start_line).to_be(1)
+      expect(shown[1].opts.end_line).to_be_nil()
+    end)
+
+    it("suppresses an edit when a review diff owns the file", function()
+      package.loaded["claudecode.diff"] = { is_live_for_file = function()
+        return true
+      end }
+      live_cursor.dispatch({
+        hook_event_name = "PreToolUse",
+        tool_name = "Edit",
+        tool_input = { file_path = "/x", old_string = "foo" },
+      })
+      expect(#shown).to_be(0)
+    end)
+
+    it("paints an edit, preferring new_string with old_string as fallback", function()
+      package.loaded["claudecode.diff"] = { is_live_for_file = function()
+        return false
+      end }
+      live_cursor.dispatch({
+        hook_event_name = "PreToolUse",
+        tool_name = "Edit",
+        tool_input = { file_path = "/x", old_string = "foo\nbar", new_string = "baz\nqux" },
+      })
+      expect(#shown).to_be(1)
+      expect(shown[1].opts.locate).to_be("baz\nqux")
+      expect(shown[1].opts.locate_fallback).to_be("foo\nbar")
+    end)
+
+    it("ignores events without a file path", function()
+      live_cursor.dispatch({ hook_event_name = "PreToolUse", tool_name = "Read", tool_input = {} })
+      expect(#shown).to_be(0)
+    end)
+
+    local function read_event()
+      return { hook_event_name = "PreToolUse", tool_name = "Read", tool_input = { file_path = "/x", offset = 1 } }
+    end
+
+    it("skips a read whose Claude lives in a different (but open) tab", function()
+      vim._tabs = { [1] = true, [2] = true }
+      vim._current_tabpage = 1
+      live_cursor.dispatch(read_event(), 2)
+      expect(#shown).to_be(0)
+    end)
+
+    it("shows a read whose Claude lives in the current tab", function()
+      vim._tabs = { [2] = true }
+      vim._current_tabpage = 2
+      live_cursor.dispatch(read_event(), 2)
+      expect(#shown).to_be(1)
+    end)
+
+    it("skips a read whose Claude tab has been closed", function()
+      vim._tabs = { [1] = true } -- tab 99 no longer exists (e.g. closed, orphaned external Claude)
+      vim._current_tabpage = 1
+      live_cursor.dispatch(read_event(), 99)
+      expect(#shown).to_be(0)
+    end)
+
+    it("does not restrict when the source tab is unknown", function()
+      vim._tabs = { [5] = true }
+      vim._current_tabpage = 5
+      live_cursor.dispatch(read_event(), 0)
+      expect(#shown).to_be(1)
+    end)
+  end)
+
+  describe("toggle", function()
+    it("refuses to enable without a mode", function()
+      live_cursor.setup(base_config({ enabled = false }))
+      expect(live_cursor.toggle()).to_be_false()
+      expect(live_cursor._is_enabled()).to_be_false()
+    end)
+
+    it("enables when a mode is already set", function()
+      live_cursor.setup(base_config({ enabled = false, mode = "open" }))
+      expect(live_cursor.toggle()).to_be_true()
+      expect(live_cursor._is_enabled()).to_be_true()
+    end)
+
+    it("sets the mode and enables when given an explicit mode", function()
+      live_cursor.setup(base_config({ enabled = false }))
+      expect(live_cursor.toggle("preview")).to_be_true()
+      expect(live_cursor._is_enabled()).to_be_true()
+    end)
+
+    it("disables with off", function()
+      live_cursor.setup(base_config({ enabled = true, mode = "open" }))
+      expect(live_cursor.toggle("off")).to_be_false()
+      expect(live_cursor._is_enabled()).to_be_false()
+    end)
+
+    it("flips an enabled feature off", function()
+      live_cursor.setup(base_config({ enabled = true, mode = "open" }))
+      expect(live_cursor.toggle()).to_be_false()
+    end)
+  end)
+
+  describe("preview auto-close", function()
+    it("closes an idle, unfocused preview window", function()
+      live_cursor.setup(base_config({ enabled = true, mode = "preview" }))
+      vim._windows[1000] = { buf = 1 }
+      vim._windows[2000] = { buf = 2 }
+      vim.api.nvim_set_current_win(2000) -- focused elsewhere
+      live_cursor._state.preview_win = 1000
+
+      live_cursor._close_idle_preview()
+
+      expect(vim.api.nvim_win_is_valid(1000)).to_be_false()
+      expect(live_cursor._state.preview_win).to_be_nil()
+    end)
+
+    it("keeps the preview window when it is focused", function()
+      live_cursor.setup(base_config({ enabled = true, mode = "preview" }))
+      vim._windows[1000] = { buf = 1 }
+      vim.api.nvim_set_current_win(1000) -- focused in the preview
+      live_cursor._state.preview_win = 1000
+
+      live_cursor._close_idle_preview()
+
+      expect(vim.api.nvim_win_is_valid(1000)).to_be_true()
+      expect(live_cursor._state.preview_win).to_be(1000)
+    end)
+
+    it("does nothing in open mode", function()
+      live_cursor.setup(base_config({ enabled = true, mode = "open" }))
+      vim._windows[1000] = { buf = 1 }
+      vim.api.nvim_set_current_win(2000)
+      live_cursor._state.preview_win = 1000
+
+      live_cursor._close_idle_preview()
+
+      expect(vim.api.nvim_win_is_valid(1000)).to_be_true()
+    end)
+  end)
+
+  describe("preview marker", function()
+    it("sets a winbar label and a tinted divider by default", function()
+      live_cursor.setup(base_config({ enabled = true, mode = "preview" }))
+      live_cursor._apply_preview_marker(1000)
+      assert.is_truthy(vim.wo[1000].winbar:match("Claude live preview"))
+      assert.is_truthy(vim.wo[1000].winbar:match("ClaudeCodeLivePreview"))
+      expect(vim.wo[1000].winhighlight).to_be("WinSeparator:ClaudeCodeLivePreview")
+    end)
+
+    it("omits the winbar when preview_winbar is false", function()
+      live_cursor.setup(base_config({ enabled = true, mode = "preview", preview_winbar = false }))
+      live_cursor._apply_preview_marker(1001)
+      expect(vim.wo[1001].winbar).to_be_nil()
+      expect(vim.wo[1001].winhighlight).to_be("WinSeparator:ClaudeCodeLivePreview")
+    end)
+
+    it("omits the divider when preview_divider is false", function()
+      live_cursor.setup(base_config({ enabled = true, mode = "preview", preview_divider = false }))
+      live_cursor._apply_preview_marker(1002)
+      expect(vim.wo[1002].winhighlight).to_be_nil()
+      assert.is_truthy(vim.wo[1002].winbar:match("Claude live preview"))
+    end)
+  end)
+
+  describe("locate_block", function()
+    local function set_buf(lines)
+      vim._mock.add_buffer(7, "/x", lines)
+      return 7
+    end
+
+    it("matches the exact block, not an earlier line that shares the first line", function()
+      -- "if cond then" appears at lines 2 and 5; only the line-5 block is the
+      -- real match. Substring/first-line matching would wrongly pick line 2.
+      local buf = set_buf({ "x = 1", "if cond then", "  x = 1", "end", "if cond then", "  x = 2", "end" })
+      local s, e = live_cursor._locate_block(buf, "if cond then\n  x = 2\nend")
+      expect(s).to_be(5)
+      expect(e).to_be(7)
+    end)
+
+    it("matches a single exact line", function()
+      local buf = set_buf({ "alpha", "beta", "gamma" })
+      local s, e = live_cursor._locate_block(buf, "beta")
+      expect(s).to_be(2)
+      expect(e).to_be(2)
+    end)
+
+    it("returns nil when the block is not present", function()
+      local buf = set_buf({ "alpha", "beta" })
+      expect(live_cursor._locate_block(buf, "zzz")).to_be_nil()
+    end)
+  end)
+
+  describe("common_context (changed-line trimming)", function()
+    it("counts shared leading and trailing lines", function()
+      local prefix, suffix =
+        live_cursor._common_context({ "ctx1", "ctx2", "OLD", "ctx3" }, { "ctx1", "ctx2", "NEW", "ctx3" })
+      expect(prefix).to_be(2)
+      expect(suffix).to_be(1)
+    end)
+
+    it("handles a leading anchor that new_string keeps", function()
+      -- old=2-line anchor kept at the start of an otherwise-new block.
+      local prefix, suffix = live_cursor._common_context({ "a", "b" }, { "a", "b", "n1", "n2", "n3" })
+      expect(prefix).to_be(2)
+      expect(suffix).to_be(0)
+    end)
+
+    it("reports no shared context when nothing matches", function()
+      local prefix, suffix = live_cursor._common_context({ "x" }, { "y" })
+      expect(prefix).to_be(0)
+      expect(suffix).to_be(0)
+    end)
+  end)
+
+  describe("reconstruct_old (for the inline diff)", function()
+    it("swaps the new block back to old_string to rebuild the pre-edit file", function()
+      local post = { "a", "NEW1", "NEW2", "b" }
+      local rebuilt = live_cursor._reconstruct_old(post, 2, 3, { "OLD" })
+      assert.are.same({ "a", "OLD", "b" }, rebuilt)
+    end)
+
+    it("removes the block for a pure insertion (empty old)", function()
+      local post = { "a", "INS1", "INS2", "b" }
+      local rebuilt = live_cursor._reconstruct_old(post, 2, 3, {})
+      assert.are.same({ "a", "b" }, rebuilt)
+    end)
+
+    it("locate_in_array finds the exact block", function()
+      local s, e = live_cursor._locate_in_array({ "a", "x", "y", "b" }, { "x", "y" })
+      expect(s).to_be(2)
+      expect(e).to_be(3)
+    end)
+  end)
+end)
+
+describe("diff.is_live_for_file", function()
+  local diff
+
+  before_each(function()
+    if vim and vim._mock and vim._mock.reset then
+      vim._mock.reset()
+    end
+    package.loaded["claudecode.diff"] = nil
+    diff = require("claudecode.diff")
+    local active = diff._get_active_diffs()
+    for k in pairs(active) do
+      active[k] = nil
+    end
+  end)
+
+  it("is true for a pending diff matching new or old path", function()
+    local active = diff._get_active_diffs()
+    active["t1"] = { new_file_path = "/a", old_file_path = "/b", status = "pending" }
+    expect(diff.is_live_for_file("/a")).to_be_true()
+    expect(diff.is_live_for_file("/b")).to_be_true()
+  end)
+
+  it("is false for an unrelated path", function()
+    local active = diff._get_active_diffs()
+    active["t1"] = { new_file_path = "/a", old_file_path = "/b", status = "pending" }
+    expect(diff.is_live_for_file("/c")).to_be_false()
+  end)
+
+  it("is false once the diff is no longer pending", function()
+    local active = diff._get_active_diffs()
+    active["t1"] = { new_file_path = "/a", old_file_path = "/b", status = "saved" }
+    expect(diff.is_live_for_file("/a")).to_be_false()
+  end)
+end)

@@ -376,6 +376,8 @@ function M.setup(opts)
   local diff = require("claudecode.diff")
   diff.setup(M.state.config)
 
+  require("claudecode.live_cursor").setup(M.state.config)
+
   if M.state.config.auto_start then
     M.start(false)
   end
@@ -393,6 +395,9 @@ function M.setup(opts)
           clear_mention_queue_for(inst)
         end
       end
+      pcall(function()
+        require("claudecode.live_cursor").cleanup()
+      end)
     end,
     desc = "Automatically stop Claude Code integration when exiting Neovim",
   })
@@ -632,6 +637,16 @@ function M._create_commands()
     M.stop()
   end, {
     desc = "Stop Claude Code integration for current tab",
+  })
+
+  vim.api.nvim_create_user_command("ClaudeCodeLiveCursor", function(opts)
+    require("claudecode.live_cursor").toggle(opts.args ~= "" and opts.args or nil)
+  end, {
+    nargs = "?",
+    complete = function()
+      return { "preview", "open", "off" }
+    end,
+    desc = "Toggle the live Claude cursor (optionally: preview | open | off)",
   })
 
   vim.api.nvim_create_user_command("ClaudeCodeStatus", function()

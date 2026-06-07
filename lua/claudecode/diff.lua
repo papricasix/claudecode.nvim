@@ -1905,6 +1905,26 @@ function M._get_active_diffs()
   return active_diffs
 end
 
+-- Shared helpers reused by the live-cursor feature (lua/claudecode/live_cursor.lua)
+-- so it doesn't re-implement (and drift from) window discovery, filetype
+-- detection, and unified.nvim initialization.
+M.find_main_editor_window = find_main_editor_window
+M.detect_filetype = detect_filetype
+M.ensure_unified_initialized = ensure_unified_initialized
+
+---Whether a review diff is currently open (pending) for the given file.
+---Used by the live-cursor feature to avoid duplicating what the diff already shows.
+---@param file_path string Absolute path to check.
+---@return boolean
+function M.is_live_for_file(file_path)
+  for _, d in pairs(active_diffs) do
+    if (d.new_file_path == file_path or d.old_file_path == file_path) and d.status == "pending" then
+      return true
+    end
+  end
+  return false
+end
+
 ---Manual buffer reload function for testing/debugging
 ---@param file_path string Path to the file to reload
 ---@param original_cursor_pos table? Original cursor position {row, col}

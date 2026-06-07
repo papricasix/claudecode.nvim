@@ -331,6 +331,19 @@ local function get_claude_command_and_env(cmd_args)
     env_table[key] = value
   end
 
+  -- Live-cursor: inject the hook settings + RPC address (no-op when disabled).
+  -- This single seam covers every provider, since they all launch from these two values.
+  local lc_ok, live_cursor = pcall(require, "claudecode.live_cursor")
+  if lc_ok then
+    local injection = live_cursor.build_launch_injection()
+    if injection then
+      cmd_string = cmd_string .. " " .. injection.args
+      for key, value in pairs(injection.env) do
+        env_table[key] = value
+      end
+    end
+  end
+
   return cmd_string, env_table
 end
 

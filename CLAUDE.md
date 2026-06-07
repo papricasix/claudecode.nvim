@@ -65,6 +65,7 @@ The `fixtures/` directory contains test Neovim configurations for verifying plug
 4. **Selection Tracking** (`lua/claudecode/selection.lua`) - Monitors text selections and sends updates to Claude
 5. **Diff Integration** (`lua/claudecode/diff.lua`) - Native Neovim diff support for Claude's file comparisons
 6. **Terminal Integration** (`lua/claudecode/terminal.lua`) - Manages Claude CLI terminal sessions with support for internal Neovim terminals and external terminal applications
+7. **Live Cursor** (`lua/claudecode/live_cursor.lua`) - Opt-in "ride-along" view. Injects a Claude Code `PreToolUse` hook at launch (via `claude --settings`, so user settings are untouched) that reports `Read`/`Edit`/`Write` tool events back over Neovim's RPC socket (`scripts/claudecode_live_cursor_hook.sh`, stamped with the launching tabpage via `CLAUDECODE_NVIM_TAB` so background-tab Claudes don't preview in the current tab). Reads highlight the read line range; edits render a real inline diff via unified.nvim (`show_diff` reconstructs the pre-edit file and calls `unified.diff.show_against_text`), falling back to a line highlight when unified.nvim is absent. Edits are suppressed when a review diff already owns the file (`diff.is_live_for_file`).
 
 ### WebSocket Server Implementation
 
