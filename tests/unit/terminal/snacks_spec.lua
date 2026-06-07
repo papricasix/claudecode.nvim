@@ -85,6 +85,9 @@ describe("claudecode.terminal.snacks command handling", function()
           return 1
         end,
         nvim_set_current_win = function() end,
+        nvim_get_current_tabpage = function()
+          return 1
+        end,
       },
     }
 

@@ -38,6 +38,12 @@ describe("ClaudeCodeSend Command Range Functionality", function()
         nvim_replace_termcodes = spy.new(function(str)
           return str
         end),
+        -- live_cursor.setup() (run from claudecode.setup) creates a namespace
+        -- and registers default highlights.
+        nvim_create_namespace = function()
+          return 1
+        end,
+        nvim_set_hl = function() end,
       },
       notify = spy.new(function() end),
       log = { levels = { ERROR = 1, WARN = 2, INFO = 3 } },

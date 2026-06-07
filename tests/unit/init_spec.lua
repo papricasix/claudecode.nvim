@@ -96,6 +96,12 @@ describe("claudecode.init", function()
       end),
       nvim_create_user_command = SpyObject.new(function() end),
       nvim_echo = SpyObject.new(function() end),
+      -- live_cursor.setup() (run from claudecode.setup) creates a namespace and
+      -- registers default highlights; stub the calls it makes.
+      nvim_create_namespace = function()
+        return 1
+      end,
+      nvim_set_hl = function() end,
     }
 
     vim.deepcopy = function(t)

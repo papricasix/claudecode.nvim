@@ -355,6 +355,7 @@ end
 -- luacheck: globals mock_server
 describe("Selection module", function()
   local selection
+  local saved_get_instance
   mock_server = {
     broadcast = function(event, data)
       -- Store last broadcast for testing
@@ -370,6 +371,13 @@ describe("Selection module", function()
     package.loaded["claudecode.selection"] = nil
 
     selection = require("claudecode.selection")
+
+    -- selection.lua resolves the active server per tab via
+    -- claudecode.get_instance(); point it at the mock so broadcasts land there.
+    saved_get_instance = require("claudecode").get_instance
+    require("claudecode").get_instance = function()
+      return { server = mock_server }
+    end
   end)
 
   teardown(function()
@@ -377,6 +385,8 @@ describe("Selection module", function()
       selection.disable()
     end
     mock_server.last_broadcast = nil
+    -- Restore so the override doesn't leak into other spec files in this process.
+    require("claudecode").get_instance = saved_get_instance
   end)
 
   it("should have the correct initial state", function()

@@ -105,6 +105,14 @@ describe("claudecode.terminal.native toggle behavior", function()
           -- Mock window-specific function execution
           return fn()
         end,
+        nvim_get_current_tabpage = function()
+          return 1
+        end,
+        -- Per-tab terminal tracking uses tabpage_list_wins; delegate to
+        -- nvim_list_wins so the existing per-test overrides above still apply.
+        nvim_tabpage_list_wins = function(_tab_id)
+          return mock_vim.api.nvim_list_wins()
+        end,
       },
       cmd = function(command)
         -- Handle vsplit and other commands

@@ -60,7 +60,13 @@ describe("Diff split window cleanup", function()
     package.loaded["claudecode.diff"] = nil
   end)
 
-  it("closes the plugin-created original split after accept when close_tab is invoked", function()
+  it("reuses the main window in-place and restores its pre-diff buffer on close", function()
+    -- The main window (1000) shows some unrelated buffer; the diff targets a
+    -- different file. The merged diff logic reuses the main window in-place
+    -- (force_reuse when a real target window is found) rather than carving out a
+    -- plugin-owned split, saving the pre-diff buffer for restoration on close.
+    local pre_diff_buffer = vim.api.nvim_win_get_buf(1000)
+
     local params = {
       old_file_path = test_old_file,
       new_file_path = test_old_file,
@@ -76,8 +82,10 @@ describe("Diff split window cleanup", function()
     local new_win = state.new_window
     local target_win = state.target_window
 
-    -- Should have created an extra split for the original side (target_win != 1000)
-    assert.are_not.equal(1000, target_win)
+    -- Reused the existing main window for the original side (no extra split).
+    assert.are.equal(1000, target_win)
+    assert.is_false(state.target_window_created_by_plugin)
+    assert.are.equal(pre_diff_buffer, state.pre_diff_buffer)
     assert.is_true(vim.api.nvim_win_is_valid(target_win))
     assert.is_true(vim.api.nvim_win_is_valid(new_win))
 
@@ -89,9 +97,11 @@ describe("Diff split window cleanup", function()
     local closed = diff.close_diff_by_tab_name(tab_name)
     assert.is_true(closed)
 
+    -- Only the proposed split is torn down; the reused main window survives and
+    -- is restored to the buffer it held before the diff opened.
     assert.is_false(vim.api.nvim_win_is_valid(new_win))
-    assert.is_false(vim.api.nvim_win_is_valid(target_win))
     assert.is_true(vim.api.nvim_win_is_valid(1000))
+    assert.are.equal(pre_diff_buffer, vim.api.nvim_win_get_buf(1000))
   end)
 
   it("does not close the reused target window when the old file is already open", function()

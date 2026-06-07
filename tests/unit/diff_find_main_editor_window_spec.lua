@@ -27,6 +27,14 @@ describe("diff.find_main_editor_window sidebar exclusion", function()
     _G.vim.api.nvim_list_wins = function()
       return win_ids
     end
+    -- find_main_editor_window enumerates the current tab's windows via
+    -- nvim_tabpage_list_wins(nvim_get_current_tabpage()); mirror nvim_list_wins.
+    _G.vim.api.nvim_get_current_tabpage = function()
+      return 1
+    end
+    _G.vim.api.nvim_tabpage_list_wins = function(_tab)
+      return win_ids
+    end
     _G.vim.api.nvim_win_get_buf = function(win)
       return buf_of[win]
     end
@@ -46,6 +54,8 @@ describe("diff.find_main_editor_window sidebar exclusion", function()
       nvim_win_get_buf = _G.vim.api.nvim_win_get_buf,
       nvim_buf_get_option = _G.vim.api.nvim_buf_get_option,
       nvim_win_get_config = _G.vim.api.nvim_win_get_config,
+      nvim_get_current_tabpage = _G.vim.api.nvim_get_current_tabpage,
+      nvim_tabpage_list_wins = _G.vim.api.nvim_tabpage_list_wins,
     }
     package.loaded["claudecode.diff"] = nil
     diff = require("claudecode.diff")
