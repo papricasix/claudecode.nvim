@@ -46,6 +46,7 @@ describe("ClaudeCodeSend Command Range Functionality", function()
         nvim_set_hl = function() end,
       },
       notify = spy.new(function() end),
+      keymap = { set = function() end },
       log = { levels = { ERROR = 1, WARN = 2, INFO = 3 } },
       deepcopy = function(t)
         return t

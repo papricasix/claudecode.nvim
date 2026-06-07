@@ -28,6 +28,19 @@ describe("claudecode.init", function()
       return true
     end,
   }
+  -- The fork starts a per-tab server via server.new_instance(tab_id); the
+  -- returned instance delegates to the (spied) mock_server start/stop so the
+  -- shutdown assertions still observe the calls.
+  mock_server.new_instance = function(_tab_id)
+    return {
+      start = function()
+        return mock_server.start()
+      end,
+      stop = function()
+        return mock_server.stop()
+      end,
+    }
+  end
 
   local mock_lockfile = {
     create = function()
@@ -102,6 +115,13 @@ describe("claudecode.init", function()
         return 1
       end,
       nvim_set_hl = function() end,
+      -- Per-tab start()/instance lookup resolves the current tabpage.
+      nvim_get_current_tabpage = function()
+        return 1
+      end,
+      nvim_tabpage_is_valid = function()
+        return true
+      end,
     }
 
     vim.deepcopy = function(t)
@@ -336,8 +356,8 @@ describe("claudecode.init", function()
           local config = call.vals[3]
           assert.is_equal("*", config.nargs)
           assert.is_true(
-            string.find(config.desc, "optional arguments") ~= nil,
-            "Description should mention optional arguments"
+            string.find(config.desc, "Claude Code") ~= nil,
+            "Description should mention Claude Code"
           )
           break
         end
