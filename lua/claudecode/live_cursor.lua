@@ -47,6 +47,9 @@ local state = {
 
 local EDIT_TOOLS = { Edit = true, Write = true, MultiEdit = true }
 
+--- Present-tense verb shown in the preview winbar for each action kind.
+local ACTION_VERB = { read = "reading", write = "writing" }
+
 ---@return boolean
 local function is_enabled()
   return config ~= nil and config.enabled == true and (config.mode == "preview" or config.mode == "open")
@@ -246,7 +249,7 @@ function M.dispatch(event, source_tab)
     local limit = tonumber(input.limit)
     local e = (s and limit and limit > 0) and (s + limit - 1) or nil
     logger.debug("live_cursor", "Read", file, "offset=", tostring(input.offset), "limit=", tostring(input.limit))
-    M.show(file, { start_line = s or 1, end_line = e })
+    M.show(file, { start_line = s or 1, end_line = e, action = "read" })
   elseif EDIT_TOOLS[tool] then
     local delay = config.diff_suppress_ms or 250
     local new_text, old_text = edit_texts(input, tool)
@@ -266,9 +269,9 @@ function M.dispatch(event, source_tab)
         return
       end
       if (new_text and new_text ~= "") or (old_text and old_text ~= "") then
-        M.show(file, { locate = new_text, locate_fallback = old_text })
+        M.show(file, { locate = new_text, locate_fallback = old_text, action = "write" })
       else
-        M.show(file, { start_line = 1 }) -- Write / no snippet: whole-file change
+        M.show(file, { start_line = 1, action = "write" }) -- Write / no snippet: whole-file change
       end
     end, delay)
   end
@@ -286,15 +289,40 @@ local function find_editor_window()
   return d and d.find_main_editor_window() or nil
 end
 
----Mark a freshly-created preview window so the user can tell it is a live preview.
+---Compose the winbar text: the brand label, then what Claude is doing, then the
+---file it is doing it to — e.g. "● Claude live preview · reading · config.lua".
+---Each piece is optional: with no `info` it degrades to just the brand label.
+---@param info { action: string?, file: string? }|nil
+---@return string
+local function winbar_text(info)
+  local parts = { config.preview_label or "● Claude live preview" }
+  local verb = info and info.action and ACTION_VERB[info.action]
+  if verb then
+    parts[#parts + 1] = verb
+  end
+  if info and type(info.file) == "string" and info.file ~= "" then
+    parts[#parts + 1] = vim.fn.fnamemodify(info.file, ":t")
+  end
+  return table.concat(parts, " · ")
+end
+
+---Mark a freshly-created preview window so the user can tell it is a live preview,
+---and what Claude is currently reading/writing.
 ---@param win integer
-local function apply_preview_marker(win)
+---@param info { action: string?, file: string? }|nil What Claude is doing (for the winbar).
+local function apply_preview_marker(win, info)
   local hl = config.preview_highlight or "ClaudeCodeLivePreview"
   local did_winbar, did_divider = false, false
   if config.preview_winbar ~= false then
-    local label = (config.preview_label or "● Claude live preview"):gsub("%%", "%%%%")
+    -- Escape '%' (statusline meta) in the visible text only; the highlight
+    -- directive '%#group#' and the '%=' alignment items must stay literal.
+    local label = winbar_text(info):gsub("%%", "%%%%")
+    -- Centering uses a '%=' on each side of the text: the two alignment items
+    -- split the bar into equal-width sections, pushing the label to the middle.
+    local bar = (config.preview_align or "center") == "left" and ("%#" .. hl .. "#" .. label)
+      or ("%#" .. hl .. "#%=" .. label .. "%=")
     did_winbar = pcall(function()
-      vim.wo[win].winbar = "%#" .. hl .. "#" .. label
+      vim.wo[win].winbar = bar
     end)
   end
   if config.preview_divider ~= false then
@@ -314,13 +342,14 @@ end
 ---In preview mode, (re-)apply the marker on the next tick so it wins against any
 ---winbar plugin that sets its own on BufWinEnter (see M.show for the rationale).
 ---@param win integer
-local function schedule_preview_marker(win)
+---@param info { action: string?, file: string? }|nil What Claude is doing (for the winbar).
+local function schedule_preview_marker(win, info)
   if config.mode ~= "preview" then
     return
   end
   vim.schedule(function()
     if vim.api.nvim_win_is_valid(win) then
-      apply_preview_marker(win)
+      apply_preview_marker(win, info)
     end
   end)
 end
@@ -575,7 +604,7 @@ end
 
 ---Open/preview a file and highlight a line range, without moving focus.
 ---@param file_path string
----@param opts { start_line: integer?, end_line: integer?, locate: string?, locate_fallback: string? }
+---@param opts { start_line: integer?, end_line: integer?, locate: string?, locate_fallback: string?, action: string? }
 function M.show(file_path, opts)
   opts = opts or {}
   if not ns then
@@ -597,7 +626,7 @@ function M.show(file_path, opts)
   -- Loading the file fires BufWinEnter, where a winbar plugin (dropbar, barbecue,
   -- lualine winbar, ...) may set its own winbar. Re-apply our marker on the next
   -- tick so it wins (see schedule_preview_marker).
-  schedule_preview_marker(win)
+  schedule_preview_marker(win, { action = opts.action, file = file_path })
 
   local s, e = opts.start_line, opts.end_line
   if opts.locate or opts.locate_fallback then
@@ -779,7 +808,7 @@ function M.show_diff(file_path, new_string, old_string)
   local hunks = vim.b[buf].unified_hunks or {}
   scroll_into_view(win, math.max(1, math.min(hunks[1] or ls, vim.api.nvim_buf_line_count(buf))), le - ls + 1)
 
-  schedule_preview_marker(win)
+  schedule_preview_marker(win, { action = "write", file = file_path })
   arm_clear_timer()
   logger.debug("live_cursor", "edit diff for", file_path, "block", ls .. "-" .. le)
   return true
@@ -853,6 +882,7 @@ M._state = state
 M._is_enabled = is_enabled
 M._close_idle_preview = close_idle_preview
 M._apply_preview_marker = apply_preview_marker
+M._winbar_text = winbar_text
 M._locate_block = locate_block
 M._common_context = common_context
 M._locate_in_array = locate_in_array

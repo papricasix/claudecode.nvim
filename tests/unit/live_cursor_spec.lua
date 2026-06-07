@@ -68,6 +68,12 @@ describe("live_cursor", function()
       expect(pcall(config.validate, base_config({ enabled = true, mode = "preview", layout = "diagonal" }))).to_be_false()
     end)
 
+    it("accepts a valid preview_align and rejects unknown ones", function()
+      expect(pcall(config.validate, base_config({ enabled = true, mode = "preview", preview_align = "center" }))).to_be_true()
+      expect(pcall(config.validate, base_config({ enabled = true, mode = "preview", preview_align = "left" }))).to_be_true()
+      expect(pcall(config.validate, base_config({ enabled = true, mode = "preview", preview_align = "middle" }))).to_be_false()
+    end)
+
     it("accepts a split_size_percentage between 0 and 1 and rejects others", function()
       expect(pcall(config.validate, base_config({ enabled = true, mode = "preview", split_size_percentage = 0.5 }))).to_be_true()
       expect(pcall(config.validate, base_config({ enabled = true, mode = "preview", split_size_percentage = 1 }))).to_be_true()
@@ -304,6 +310,37 @@ describe("live_cursor", function()
       expect(vim.wo[1002].winhighlight).to_be_nil()
       assert.is_truthy(vim.wo[1002].winbar:match("Claude live preview"))
     end)
+
+    it("shows the action and file name alongside the brand label (centered by default)", function()
+      live_cursor.setup(base_config({ enabled = true, mode = "preview" }))
+
+      -- Logical order: brand · action · file (basename only); centered via %=…%=.
+      live_cursor._apply_preview_marker(1003, { action = "read", file = "/proj/src/config.lua" })
+      expect(vim.wo[1003].winbar).to_be("%#ClaudeCodeLivePreview#%=● Claude live preview · reading · config.lua%=")
+
+      live_cursor._apply_preview_marker(1003, { action = "write", file = "/proj/src/config.lua" })
+      expect(vim.wo[1003].winbar).to_be("%#ClaudeCodeLivePreview#%=● Claude live preview · writing · config.lua%=")
+    end)
+
+    it("left-aligns the winbar when preview_align is 'left'", function()
+      live_cursor.setup(base_config({ enabled = true, mode = "preview", preview_align = "left" }))
+      live_cursor._apply_preview_marker(1007, { action = "read", file = "/proj/src/config.lua" })
+      expect(vim.wo[1007].winbar).to_be("%#ClaudeCodeLivePreview#● Claude live preview · reading · config.lua")
+    end)
+
+    it("falls back to just the brand label when no action/file is given", function()
+      live_cursor.setup(base_config({ enabled = true, mode = "preview" }))
+      expect(live_cursor._winbar_text(nil)).to_be("● Claude live preview")
+      expect(live_cursor._winbar_text({ file = "/a/b.lua" })).to_be("● Claude live preview · b.lua")
+      expect(live_cursor._winbar_text({ action = "read" })).to_be("● Claude live preview · reading")
+    end)
+
+    it("escapes '%' in the file name so the winbar renders it literally", function()
+      live_cursor.setup(base_config({ enabled = true, mode = "preview", preview_align = "left" }))
+      live_cursor._apply_preview_marker(1004, { action = "read", file = "/proj/jan%2025.md" })
+      -- The visible text doubles '%' (statusline meta); the directive keeps one.
+      expect(vim.wo[1004].winbar).to_be("%#ClaudeCodeLivePreview#● Claude live preview · reading · jan%%2025.md")
+    end)
   end)
 
   describe("locate_block", function()
@@ -438,6 +475,8 @@ describe("live_cursor", function()
       assert.is_not_nil(pw)
       assert.are_not.equal(1000, pw) -- a NEW window, not the editor window
       expect(vim.api.nvim_win_is_valid(pw)).to_be_true()
+      -- The winbar reports the action and file end-to-end (dispatch → show → marker).
+      assert.is_truthy(vim.wo[pw].winbar:match("reading · x"))
 
       -- Auto-close when Claude goes idle (the timer calls _close_idle_preview).
       live_cursor._close_idle_preview()
@@ -458,6 +497,7 @@ describe("live_cursor", function()
       assert.is_not_nil(pw)
       assert.are_not.equal(1000, pw)
       expect(vim.api.nvim_win_is_valid(pw)).to_be_true()
+      assert.is_truthy(vim.wo[pw].winbar:match("writing · x"))
 
       live_cursor._close_idle_preview()
       expect(vim.api.nvim_win_is_valid(pw)).to_be_false()

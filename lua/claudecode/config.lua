@@ -39,7 +39,8 @@ M.defaults = {
     -- Visual markers so you can tell a split is a live preview (preview mode only):
     preview_winbar = true, -- show a colored winbar label at the top of the preview window
     preview_divider = true, -- tint the preview window's split divider (WinSeparator)
-    preview_label = "● Claude live preview", -- winbar text
+    preview_label = "● Claude live preview", -- winbar brand text (the file name and read/write action are appended)
+    preview_align = "center", -- winbar alignment: "center" or "left"
     preview_highlight = "ClaudeCodeLivePreview", -- highlight group for the marker; defaults to a link to DiagnosticOk (green)
   },
   -- `value` is passed verbatim to `claude --model`. These short aliases resolve
@@ -219,6 +220,9 @@ function M.validate(config)
     check("preview_label", function(v)
       return type(v) == "string"
     end, "must be a string")
+    check("preview_align", function(v)
+      return v == "center" or v == "left"
+    end, "must be 'center' or 'left'")
     check("preview_highlight", is_nonempty_string, "must be a non-empty string")
     check("clear_delay_ms", is_nonneg, "must be a non-negative number")
     check("diff_suppress_ms", is_nonneg, "must be a non-negative number")

@@ -326,7 +326,8 @@ For deep technical details, see [ARCHITECTURE.md](./ARCHITECTURE.md).
       diff_suppress_ms = 250, -- delay before painting an edit, to detect a review diff first
       preview_winbar = true, -- colored winbar label marking the preview window
       preview_divider = true, -- tint the preview window's split divider
-      preview_label = "● Claude live preview", -- winbar text
+      preview_label = "● Claude live preview", -- winbar brand text (file name + read/write action are appended)
+      preview_align = "center", -- winbar alignment: "center" or "left"
       preview_highlight = "ClaudeCodeLivePreview", -- marker color (defaults to a link to DiagnosticOk / green)
     },
   },
@@ -351,7 +352,7 @@ This works by injecting a Claude Code `PreToolUse` hook at launch via `claude --
 - **Edits render a real inline diff** when [unified.nvim](https://github.com/papricasix/unified.nvim) is installed: the live cursor reconstructs the pre-edit file (post-edit content with the edit reversed) and shows the precise added/removed lines, rather than a heuristic highlight. Without unified.nvim it falls back to highlighting the changed line range.
 - **Multi-tab aware:** each Claude is stamped with the tab it launched in, and its reads/edits only drive the preview when you are viewing that tab. A Claude running in a background tab never opens previews in the tab you are currently working in.
 - `highlight` — the highlight group used for the range. Define your own group of this (or another) name to customize colors.
-- In `preview` mode the window is marked so you can tell it apart from a normal split: a colored winbar label (`preview_winbar`) and a tinted split divider (`preview_divider`), both on by default. `preview_label` sets the winbar text and `preview_highlight` sets the color — it defaults to a link to `DiagnosticOk` (green); point it at a different group (e.g. `Function`, `Directory`) for blue, or define `ClaudeCodeLivePreview` yourself.
+- In `preview` mode the window is marked so you can tell it apart from a normal split: a colored winbar label (`preview_winbar`) and a tinted split divider (`preview_divider`), both on by default. The winbar reads `<label> · <reading|writing> · <file>` (e.g. `● Claude live preview · reading · config.lua`) so you can see at a glance what Claude is doing and to which file. `preview_label` sets the leading brand text, `preview_align` centers (`"center"`, default) or left-aligns (`"left"`) it, and `preview_highlight` sets the color — it defaults to a link to `DiagnosticOk` (green); point it at a different group (e.g. `Function`, `Directory`) for blue, or define `ClaudeCodeLivePreview` yourself.
 - Neovim splits have no true border, so a window can only recolor the separators it _owns_ (right/bottom edges). The divider tint is therefore most effective with `layout = "vertical"` (it colors the separator beside the preview); with `layout = "horizontal"` the top divider belongs to the window above and stays uncolored, so the **winbar** is the reliable marker there. If you run a winbar plugin (dropbar, barbecue, lualine winbar, …), the live-preview label intentionally overrides it inside the preview window.
 
 Toggle it at runtime with `:ClaudeCodeLiveCursor`:
