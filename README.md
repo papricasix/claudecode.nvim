@@ -341,7 +341,7 @@ For deep technical details, see [ARCHITECTURE.md](./ARCHITECTURE.md).
 
 A "ride-along" view: as Claude uses its `Read`/`Edit`/`Write` tools, claudecode.nvim opens or previews the touched file and highlights the exact line range — a live picture of what the agent is doing.
 
-This works by injecting a Claude Code `PreToolUse` hook at launch via `claude --settings` (your own settings files are never modified) that reports each tool event back to the running Neovim over its RPC socket. It requires the `claude` CLI's hook support and an `nvim` on `PATH`.
+This works by injecting a Claude Code `PreToolUse` hook at launch via `claude --settings` (your own settings files are never modified) that reports each tool event back to the running Neovim over its RPC socket. The hook is a small Lua script run through `nvim` itself, so it works on macOS, Linux, and native Windows alike. It requires the `claude` CLI's hook support and an `nvim` on `PATH`.
 
 - `enabled` — off by default; set to `true` to turn it on.
 - `mode` — **required** when enabled:

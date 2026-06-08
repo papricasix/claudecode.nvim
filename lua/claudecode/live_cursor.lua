@@ -84,7 +84,7 @@ local function hook_script_path()
   local src = debug.getinfo(1, "S").source or ""
   local file = src:gsub("^@", "")
   local root = file:gsub("[/\\]lua[/\\]claudecode[/\\]live_cursor%.lua$", "")
-  return root .. "/scripts/claudecode_live_cursor_hook.sh"
+  return root .. "/scripts/live_cursor_hook.lua"
 end
 
 ---Build the per-launch injection: extra `claude` args and env vars.
@@ -108,7 +108,8 @@ function M.build_launch_injection()
   end
   state.server_addr = addr
 
-  local hook = { type = "command", command = hook_script_path(), async = true }
+  local hook_cmd = "nvim --headless -u NONE -l " .. vim.fn.shellescape(hook_script_path())
+  local hook = { type = "command", command = hook_cmd, async = true }
   local settings = {
     hooks = {
       -- Only PreToolUse: PostToolUse would clear the highlight the instant a
@@ -145,38 +146,25 @@ function M.build_launch_injection()
 end
 
 --------------------------------------------------------------------------------
--- Transport: the hook writes the event JSON to a tempfile and passes us its path
+-- Transport: the hook forwards the event JSON over RPC and we decode it here
 --------------------------------------------------------------------------------
 
----Entry point invoked from the hook via `nvim --server ... --remote-expr`.
----@param arg string|table Either the tempfile path, or `{ path, source_tab }`.
----@return string Empty string (remote-expr expects a return value).
-function M.ingest_file(arg)
-  local path, source_tab
-  if type(arg) == "table" then
-    path, source_tab = arg[1], tonumber(arg[2])
-  else
-    path = arg
-  end
-  if type(path) ~= "string" then
-    return ""
-  end
-  local f = io.open(path, "r")
-  local data = nil
-  if f then
-    data = f:read("*a")
-    f:close()
-  end
-  pcall(os.remove, path)
-  if not data or data == "" then
+---Entry point invoked from the hook over RPC (`nvim_exec_lua`). The JSON event
+---passed through directly — no tempfile — so the transport is the same on platform.
+---@param data string The raw tool-event JSON Claude piped to the hook.
+---@param source_tab integer|string|nil Tabpage the triggering Claude was launched in.
+---@return string Empty string (the remote call expects a return value).
+function M.ingest(data, source_tab)
+  if type(data) ~= "string" or data == "" then
     return ""
   end
   local ok, event = pcall(vim.json.decode, data)
   if not ok or type(event) ~= "table" then
     return ""
   end
+  local tab = tonumber(source_tab)
   vim.schedule(function()
-    pcall(M.dispatch, event, source_tab)
+    pcall(M.dispatch, event, tab)
   end)
   return ""
 end
