@@ -228,6 +228,14 @@ function M.dispatch(event, source_tab)
       logger.debug("live_cursor", "skip Read: Claude in tab", tostring(source_tab), "is not the current tab")
       return
     end
+    -- A pending review diff already owns this file's window; a preview here would
+    -- fight it for the same screen real estate (and can leave the diff's acwrite
+    -- buffer in a state where accepting with :w fails). Stand down.
+    local diff = get_diff()
+    if diff and diff.is_live_for_file and diff.is_live_for_file(file) then
+      logger.debug("live_cursor", "skip Read", file, "(review diff open)")
+      return
+    end
     -- offset/limit are only present when Claude reads a *slice*; a whole-file
     -- read carries no range, so we open the file but highlight its first line.
     local s = tonumber(input.offset)
@@ -383,6 +391,11 @@ local function resolve_window()
     end
     if new_win and vim.api.nvim_win_is_valid(new_win) then
       state.preview_win = new_win
+      -- Tag the preview window so the review diff's window discovery skips it and
+      -- never opens a diff into the ride-along split (see diff.find_main_editor_window).
+      pcall(function()
+        vim.w[new_win].claudecode_live_preview = true
+      end)
       -- Size the split as a fraction of the screen: height for a horizontal
       -- (below) split, width for a vertical (beside) split.
       local size = config.split_size_percentage or 0.5
@@ -588,6 +601,23 @@ local function arm_clear_timer()
     state.clear_timer = nil
     close_idle_preview()
   end, delay)
+end
+
+---Called by diff.lua the moment a review diff opens, to make the live preview
+---stand down. The two features both arrange windows and would otherwise fight:
+---the preview can land on or split the diff window, and its idle timer can later
+---close a window the diff owns — leaving the diff's acwrite buffer in a state
+---where accepting with :w fails (E676). Closing the preview here also closes the
+---race where the preview opened just before the diff registered as pending (so
+---the deferred is_live_for_file check missed it). Best-effort; never throws.
+---@param file_path string|nil The file the diff is for (unused; we always yield).
+function M.on_diff_opened(file_path) -- luacheck: ignore file_path
+  M.clear()
+  stop_clear_timer()
+  if state.preview_win and vim.api.nvim_win_is_valid(state.preview_win) then
+    pcall(vim.api.nvim_win_close, state.preview_win, true)
+  end
+  state.preview_win = nil
 end
 
 ---Open/preview a file and highlight a line range, without moving focus.

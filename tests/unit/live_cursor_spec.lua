@@ -166,6 +166,20 @@ describe("live_cursor", function()
       expect(#shown).to_be(0)
     end)
 
+    it("suppresses a read when a review diff owns the file", function()
+      package.loaded["claudecode.diff"] = {
+        is_live_for_file = function()
+          return true
+        end,
+      }
+      live_cursor.dispatch({
+        hook_event_name = "PreToolUse",
+        tool_name = "Read",
+        tool_input = { file_path = "/x", offset = 10, limit = 5 },
+      })
+      expect(#shown).to_be(0)
+    end)
+
     it("paints an edit, preferring new_string with old_string as fallback", function()
       package.loaded["claudecode.diff"] = {
         is_live_for_file = function()
@@ -286,6 +300,27 @@ describe("live_cursor", function()
       live_cursor._close_idle_preview()
 
       expect(vim.api.nvim_win_is_valid(1000)).to_be_true()
+    end)
+
+    it("on_diff_opened closes the preview so the review diff owns the window", function()
+      live_cursor.setup(base_config({ enabled = true, mode = "preview" }))
+      vim._windows[1000] = { buf = 1 }
+      vim.api.nvim_set_current_win(2000) -- even when focused elsewhere
+      live_cursor._state.preview_win = 1000
+
+      live_cursor.on_diff_opened("/x")
+
+      expect(vim.api.nvim_win_is_valid(1000)).to_be_false()
+      expect(live_cursor._state.preview_win).to_be_nil()
+    end)
+
+    it("on_diff_opened is a no-op when no preview is open", function()
+      live_cursor.setup(base_config({ enabled = true, mode = "preview" }))
+      live_cursor._state.preview_win = nil
+
+      local ok = pcall(live_cursor.on_diff_opened, "/x")
+      expect(ok).to_be_true()
+      expect(live_cursor._state.preview_win).to_be_nil()
     end)
   end)
 

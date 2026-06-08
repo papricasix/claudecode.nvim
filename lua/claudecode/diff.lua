@@ -4,6 +4,19 @@ local M = {}
 
 local logger = require("claudecode.logger")
 
+---Tell the live-cursor feature to dismiss its ride-along preview before we build
+---a review diff for `file_path`. Done first thing in diff setup so the preview
+---window is gone before window discovery runs (it must not become the diff
+---target) and so an already-open preview can't keep fighting the diff for the
+---same screen. Best-effort and decoupled — a missing/older live_cursor is fine.
+---@param file_path string
+local function dismiss_live_cursor_preview(file_path)
+  local ok, live_cursor = pcall(require, "claudecode.live_cursor")
+  if ok and live_cursor and type(live_cursor.on_diff_opened) == "function" then
+    pcall(live_cursor.on_diff_opened, file_path)
+  end
+end
+
 -- Window options for terminal display (internal type, not exposed in public API)
 ---@class WindowOptions
 ---@field number boolean Show line numbers
@@ -115,6 +128,17 @@ local function find_main_editor_window(windows)
 
     if is_suitable and (buftype == "terminal" or buftype == "prompt") then
       is_suitable = false
+    end
+
+    -- Skip the live-cursor "ride-along" preview split: opening a diff into it
+    -- makes the two features fight over the same window (see live_cursor.lua).
+    if is_suitable then
+      local ok_pv, is_preview = pcall(function()
+        return vim.w[win].claudecode_live_preview
+      end)
+      if ok_pv and is_preview then
+        is_suitable = false
+      end
     end
 
     if
@@ -1343,6 +1367,8 @@ function M._setup_blocking_diff_unified(params, resolution_callback)
   local tab_name = params.tab_name
   logger.debug("diff", "Setting up unified diff for:", params.old_file_path)
 
+  dismiss_live_cursor_preview(params.old_file_path)
+
   local setup_success, setup_error = pcall(function()
     ensure_unified_initialized()
     local unified_diff = require("unified.diff")
@@ -1515,6 +1541,8 @@ end
 function M._setup_blocking_diff(params, resolution_callback)
   local tab_name = params.tab_name
   logger.debug("diff", "Setting up diff for:", params.old_file_path)
+
+  dismiss_live_cursor_preview(params.old_file_path)
 
   -- Determine target tab from the active Claude instance without switching the current tab.
   -- Falls back to current tab when no active-tab hint is available.

@@ -14,7 +14,7 @@ describe("diff.find_main_editor_window sidebar exclusion", function()
   -- Build a fake window layout and stub the four vim.api calls the function uses.
   -- `wins` is an ordered list of { ft=, bt=, floating= } describing each window.
   local function with_layout(wins)
-    local win_ids, buf_of, opt_of, cfg_of = {}, {}, {}, {}
+    local win_ids, buf_of, opt_of, cfg_of, w_of = {}, {}, {}, {}, {}
     for i, w in ipairs(wins) do
       local win_id = 1000 + i
       local buf_id = 2000 + i
@@ -22,7 +22,10 @@ describe("diff.find_main_editor_window sidebar exclusion", function()
       buf_of[win_id] = buf_id
       opt_of[buf_id] = { buftype = w.bt or "", filetype = w.ft or "" }
       cfg_of[win_id] = { relative = w.floating and "editor" or "" }
+      w_of[win_id] = { claudecode_live_preview = w.preview or nil }
     end
+
+    _G.vim.w = w_of
 
     _G.vim.api.nvim_list_wins = function()
       return win_ids
@@ -48,6 +51,8 @@ describe("diff.find_main_editor_window sidebar exclusion", function()
     return win_ids
   end
 
+  local saved_w
+
   before_each(function()
     saved = {
       nvim_list_wins = _G.vim.api.nvim_list_wins,
@@ -57,6 +62,7 @@ describe("diff.find_main_editor_window sidebar exclusion", function()
       nvim_get_current_tabpage = _G.vim.api.nvim_get_current_tabpage,
       nvim_tabpage_list_wins = _G.vim.api.nvim_tabpage_list_wins,
     }
+    saved_w = _G.vim.w
     package.loaded["claudecode.diff"] = nil
     diff = require("claudecode.diff")
   end)
@@ -65,6 +71,7 @@ describe("diff.find_main_editor_window sidebar exclusion", function()
     for name, fn in pairs(saved) do
       _G.vim.api[name] = fn
     end
+    _G.vim.w = saved_w
     package.loaded["claudecode.diff"] = nil
   end)
 
@@ -106,6 +113,17 @@ describe("diff.find_main_editor_window sidebar exclusion", function()
     })
 
     expect(diff._find_main_editor_window()).to_be(wins[4])
+  end)
+
+  it("skips the live-cursor ride-along preview split", function()
+    -- The preview split is a normal editor window (buftype ""), distinguished only
+    -- by the claudecode_live_preview window var; the diff must not open into it.
+    local wins = with_layout({
+      { ft = "lua", bt = "", preview = true }, -- live-cursor preview
+      { ft = "lua", bt = "" }, -- the actual editor
+    })
+
+    expect(diff._find_main_editor_window()).to_be(wins[2])
   end)
 
   it("returns nil when only excluded windows exist", function()
