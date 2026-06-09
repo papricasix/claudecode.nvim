@@ -108,7 +108,26 @@ function M.build_launch_injection()
   end
   state.server_addr = addr
 
-  local hook_cmd = "nvim --headless -u NONE -l " .. vim.fn.shellescape(hook_script_path())
+  -- The hook command is executed by Claude Code's hook runner — /bin/sh on
+  -- macOS/Linux, cmd.exe on native Windows — NOT by Neovim's shell, so
+  -- vim.fn.shellescape (which follows the user's 'shell' option) is the wrong
+  -- quoting: an nvim configured with shell=pwsh/bash on Windows would emit
+  -- POSIX single quotes that cmd.exe passes through literally, silently
+  -- breaking the hook. Quote explicitly for the runner we know will be used.
+  local is_windows = vim.fn.has("win32") == 1
+  local function quote_for_hook_runner(path)
+    if is_windows then
+      return '"' .. path .. '"' -- cmd.exe: double quotes (no escape needed; " is illegal in paths)
+    end
+    return "'" .. path:gsub("'", "'\\''") .. "'" -- /bin/sh: single quotes
+  end
+
+  -- Use the absolute path of the running Neovim rather than relying on `nvim`
+  -- being on the Claude process's PATH (it often isn't for GUI launches).
+  local nvim_bin = (vim.v and vim.v.progpath) or "nvim"
+  local hook_cmd = quote_for_hook_runner(nvim_bin)
+    .. " --headless -u NONE -l "
+    .. quote_for_hook_runner(hook_script_path())
   local hook = { type = "command", command = hook_cmd, async = true }
   local settings = {
     hooks = {

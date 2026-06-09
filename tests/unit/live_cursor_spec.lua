@@ -109,8 +109,48 @@ describe("live_cursor", function()
       f:close()
       assert.is_truthy(contents:match("PreToolUse"))
       assert.is_truthy(contents:match("Read|Edit|Write|MultiEdit"))
-      assert.is_truthy(contents:match("nvim %-%-headless"))
+      assert.is_truthy(contents:match("%-%-headless"))
       assert.is_truthy(contents:match("live_cursor_hook%.lua"))
+    end)
+
+    local function injected_settings_contents(injection)
+      local path = injection.args:match("%-%-settings%s+'?([^']+)'?")
+      assert.is_not_nil(path)
+      local f = assert(io.open(path, "r"))
+      local contents = f:read("*a")
+      f:close()
+      return contents
+    end
+
+    it("single-quotes the hook command for /bin/sh on POSIX", function()
+      live_cursor.setup(base_config({ enabled = true, mode = "preview" }))
+      local contents = injected_settings_contents(live_cursor.build_launch_injection())
+      -- Claude's hook runner is /bin/sh here; nvim binary and script path are
+      -- single-quoted (mock has no vim.v.progpath, so the binary falls back to "nvim").
+      assert.is_truthy(contents:match("'nvim' %-%-headless"))
+      assert.is_truthy(contents:match("live_cursor_hook%.lua'"))
+    end)
+
+    it("double-quotes the hook command for cmd.exe on Windows", function()
+      local saved_has = _G.vim.fn.has
+      local saved_progpath = _G.vim.v.progpath
+      _G.vim.fn.has = function(feature)
+        return feature == "win32" and 1 or saved_has(feature)
+      end
+      _G.vim.v.progpath = "C:\\Program Files\\Neovim\\bin\\nvim.exe"
+
+      live_cursor.setup(base_config({ enabled = true, mode = "preview" }))
+      local contents = injected_settings_contents(live_cursor.build_launch_injection())
+
+      _G.vim.fn.has = saved_has
+      _G.vim.v.progpath = saved_progpath
+
+      -- cmd.exe does not understand POSIX single quotes; the command must use
+      -- double quotes (JSON-escaped as \" in the settings file) and the absolute
+      -- nvim path from progpath.
+      assert.is_truthy(contents:match('nvim%.exe\\"'))
+      assert.is_truthy(contents:match('live_cursor_hook%.lua\\"'))
+      assert.is_falsy(contents:match("'nvim"))
     end)
   end)
 

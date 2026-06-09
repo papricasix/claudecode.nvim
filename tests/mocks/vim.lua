@@ -753,12 +753,17 @@ local vim = {
     encode = function(data)
       -- Extremely simplified JSON encoding, sufficient for basic test cases.
       -- Does not handle all JSON types or edge cases.
+      -- Strings are escaped like real vim.json.encode (backslash, quote,
+      -- newline, ...) so tests see the same bytes Neovim would produce.
+      local function escape_str(s)
+        return (s:gsub("\\", "\\\\"):gsub('"', '\\"'):gsub("\n", "\\n"):gsub("\r", "\\r"):gsub("\t", "\\t"))
+      end
       if type(data) == "table" then
         local parts = {}
         for k, v in pairs(data) do
           local val
           if type(v) == "string" then
-            val = '"' .. v .. '"'
+            val = '"' .. escape_str(v) .. '"'
           elseif type(v) == "table" then
             val = vim.json.encode(v)
           else
@@ -768,7 +773,7 @@ local vim = {
           if type(k) == "number" then
             table.insert(parts, val)
           else
-            table.insert(parts, '"' .. k .. '":' .. val)
+            table.insert(parts, '"' .. escape_str(k) .. '":' .. val)
           end
         end
 
@@ -778,7 +783,7 @@ local vim = {
           return "{" .. table.concat(parts, ",") .. "}"
         end
       elseif type(data) == "string" then
-        return '"' .. data .. '"'
+        return '"' .. escape_str(data) .. '"'
       else
         return tostring(data)
       end

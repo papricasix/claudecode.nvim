@@ -17,16 +17,40 @@
 --
 -- No-ops silently when not launched from Neovim or when the socket is gone, so
 -- it can never block or break a Claude session.
+--
+-- DEBUGGING: set CLAUDECODE_HOOK_DEBUG to a writable file path before launching
+-- Claude (e.g. via the plugin's `terminal.env`); every run then appends a line
+-- explaining what it saw and where it stopped. This is the fastest way to find
+-- out why the ride-along is silent on a given platform (Windows especially).
+
+local debug_path = os.getenv("CLAUDECODE_HOOK_DEBUG")
+local function dbg(msg)
+  if not debug_path or debug_path == "" then
+    return
+  end
+  local f = io.open(debug_path, "a")
+  if f then
+    f:write(os.date("%Y-%m-%d %H:%M:%S ") .. msg .. "\n")
+    f:close()
+  end
+end
+
+local function bail(reason)
+  dbg("exit: " .. reason)
+  os.exit(0)
+end
 
 local server = os.getenv("CLAUDECODE_NVIM_SERVER")
+dbg("start; CLAUDECODE_NVIM_SERVER=" .. tostring(server))
 if not server or server == "" then
-  os.exit(0)
+  bail("no CLAUDECODE_NVIM_SERVER in env (was it passed to the Claude process?)")
 end
 
 local data = io.read("*a")
 if not data or data == "" then
-  os.exit(0)
+  bail("empty stdin (no tool-event JSON piped in)")
 end
+dbg("read " .. #data .. " bytes of stdin")
 
 -- The tabpage this Claude was launched in (0 = unknown). Strip to digits so it
 -- is always a safe integer.
@@ -35,15 +59,17 @@ local tab = tonumber((os.getenv("CLAUDECODE_NVIM_TAB") or ""):match("%d+") or "0
 -- TCP addresses look like `127.0.0.1:6789`; everything else (a Unix socket path
 -- or a Windows named pipe `\\.\pipe\nvim...`) is a "pipe" connection.
 local kind = server:match("^%d[%d%.]*:%d+$") and "tcp" or "pipe"
+dbg("connecting kind=" .. kind .. " tab=" .. tab)
 
 local ok, chan = pcall(vim.fn.sockconnect, kind, server, { rpc = true })
 if not ok or type(chan) ~= "number" or chan == 0 then
-  os.exit(0)
+  bail("sockconnect failed: " .. tostring(chan))
 end
+dbg("connected on channel " .. tostring(chan))
 
 -- Synchronous request so the message is delivered before this short-lived
 -- process exits. The remote `ingest` schedules its work and returns immediately.
-pcall(
+local req_ok, req_err = pcall(
   vim.rpcrequest,
   chan,
   "nvim_exec_lua",
@@ -53,5 +79,8 @@ pcall(
   ]],
   { data, tab }
 )
+if not req_ok then
+  bail("rpcrequest failed: " .. tostring(req_err))
+end
 
-os.exit(0)
+bail("delivered ok")

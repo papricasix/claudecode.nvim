@@ -539,3 +539,36 @@ describe("Diff Module", function()
 
   teardown()
 end)
+
+describe("diff content_to_lines (CRLF normalization)", function()
+  local diff
+
+  before_each(function()
+    package.loaded["claudecode.diff"] = nil
+    diff = require("claudecode.diff")
+  end)
+
+  it("splits unix content and reports unix fileformat", function()
+    local lines, ff = diff._content_to_lines("a\nb\nc\n")
+    assert.are.same({ "a", "b", "c" }, lines)
+    expect(ff).to_be("unix")
+  end)
+
+  it("strips trailing CR and reports dos fileformat for CRLF content", function()
+    local lines, ff = diff._content_to_lines("a\r\nb\r\nc\r\n")
+    -- Without stripping, each line would keep a ^M and diff as fully changed.
+    assert.are.same({ "a", "b", "c" }, lines)
+    expect(ff).to_be("dos")
+  end)
+
+  it("drops the spurious empty final element from a trailing newline", function()
+    local lines = diff._content_to_lines("a\r\nb\r\n")
+    assert.are.same({ "a", "b" }, lines)
+  end)
+
+  it("treats content with no trailing newline as unix and keeps all lines", function()
+    local lines, ff = diff._content_to_lines("a\nb")
+    assert.are.same({ "a", "b" }, lines)
+    expect(ff).to_be("unix")
+  end)
+end)

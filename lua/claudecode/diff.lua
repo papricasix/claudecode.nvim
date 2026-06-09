@@ -17,6 +17,34 @@ local function dismiss_live_cursor_preview(file_path)
   end
 end
 
+---Split proposed file contents into buffer lines, stripping CRLF/CR so a Windows
+---(`\r\n`) file does not diff as entirely changed: Neovim loads the on-disk
+---original with `fileformat=dos` (no trailing `\r`), but a scratch buffer keeps a
+---literal `\r` from a plain `\n` split and renders it as `^M`, making every line
+---differ. We strip the `\r` here and report the detected line ending so accept
+---(`_resolve_diff_as_saved`) can rejoin with the same separator and preserve it.
+---@param contents string The raw proposed file contents from Claude.
+---@return string[] lines Buffer lines with no trailing carriage returns.
+---@return string fileformat "dos" if CRLF was detected, else "unix".
+local function content_to_lines(contents)
+  local lines = vim.split(contents, "\n", { plain = true })
+  -- Drop the spurious empty final element a trailing newline produces.
+  if #lines > 0 and lines[#lines] == "" then
+    table.remove(lines)
+  end
+  local fileformat = "unix"
+  for i = 1, #lines do
+    if lines[i]:sub(-1) == "\r" then
+      fileformat = "dos"
+      lines[i] = lines[i]:sub(1, -2)
+    end
+  end
+  return lines, fileformat
+end
+
+-- Exposed for testing the CRLF normalization.
+M._content_to_lines = content_to_lines
+
 -- Window options for terminal display (internal type, not exposed in public API)
 ---@class WindowOptions
 ---@field number boolean Show line numbers
@@ -527,7 +555,9 @@ local function create_temp_file(content, filename)
   end
 
   local tmp_file = tmp_session_dir .. "/" .. filename
-  local file = io.open(tmp_file, "w")
+  -- Binary mode: on Windows, text mode would translate \n to \r\n on write,
+  -- turning CRLF content into \r\r\n and corrupting the diff.
+  local file = io.open(tmp_file, "wb")
   if not file then
     return nil, "Failed to create temporary file: " .. tmp_file
   end
@@ -912,12 +942,16 @@ function M._resolve_diff_as_saved(tab_name, buffer_id)
 
   logger.debug("diff", "Accepting diff for", tab_name)
 
-  -- Get content from buffer
+  -- Get content from buffer. Rejoin with the buffer's own line ending so a CRLF
+  -- (fileformat=dos) file is written back with CRLF intact rather than silently
+  -- converted to LF on accept (we stripped the \r when building the buffer).
   local content_lines = vim.api.nvim_buf_get_lines(buffer_id, 0, -1, false)
-  local final_content = table.concat(content_lines, "\n")
+  local ok_ff, ff = pcall(vim.api.nvim_buf_get_option, buffer_id, "fileformat")
+  local newline = (ok_ff and ff == "dos") and "\r\n" or "\n"
+  local final_content = table.concat(content_lines, newline)
   -- Add trailing newline if the buffer has one
   if #content_lines > 0 and vim.api.nvim_buf_get_option(buffer_id, "eol") then
-    final_content = final_content .. "\n"
+    final_content = final_content .. newline
   end
 
   -- Do not modify windows/tabs here; wait for explicit close_tab tool call to clean up UI
@@ -1384,7 +1418,10 @@ function M._setup_blocking_diff_unified(params, resolution_callback)
       })
     end
 
-    local old_text = is_new_file and "" or read_file_contents_or_empty(params.old_file_path)
+    -- Normalize the on-disk original's line endings too, so a CRLF file diffs
+    -- cleanly against the (CRLF-stripped) proposed buffer instead of as a
+    -- wholesale replacement.
+    local old_text = is_new_file and "" or (read_file_contents_or_empty(params.old_file_path):gsub("\r\n", "\n"))
 
     -- All window discovery, buffer placement, and cursor positioning must
     -- happen in the tab that owns the active Claude message — otherwise the
@@ -1419,16 +1456,14 @@ function M._setup_blocking_diff_unified(params, resolution_callback)
       local unique_name = is_new_file and (tab_name .. " (NEW FILE - proposed)") or (tab_name .. " (proposed)")
       pcall(vim.api.nvim_buf_set_name, new_buffer, unique_name)
 
-      local lines = vim.split(params.new_file_contents, "\n")
-      if #lines > 0 and lines[#lines] == "" then
-        table.remove(lines, #lines)
-      end
+      local lines, fileformat = content_to_lines(params.new_file_contents)
       vim.api.nvim_buf_set_lines(new_buffer, 0, -1, false, lines)
 
       vim.api.nvim_buf_set_option(new_buffer, "buftype", "acwrite")
       vim.api.nvim_buf_set_option(new_buffer, "bufhidden", "hide")
       vim.api.nvim_buf_set_option(new_buffer, "swapfile", false)
       vim.api.nvim_buf_set_option(new_buffer, "modifiable", true)
+      vim.api.nvim_buf_set_option(new_buffer, "fileformat", fileformat)
       vim.api.nvim_buf_set_option(new_buffer, "modified", false)
 
       local ft = detect_filetype(params.old_file_path, nil)
@@ -1665,15 +1700,12 @@ function M._setup_blocking_diff(params, resolution_callback)
 
     local new_unique_name = is_new_file and (tab_name .. " (NEW FILE - proposed)") or (tab_name .. " (proposed)")
     vim.api.nvim_buf_set_name(new_buffer, new_unique_name)
-    local lines = vim.split(params.new_file_contents, "\n")
-    -- Remove trailing empty line if content ended with \n
-    if #lines > 0 and lines[#lines] == "" then
-      table.remove(lines, #lines)
-    end
+    local lines, fileformat = content_to_lines(params.new_file_contents)
     vim.api.nvim_buf_set_lines(new_buffer, 0, -1, false, lines)
 
     vim.api.nvim_buf_set_option(new_buffer, "buftype", "acwrite") -- Allows saving but stays as scratch-like
     vim.api.nvim_buf_set_option(new_buffer, "modifiable", true)
+    vim.api.nvim_buf_set_option(new_buffer, "fileformat", fileformat)
 
     -- Save the buffer currently in the target window so we can restore it after the diff closes
     local pre_diff_buffer = nil
