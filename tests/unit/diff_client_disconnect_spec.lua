@@ -85,6 +85,43 @@ describe("issue #248: closing orphaned diffs", function()
     assert.is_nil(next(diff._get_active_diffs()))
   end)
 
+  -- Multi-tab regression: every per-tab Claude server shares this one
+  -- active_diffs table, and Claude Code sends closeAllDiffTabs around each edit.
+  -- close_all_diffs (the tool's backend) must only close diffs owned by the tab
+  -- that issued the call -- otherwise the foreground Claude's routine
+  -- closeAllDiffTabs rejects a *background* tab's still-pending diff, which that
+  -- Claude receives as a spurious tool rejection and stops.
+  it("close_all_diffs only closes diffs owned by the calling tab", function()
+    vim._tabs[101] = true
+    vim._tabs[102] = true
+
+    _G._claudecode_active_tab_id = 101
+    local a = open_pending(file_a, "tab-101", "client101")
+    _G._claudecode_active_tab_id = 102
+    local b = open_pending(file_b, "tab-102", "client102")
+
+    assert.equal(101, diff._get_active_diffs()["tab-101"].original_tab_number)
+    assert.equal(102, diff._get_active_diffs()["tab-102"].original_tab_number)
+
+    -- closeAllDiffTabs arrives from tab 101's Claude (its server set the active id).
+    _G._claudecode_active_tab_id = 101
+    local closed = diff.close_all_diffs("closeAllDiffTabs from tab 101")
+
+    -- The calling tab's diff is closed/rejected...
+    assert.equal(1, closed)
+    assert.equal("dead", coroutine.status(a.co))
+    assert.equal("DIFF_REJECTED", a.result.content[1].text)
+    assert.is_nil(diff._get_active_diffs()["tab-101"])
+    -- ...but the background tab's pending diff is untouched.
+    assert.equal("suspended", coroutine.status(b.co))
+    assert.is_table(diff._get_active_diffs()["tab-102"])
+    assert.is_nil(b.result)
+
+    _G._claudecode_active_tab_id = nil
+    vim._tabs[101] = nil
+    vim._tabs[102] = nil
+  end)
+
   -- A status="saved" diff still holds the user's :w'd edits only in its proposed
   -- buffer (until Claude writes the file). Auto-cleanup must NOT close it, or those
   -- edits are silently destroyed if Claude died before writing. Pending diffs only.

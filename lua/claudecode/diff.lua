@@ -1544,6 +1544,7 @@ function M._setup_blocking_diff_unified(params, resolution_callback)
       result_content = nil,
       is_new_file = is_new_file,
       provider = "unified",
+      client_id = params.client_id,
     })
   end)
 
@@ -2046,9 +2047,25 @@ end
 ---accepted files. Automatic cleanup and the :ClaudeCodeCloseAllDiffs command
 ---deliberately use close_pending_diffs / close_diffs_for_client instead, to
 ---leave already-saved diffs alone -- see close_pending_diffs for why.
+---
+---Scoped to the calling Claude's tab: in the multi-tab architecture every
+---per-tab server shares this one active_diffs table, and Claude Code sends
+---closeAllDiffTabs around every edit. Without scoping, the foreground Claude's
+---routine closeAllDiffTabs would reject a *different* tab's still-pending diff,
+---which that background Claude receives as a spurious tool rejection (it then
+---stops, believing the user declined the edit). We therefore only close diffs
+---owned by the tab that issued this call (`_claudecode_active_tab_id`, set by
+---the server on the incoming message). When no owning tab is known
+---(single-instance / legacy / tests) we fall back to closing everything.
 ---@param reason string Human-readable reason (for logging)
 ---@return number count Number of diffs closed
 function M.close_all_diffs(reason)
+  local active_tab = _G._claudecode_active_tab_id
+  if active_tab and vim.api.nvim_tabpage_is_valid(active_tab) then
+    return close_active_diffs(function(diff_data)
+      return diff_data.original_tab_number == active_tab
+    end, reason or ("close all diffs for tab " .. tostring(active_tab)))
+  end
   return close_active_diffs(nil, reason or "close all diffs")
 end
 
