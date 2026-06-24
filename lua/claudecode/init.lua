@@ -379,6 +379,7 @@ function M.setup(opts)
   diff.setup(M.state.config)
 
   require("claudecode.live_cursor").setup(M.state.config)
+  require("claudecode.plan_view").setup(M.state.config)
 
   if M.state.config.auto_start then
     M.start(false)
@@ -399,6 +400,9 @@ function M.setup(opts)
       end
       pcall(function()
         require("claudecode.live_cursor").cleanup()
+      end)
+      pcall(function()
+        require("claudecode.plan_view").cleanup()
       end)
     end,
     desc = "Automatically stop Claude Code integration when exiting Neovim",
@@ -652,6 +656,16 @@ function M._create_commands()
       return { "preview", "open", "off" }
     end,
     desc = "Toggle the live Claude cursor (optionally: preview | open | off)",
+  })
+
+  vim.api.nvim_create_user_command("ClaudeCodePlanView", function(opts)
+    require("claudecode.plan_view").toggle(opts.args ~= "" and opts.args or nil)
+  end, {
+    nargs = "?",
+    complete = function()
+      return { "on", "off" }
+    end,
+    desc = "Toggle showing Claude's plan-mode plan in an editor split (optionally: on | off)",
   })
 
   vim.api.nvim_create_user_command("ClaudeCodeStatus", function()

@@ -43,6 +43,16 @@ M.defaults = {
     preview_align = "center", -- winbar alignment: "center" or "left"
     preview_highlight = "ClaudeCodeLivePreview", -- highlight group for the marker; defaults to a link to DiagnosticOk (green)
   },
+  plan = {
+    enabled = false, -- opt-in: render Claude's plan-mode plan in an editor split
+    layout = "vertical", -- "vertical" or "horizontal" split for the plan window
+    split_size_percentage = 0.5, -- plan split size as a fraction of the screen (0..1)
+    focus = true, -- move focus into the plan window when it opens
+    close_on_resolve = true, -- close the plan window when the plan is accepted/rejected
+    clear_delay_ms = 0, -- inactivity backstop close (0 = rely on the resolve signals)
+    label = "● Claude plan", -- winbar brand text for the plan window
+    highlight = "ClaudeCodePlan", -- winbar highlight group; defaults to a link to DiagnosticInfo
+  },
   -- `value` is passed verbatim to `claude --model`. These short aliases resolve
   -- to the latest model on the Anthropic API, so labels stay version-free to
   -- avoid going stale on every release.
@@ -233,6 +243,43 @@ function M.validate(config)
         "live_cursor.mode is required when live_cursor.enabled is true (set it to 'preview' or 'open')"
       )
     end
+  end
+
+  -- Validate plan (optional; apply() supplies defaults)
+  if config.plan ~= nil then
+    local p = config.plan
+    assert(type(p) == "table", "plan must be a table")
+
+    local function check(field, ok, msg)
+      if p[field] ~= nil then
+        assert(ok(p[field]), "plan." .. field .. " " .. msg)
+      end
+    end
+
+    check("enabled", function(v)
+      return type(v) == "boolean"
+    end, "must be a boolean")
+    check("layout", function(v)
+      return v == "vertical" or v == "horizontal"
+    end, "must be 'vertical' or 'horizontal'")
+    check("split_size_percentage", function(v)
+      return type(v) == "number" and v > 0 and v <= 1
+    end, "must be a number between 0 and 1")
+    check("focus", function(v)
+      return type(v) == "boolean"
+    end, "must be a boolean")
+    check("close_on_resolve", function(v)
+      return type(v) == "boolean"
+    end, "must be a boolean")
+    check("clear_delay_ms", function(v)
+      return type(v) == "number" and v >= 0
+    end, "must be a non-negative number")
+    check("label", function(v)
+      return type(v) == "string"
+    end, "must be a string")
+    check("highlight", function(v)
+      return type(v) == "string" and v ~= ""
+    end, "must be a non-empty string")
   end
 
   -- Validate env

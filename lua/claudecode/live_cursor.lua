@@ -55,6 +55,13 @@ local function is_enabled()
   return config ~= nil and config.enabled == true and (config.mode == "preview" or config.mode == "open")
 end
 
+--- Whether the (separately toggled) plan view wants the launch hook injected.
+---@return boolean
+local function plan_enabled()
+  local ok, pv = pcall(require, "claudecode.plan_view")
+  return ok and pv.is_enabled() == true
+end
+
 --------------------------------------------------------------------------------
 -- Setup
 --------------------------------------------------------------------------------
@@ -91,7 +98,9 @@ end
 ---Returns nil when the feature is disabled or no RPC address is available.
 ---@return { args: string, env: table<string,string> }|nil
 function M.build_launch_injection()
-  if not is_enabled() then
+  local lc_on = is_enabled()
+  local plan_on = plan_enabled()
+  if not lc_on and not plan_on then
     return nil
   end
 
@@ -129,13 +138,29 @@ function M.build_launch_injection()
     .. " --headless -u NONE -l "
     .. quote_for_hook_runner(hook_script_path())
   local hook = { type = "command", command = hook_cmd, async = true }
+  -- Build the PreToolUse matcher from whichever features are enabled: live-cursor
+  -- wants the file tools; the plan view wants ExitPlanMode (which carries the plan).
+  local pre_tools = {}
+  if lc_on then
+    table.insert(pre_tools, "Read|Edit|Write|MultiEdit")
+  end
+  if plan_on then
+    table.insert(pre_tools, "ExitPlanMode")
+  end
   local settings = {
     hooks = {
-      -- Only PreToolUse: PostToolUse would clear the highlight the instant a
-      -- near-instant Read finishes, so we rely on the inactivity timer instead.
-      PreToolUse = { { matcher = "Read|Edit|Write|MultiEdit", hooks = { hook } } },
+      -- For the file tools we use only PreToolUse: a PostToolUse would clear the
+      -- highlight the instant a near-instant Read finishes, so live-cursor relies
+      -- on its inactivity timer instead.
+      PreToolUse = { { matcher = table.concat(pre_tools, "|"), hooks = { hook } } },
     },
   }
+  if plan_on then
+    -- For the plan view, PostToolUse(ExitPlanMode) is the "user accepted" signal
+    -- that closes the plan window. Scoped to ExitPlanMode so it never fires for
+    -- the file tools above.
+    settings.hooks.PostToolUse = { { matcher = "ExitPlanMode", hooks = { hook } } }
+  end
 
   local tmp = vim.fn.tempname()
   local ok_w = pcall(function()
@@ -225,17 +250,64 @@ local function edit_texts(input, tool)
   return input.new_string, input.old_string
 end
 
+---Fallback plan-text extractor: the longest string value in a tool_input table.
+---Used only if ExitPlanMode's field is ever named something other than `plan`, so
+---a field-name surprise degrades to "show something" rather than showing nothing.
+---@param tbl table|nil
+---@return string|nil
+local function longest_string(tbl)
+  if type(tbl) ~= "table" then
+    return nil
+  end
+  local best
+  for _, v in pairs(tbl) do
+    if type(v) == "string" and (not best or #v > #best) then
+      best = v
+    end
+  end
+  return best
+end
+
 ---Route a hook event to the appropriate visual action.
 ---@param event table Decoded hook payload.
 ---@param source_tab integer|nil Tabpage the triggering Claude was launched in.
 function M.dispatch(event, source_tab)
+  local tool = event.tool_name
+  local ehn = event.hook_event_name
+
+  -- Plan view: ExitPlanMode carries the plan markdown. Routed independently of the
+  -- live-cursor enabled gate, since the two features toggle separately. PreToolUse
+  -- (plan ready to read) opens it; PostToolUse (user accepted) closes it.
+  if tool == "ExitPlanMode" then
+    local ok, pv = pcall(require, "claudecode.plan_view")
+    if ok then
+      if ehn == "PreToolUse" then
+        local input = event.tool_input or {}
+        pv.show(input.plan or longest_string(input), source_tab)
+      elseif ehn == "PostToolUse" then
+        pv.close()
+      end
+    end
+    return
+  end
+
+  -- Any other tool event resolves an open plan: after acceptance Claude starts
+  -- executing (Read/Edit/Write), after a reject it resumes planning — either way
+  -- the plan presentation is over, so close the window. This covers the reject
+  -- case, which PostToolUse may not fire for.
+  if ehn == "PreToolUse" then
+    local ok, pv = pcall(require, "claudecode.plan_view")
+    if ok and pv.is_open() then
+      pv.close()
+    end
+  end
+
   if not is_enabled() then
     return
   end
-  if event.hook_event_name ~= "PreToolUse" then
+  if ehn ~= "PreToolUse" then
     return
   end
-  local tool = event.tool_name
   local input = event.tool_input or {}
   local file = input.file_path
   if type(file) ~= "string" or file == "" then
@@ -297,11 +369,20 @@ end
 --------------------------------------------------------------------------------
 
 ---A normal editor window in the current tab (skips terminals, floats, and file
----explorers/pickers). Reuses diff.lua's canonical finder so the two never drift.
+---explorers/pickers). Prefers the window closest to the Claude terminal (matching
+---the plan view) and falls back to diff.lua's canonical first-suitable finder, so
+---the two never drift.
 ---@return integer|nil
 local function find_editor_window()
   local d = get_diff()
-  return d and d.find_main_editor_window() or nil
+  if not d then
+    return nil
+  end
+  local win = d.find_window_closest_to_terminal and d.find_window_closest_to_terminal()
+  if win then
+    return win
+  end
+  return d.find_main_editor_window and d.find_main_editor_window() or nil
 end
 
 ---Compose the winbar text: the brand label, then what Claude is doing, then the

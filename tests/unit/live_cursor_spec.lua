@@ -274,6 +274,159 @@ describe("live_cursor", function()
     end)
   end)
 
+  -- The plan view rides the same launch hook. live_cursor.build_launch_injection
+  -- must also fire for the plan feature, and dispatch must route ExitPlanMode to
+  -- claudecode.plan_view (open on PreToolUse, close on PostToolUse / next event).
+  describe("plan view integration", function()
+    local function settings_of(injection)
+      local path = injection.args:match("%-%-settings%s+'?([^']+)'?")
+      assert.is_not_nil(path)
+      local f = assert(io.open(path, "r"))
+      local contents = f:read("*a")
+      f:close()
+      return contents
+    end
+
+    after_each(function()
+      package.loaded["claudecode.plan_view"] = nil
+    end)
+
+    it("injects the hook for the plan view even when live_cursor is disabled", function()
+      package.loaded["claudecode.plan_view"] = {
+        is_enabled = function()
+          return true
+        end,
+      }
+      live_cursor.setup(base_config({ enabled = false }))
+      local injection = live_cursor.build_launch_injection()
+      assert.is_not_nil(injection)
+      local contents = settings_of(injection)
+      assert.is_truthy(contents:match("ExitPlanMode"))
+      assert.is_truthy(contents:match("PostToolUse"))
+      -- live_cursor off -> the file-tool matcher must not be present.
+      assert.is_falsy(contents:match("Read|Edit|Write|MultiEdit"))
+    end)
+
+    it("combines both matchers when live_cursor and plan view are enabled", function()
+      package.loaded["claudecode.plan_view"] = {
+        is_enabled = function()
+          return true
+        end,
+      }
+      live_cursor.setup(base_config({ enabled = true, mode = "preview" }))
+      local contents = settings_of(live_cursor.build_launch_injection())
+      assert.is_truthy(contents:match("Read|Edit|Write|MultiEdit"))
+      assert.is_truthy(contents:match("ExitPlanMode"))
+      assert.is_truthy(contents:match("PostToolUse"))
+    end)
+
+    it("omits PostToolUse when only live_cursor is enabled", function()
+      package.loaded["claudecode.plan_view"] = {
+        is_enabled = function()
+          return false
+        end,
+      }
+      live_cursor.setup(base_config({ enabled = true, mode = "preview" }))
+      local contents = settings_of(live_cursor.build_launch_injection())
+      assert.is_falsy(contents:match("PostToolUse"))
+      assert.is_falsy(contents:match("ExitPlanMode"))
+    end)
+
+    it("routes a PreToolUse ExitPlanMode to plan_view.show with the plan markdown", function()
+      local calls = {}
+      package.loaded["claudecode.plan_view"] = {
+        is_enabled = function()
+          return true
+        end,
+        is_open = function()
+          return false
+        end,
+        show = function(md, tab)
+          table.insert(calls, { md = md, tab = tab })
+        end,
+        close = function()
+          calls.closed = true
+        end,
+      }
+      live_cursor.setup(base_config({ enabled = false }))
+      live_cursor.dispatch({
+        hook_event_name = "PreToolUse",
+        tool_name = "ExitPlanMode",
+        tool_input = { plan = "# Plan\n- do thing" },
+      }, 7)
+      expect(#calls).to_be(1)
+      expect(calls[1].md).to_be("# Plan\n- do thing")
+      expect(calls[1].tab).to_be(7)
+    end)
+
+    it("falls back to the longest string when ExitPlanMode lacks a `plan` field", function()
+      local got
+      package.loaded["claudecode.plan_view"] = {
+        is_enabled = function()
+          return true
+        end,
+        is_open = function()
+          return false
+        end,
+        show = function(md)
+          got = md
+        end,
+        close = function() end,
+      }
+      live_cursor.setup(base_config({ enabled = false }))
+      live_cursor.dispatch({
+        hook_event_name = "PreToolUse",
+        tool_name = "ExitPlanMode",
+        tool_input = { mode = "x", content = "the much longer plan body here" },
+      })
+      expect(got).to_be("the much longer plan body here")
+    end)
+
+    it("routes a PostToolUse ExitPlanMode to plan_view.close", function()
+      local closed = false
+      package.loaded["claudecode.plan_view"] = {
+        is_enabled = function()
+          return true
+        end,
+        is_open = function()
+          return true
+        end,
+        show = function() end,
+        close = function()
+          closed = true
+        end,
+      }
+      live_cursor.setup(base_config({ enabled = false }))
+      live_cursor.dispatch({ hook_event_name = "PostToolUse", tool_name = "ExitPlanMode", tool_input = {} })
+      expect(closed).to_be_true()
+    end)
+
+    it("closes an open plan when any other tool event arrives (reject/execute)", function()
+      local closed = false
+      package.loaded["claudecode.plan_view"] = {
+        is_enabled = function()
+          return true
+        end,
+        is_open = function()
+          return true
+        end,
+        show = function() end,
+        close = function()
+          closed = true
+        end,
+      }
+      -- live_cursor disabled, so the Read itself paints nothing; the only effect we
+      -- assert is that the open plan window is dismissed.
+      live_cursor.setup(base_config({ enabled = false }))
+      live_cursor.dispatch({
+        hook_event_name = "PreToolUse",
+        tool_name = "Read",
+        tool_input = { file_path = "/x", offset = 1 },
+      })
+      expect(closed).to_be_true()
+    end)
+  end)
+
   describe("toggle", function()
     it("refuses to enable without a mode", function()
       live_cursor.setup(base_config({ enabled = false }))
@@ -613,6 +766,68 @@ describe("live_cursor", function()
       live_cursor.show("/x", { start_line = 1 })
 
       expect(live_cursor._state.preview_win).to_be_nil()
+    end)
+  end)
+
+  -- Both modes resolve the editor window through find_editor_window(), which now
+  -- prefers diff.find_window_closest_to_terminal() (matching the plan view) and
+  -- falls back to find_main_editor_window() when that is unavailable.
+  describe("window selection prefers closest-to-terminal", function()
+    before_each(function()
+      vim._tabs = { [1] = true }
+      vim._current_tabpage = 1
+      -- An editor window (1500) and a terminal window (1600) the user is focused in.
+      vim._mock.add_buffer(80, "/x", { "a", "b", "c" }, { buftype = "" })
+      vim._mock.add_window(1500, 80, { 1, 0 })
+      vim._mock.add_buffer(81, "term://x", { "" }, { buftype = "terminal" })
+      vim._mock.add_window(1600, 81, { 1, 0 })
+      vim._current_window = 1600
+      vim._next_winid = 2000
+
+      vim.fn.bufadd = function()
+        return 80
+      end
+      vim.fn.bufload = function() end
+
+      package.loaded["claudecode.diff"] = {
+        find_window_closest_to_terminal = function()
+          return 1500
+        end,
+        find_main_editor_window = function()
+          return 1500
+        end,
+        is_live_for_file = function()
+          return false
+        end,
+      }
+    end)
+
+    after_each(function()
+      vim.fn.bufadd = nil
+      vim.fn.bufload = nil
+      package.loaded["claudecode.diff"] = nil
+    end)
+
+    it("open mode loads the file into the closest-to-terminal window (focus in terminal)", function()
+      live_cursor.setup(base_config({ enabled = true, mode = "open", clear_delay_ms = 0 }))
+      live_cursor.show("/x", { start_line = 1 })
+      expect(vim.api.nvim_win_get_buf(1500)).to_be(80)
+    end)
+
+    it("falls back to find_main_editor_window when no closest finder is available", function()
+      package.loaded["claudecode.diff"].find_window_closest_to_terminal = nil
+      live_cursor.setup(base_config({ enabled = true, mode = "open", clear_delay_ms = 0 }))
+      live_cursor.show("/x", { start_line = 1 })
+      expect(vim.api.nvim_win_get_buf(1500)).to_be(80)
+    end)
+
+    it("preview mode bases its reserved split off the closest-to-terminal window", function()
+      live_cursor.setup(base_config({ enabled = true, mode = "preview", clear_delay_ms = 0 }))
+      live_cursor.show("/x", { start_line = 1 })
+      local pw = live_cursor._state.preview_win
+      assert.is_not_nil(pw)
+      assert.are_not.equal(1500, pw) -- a new split, not the base window itself
+      expect(vim.api.nvim_win_is_valid(pw)).to_be_true()
     end)
   end)
 

@@ -200,6 +200,7 @@ Configure the plugin with the detected path:
 - `:ClaudeCodeDiffDeny` - Reject diff changes
 - `:ClaudeCodeCloseAllDiffs` - Close pending Claude diffs (leaves accepted/saved diffs intact)
 - `:ClaudeCodeLiveCursor [preview|open|off]` - Toggle the live Claude cursor (see [Live Claude Cursor](#live-claude-cursor))
+- `:ClaudeCodePlanView [on|off]` - Toggle showing Claude's plan-mode plan in an editor split (see [Plan View](#plan-view))
 
 ## Working with Diffs
 
@@ -330,6 +331,20 @@ For deep technical details, see [ARCHITECTURE.md](./ARCHITECTURE.md).
       preview_align = "center", -- winbar alignment: "center" or "left"
       preview_highlight = "ClaudeCodeLivePreview", -- marker color (defaults to a link to DiagnosticOk / green)
     },
+
+    -- Plan view (opt-in): show Claude's plan-mode plan in the editor
+    plan = {
+      enabled = false, -- master switch
+      focus = true, -- move focus into the plan window when it opens
+      close_on_resolve = true, -- restore the editor when the plan is accepted/rejected
+      clear_delay_ms = 0, -- inactivity backstop close (0 = rely on accept/reject signals)
+      label = "● Claude plan", -- winbar brand text for the plan window
+      highlight = "ClaudeCodePlan", -- winbar color (defaults to a link to DiagnosticInfo)
+      -- layout / split_size_percentage only apply to the fallback split that is
+      -- created when there is no editor window to take over (terminal-only layout):
+      layout = "vertical", -- "vertical" or "horizontal" fallback split
+      split_size_percentage = 0.5, -- fallback split size as a fraction of the screen (0..1)
+    },
   },
   keys = {
     -- Your keymaps here
@@ -345,8 +360,8 @@ This works by injecting a Claude Code `PreToolUse` hook at launch via `claude --
 
 - `enabled` — off by default; set to `true` to turn it on.
 - `mode` — **required** when enabled:
-  - `"preview"` — load the file into a single reserved split, leaving your layout and focus untouched (the "live camera"). The split is `horizontal` (below) by default; set `layout = "vertical"` for a split beside instead. When Claude goes idle for `clear_delay_ms`, the preview split auto-closes — unless your cursor is in it, in which case it stays until you leave. Set `clear_delay_ms = 0` to keep it open.
-  - `"open"` — load the file into your current editor window.
+  - `"preview"` — load the file into a single reserved split, leaving your layout and focus untouched (the "live camera"). The split is spawned next to the editor window closest to the Claude terminal. It is `horizontal` (below) by default; set `layout = "vertical"` for a split beside instead. When Claude goes idle for `clear_delay_ms`, the preview split auto-closes — unless your cursor is in it, in which case it stays until you leave. Set `clear_delay_ms = 0` to keep it open.
+  - `"open"` — load the file into your current editor window if you're focused in one; otherwise (e.g. focus is in the Claude terminal, the usual case) into the editor window closest to the terminal.
 - Focus never moves — the file updates passively while you keep working.
 - Reads highlight the read range. Edits are shown only when **no review diff** is open for that file (i.e. in auto / accept-edits mode); when a normal diff is shown, that already visualizes the change and the live cursor stays out of the way.
 - **Edits render a real inline diff** when [unified.nvim](https://github.com/papricasix/unified.nvim) is installed: the live cursor reconstructs the pre-edit file (post-edit content with the edit reversed) and shows the precise added/removed lines, rather than a heuristic highlight. Without unified.nvim it falls back to highlighting the changed line range.
@@ -362,6 +377,22 @@ Toggle it at runtime with `:ClaudeCodeLiveCursor`:
 - `:ClaudeCodeLiveCursor off` — disable and clear any highlight.
 
 Because the hook is injected when Claude launches, enabling mid-session takes effect the next time you start Claude; disabling stops the highlighting immediately.
+
+#### Plan View
+
+When Claude runs in **plan mode** (`shift+tab`) and presents its finished plan, claudecode.nvim can open that plan as a markdown document in the editor — the same idea as the VS Code extension, instead of leaving the plan only in the terminal.
+
+It uses the same launch hook as the live cursor: Claude presents a plan by calling its built-in `ExitPlanMode` tool, whose input carries the plan markdown. A `PreToolUse` hook on that tool forwards the plan into Neovim the moment it is ready to read (before you accept or reject), and we render it in the editor. The same launch-time requirements apply (`claude` CLI hook support; an `nvim` on `PATH`; Claude must be started through the plugin).
+
+- `enabled` — off by default; set to `true` to turn it on. Independent of `live_cursor` (either can be on without the other).
+- The plan **takes over an existing editor window** — the one physically closest to the Claude terminal — rather than opening a new split, so it reads like the VS Code experience. When the plan resolves, that window's **previous buffer (and cursor) are restored**. If you navigate that window to a different buffer while reading the plan, your choice is left alone.
+- If there is **no editor window** to take over (e.g. only the Claude terminal is visible), it falls back to a dedicated split sized by `layout` / `split_size_percentage`, which is closed on resolve.
+- `focus` — when `true` (default), focus moves into the plan window so you can scroll it with normal motions; switch back to the Claude terminal to accept/reject. Set `false` to leave focus where it was.
+- `close_on_resolve` — when `true` (default), the plan is dismissed once resolved: accepting it (Claude starts executing) or rejecting it (Claude resumes planning) both restore the editor.
+- **Multi-tab aware:** like the live cursor, a Claude running in a background tab never opens its plan in the tab you are currently working in.
+- `label` / `highlight` — the winbar brand text and its color (defaults to a link to `DiagnosticInfo`).
+
+Toggle it at runtime with `:ClaudeCodePlanView` (`on` / `off`, or no argument to flip). As with the live cursor, the hook is injected at launch, so enabling mid-session applies the next time you start Claude.
 
 ### Working Directory Control
 

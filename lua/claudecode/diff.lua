@@ -258,6 +258,85 @@ local function find_window_adjacent_to_terminal()
   return find_main_editor_window()
 end
 
+---Screen rectangle of a window: top-left (x0,y0) and bottom-right (x1,y1) in cells.
+---@param win number Window ID
+---@return table|nil rect { x0, y0, x1, y1 }, or nil if the geometry can't be read
+local function window_rect(win)
+  local ok, pos = pcall(vim.api.nvim_win_get_position, win)
+  if not ok or type(pos) ~= "table" then
+    return nil
+  end
+  local w = vim.api.nvim_win_get_width(win)
+  local h = vim.api.nvim_win_get_height(win)
+  return { x0 = pos[2], y0 = pos[1], x1 = pos[2] + w, y1 = pos[1] + h }
+end
+
+---Gap (overlap-aware) and center distance between two screen rectangles. The gap
+---is 0 when the rectangles touch/overlap on an axis, so an adjacent window scores
+---0; center distance is the tie-breaker when several windows are equally adjacent.
+---@param a table Rect { x0, y0, x1, y1 }
+---@param b table Rect { x0, y0, x1, y1 }
+---@return number gap
+---@return number center_distance
+local function rect_gap(a, b)
+  local gx = math.max(0, math.max(a.x0 - b.x1, b.x0 - a.x1))
+  local gy = math.max(0, math.max(a.y0 - b.y1, b.y0 - a.y1))
+  local acx, acy = (a.x0 + a.x1) / 2, (a.y0 + a.y1) / 2
+  local bcx, bcy = (b.x0 + b.x1) / 2, (b.y0 + b.y1) / 2
+  return gx + gy, math.abs(acx - bcx) + math.abs(acy - bcy)
+end
+
+---Index of the rectangle in `rects` closest to `target` (smallest gap, then center).
+---@param target table Rect
+---@param rects table[] List of rects
+---@return number|nil index
+local function closest_rect_index(target, rects)
+  local best_i, best_gap, best_center
+  for i, r in ipairs(rects) do
+    local gap, center = rect_gap(target, r)
+    if not best_i or gap < best_gap or (gap == best_gap and center < best_center) then
+      best_i, best_gap, best_center = i, gap, center
+    end
+  end
+  return best_i
+end
+M._closest_rect_index = closest_rect_index
+
+---Find the editor window physically closest to the Claude Code terminal window.
+---Reuses `find_main_editor_window` for suitability (skips terminals, sidebars,
+---floats, and the live-preview split) and picks by screen geometry. Returns nil
+---when there is no suitable editor window to take over.
+---@return number|nil win_id
+local function find_window_closest_to_terminal()
+  local term = find_claudecode_terminal_window()
+  local tab = term and vim.api.nvim_win_get_tabpage(term) or vim.api.nvim_get_current_tabpage()
+
+  local candidates = {}
+  for _, w in ipairs(vim.api.nvim_tabpage_list_wins(tab)) do
+    if w ~= term and find_main_editor_window({ w }) == w then
+      candidates[#candidates + 1] = w
+    end
+  end
+  if #candidates == 0 then
+    return nil
+  end
+  if #candidates == 1 then
+    return candidates[1]
+  end
+
+  local term_rect = term and window_rect(term)
+  if not term_rect then
+    return candidates[1]
+  end
+  local rects = {}
+  for i, w in ipairs(candidates) do
+    rects[i] = window_rect(w) or { x0 = 0, y0 = 0, x1 = 0, y1 = 0 }
+  end
+  local idx = closest_rect_index(term_rect, rects)
+  return candidates[idx or 1]
+end
+M.find_window_closest_to_terminal = find_window_closest_to_terminal
+
 ---Create a split based on configured layout
 local function create_split()
   if config and config.diff_opts and config.diff_opts.layout == "horizontal" then
