@@ -53,6 +53,12 @@ M.defaults = {
     label = "● Claude plan", -- winbar brand text for the plan window
     highlight = "ClaudeCodePlan", -- winbar highlight group; defaults to a link to DiagnosticInfo
   },
+  terminal_links = {
+    enabled = true, -- open file paths clicked in the Claude terminal in the editor (VS Code parity)
+    click = true, -- intercept plain <LeftMouse> on a file:// link (non-links pass through to Claude)
+    key = "gf", -- normal-mode keymap on the terminal buffer to open the path under the cursor ("" disables)
+    mouse_motion = true, -- enable 'mousemoveevent' so mouse motion reaches Claude and its own link hover works
+  },
   -- `value` is passed verbatim to `claude --model`. These short aliases resolve
   -- to the latest model on the Anthropic API, so labels stay version-free to
   -- avoid going stale on every release.
@@ -280,6 +286,31 @@ function M.validate(config)
     check("highlight", function(v)
       return type(v) == "string" and v ~= ""
     end, "must be a non-empty string")
+  end
+
+  -- Validate terminal_links (optional; apply() supplies defaults)
+  if config.terminal_links ~= nil then
+    local tl = config.terminal_links
+    assert(type(tl) == "table", "terminal_links must be a table")
+
+    local function check(field, ok, msg)
+      if tl[field] ~= nil then
+        assert(ok(tl[field]), "terminal_links." .. field .. " " .. msg)
+      end
+    end
+
+    check("enabled", function(v)
+      return type(v) == "boolean"
+    end, "must be a boolean")
+    check("click", function(v)
+      return type(v) == "boolean"
+    end, "must be a boolean")
+    check("key", function(v)
+      return type(v) == "string"
+    end, "must be a string")
+    check("mouse_motion", function(v)
+      return type(v) == "boolean"
+    end, "must be a boolean")
   end
 
   -- Validate env

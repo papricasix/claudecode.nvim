@@ -394,6 +394,31 @@ It uses the same launch hook as the live cursor: Claude presents a plan by calli
 
 Toggle it at runtime with `:ClaudeCodePlanView` (`on` / `off`, or no argument to flip). As with the live cursor, the hook is injected at launch, so enabling mid-session applies the next time you start Claude.
 
+#### Terminal Links
+
+Click a file path in the Claude terminal to open it in your editor — like the VS Code extension, instead of having it open in your OS file explorer (Finder, etc.).
+
+Claude marks file references (the `Read`/`Update`/`Write` headers and inline `path:line` mentions) as clickable hyperlinks. Inside Neovim's `:terminal` those clicks would otherwise be handled by Claude/your terminal and opened with the OS, so this feature captures the links Claude emits and opens them in Neovim itself.
+
+- `enabled` — **on by default**; set to `false` to turn it off.
+- **Plain click** (no modifier) on a file link opens it. The file opens in the editor window closest to the Claude terminal (the same targeting the plan view uses), replacing that window's buffer, and jumps to the `:line` when one is shown. Clicks that aren't on a file pass straight through to Claude, so its own terminal UI keeps working. It works regardless of how far the conversation has scrolled, and on file names shown by themselves, with a relative path, or split across two lines.
+- `key` — a normal-mode keymap on the terminal buffer (default `"gf"`) that opens the path under the cursor; set `""` to disable. Handy if your terminal doesn't deliver the click into Neovim.
+- `mouse_motion` — on by default; enables Neovim's `'mousemoveevent'` so mouse motion reaches Claude and **Claude's own hover** (underlining the link under the pointer) works inside `:terminal`. Set `false` to leave the global option untouched.
+- `click` — set to `false` to keep the `gf` keymap (and `mouse_motion`) but not intercept mouse clicks at all.
+
+```lua
+opts = {
+  terminal_links = {
+    enabled = true,
+    click = true,
+    key = "gf",
+    mouse_motion = true,
+  },
+}
+```
+
+Unlike the live cursor and plan view, this needs no launch hook — it reads the hyperlinks already in the terminal — so toggling the config takes effect on the next Claude terminal you open.
+
 ### Working Directory Control
 
 You can fix the Claude terminal's working directory regardless of `autochdir` and buffer-local cwd changes. Options (precedence order):

@@ -380,6 +380,7 @@ function M.setup(opts)
 
   require("claudecode.live_cursor").setup(M.state.config)
   require("claudecode.plan_view").setup(M.state.config)
+  require("claudecode.terminal_links").setup(M.state.config)
 
   if M.state.config.auto_start then
     M.start(false)
@@ -403,6 +404,9 @@ function M.setup(opts)
       end)
       pcall(function()
         require("claudecode.plan_view").cleanup()
+      end)
+      pcall(function()
+        require("claudecode.terminal_links").cleanup()
       end)
     end,
     desc = "Automatically stop Claude Code integration when exiting Neovim",
