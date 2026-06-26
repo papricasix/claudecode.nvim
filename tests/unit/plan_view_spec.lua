@@ -113,7 +113,7 @@ describe("plan_view", function()
       plan_view.show("# Plan\n1. step one\n2. step two", 1)
 
       expect(plan_view._state.plan_win).to_be(1000)
-      expect(plan_view._state.created_split).to_be_falsy()
+      expect(plan_view._state.created_split).to_be_false()
       assert.is_truthy(vim.wo[1000].winbar:match("Claude plan"))
       assert.is_truthy(vim.wo[1000].winbar:match("ClaudeCodePlan"))
     end)
