@@ -55,6 +55,18 @@ local MAX_PATHS = 2000
 
 local augroup = nil
 
+--- Opt-in diagnostics: when `vim.g.claudecode_tl_debug` is set, echo to `:messages`. A
+--- no-op otherwise, so it is safe to leave in. Scheduled because some call sites (autocmd
+--- callbacks) run in a fast event context where `nvim_echo` is not allowed.
+local function dbg(msg)
+  if not vim.g.claudecode_tl_debug then
+    return
+  end
+  vim.schedule(function()
+    vim.api.nvim_echo({ { "[claudecode terminal_links] " .. msg, "WarningMsg" } }, true, {})
+  end)
+end
+
 ---@return boolean
 function M.is_enabled()
   return config ~= nil and config.enabled == true
@@ -74,6 +86,13 @@ end
 ---@param full_config table The full plugin config (expects a `terminal_links` field).
 function M.setup(full_config)
   config = (full_config and full_config.terminal_links) or {}
+  dbg(
+    ("setup enabled=%s click=%s mouse_motion=%s"):format(
+      tostring(M.is_enabled()),
+      tostring(config.click),
+      tostring(config.mouse_motion)
+    )
+  )
   if not M.is_enabled() then
     return
   end
@@ -124,8 +143,18 @@ function M._install_autocmds()
   vim.api.nvim_create_autocmd("TermOpen", {
     group = augroup,
     callback = function(args)
-      if args and args.buf and M._is_claude_terminal(args.buf) then
-        M.attach(args.buf)
+      if args and args.buf then
+        local is_claude = M._is_claude_terminal(args.buf)
+        dbg(
+          ("TermOpen buf=%s is_claude=%s name=%q"):format(
+            tostring(args.buf),
+            tostring(is_claude),
+            tostring(vim.api.nvim_buf_get_name(args.buf))
+          )
+        )
+        if is_claude then
+          M.attach(args.buf)
+        end
       end
     end,
     desc = "Wire file-path opening into the Claude terminal",
@@ -157,6 +186,14 @@ function M.attach(bufnr)
     return -- already attached
   end
   state[bufnr] = { paths = {}, click = nil }
+  dbg(
+    ("attach buf=%s click=%s key=%q mouse_motion=%s"):format(
+      tostring(bufnr),
+      tostring(config.click ~= false),
+      tostring(config.key),
+      tostring(config.mouse_motion ~= false)
+    )
+  )
 
   vim.api.nvim_create_autocmd("BufWipeout", {
     group = augroup,
@@ -241,6 +278,9 @@ function M._on_term_request(bufnr, ev)
   end
   uri = uri:gsub("\27\\$", ""):gsub("\7$", "") -- strip a trailing string terminator if present
 
+  if uri ~= "" then
+    dbg(("CAPTURE osc8 uri=%q file=%s"):format(uri, tostring(uri:match("^file:") ~= nil)))
+  end
   if uri == "" or not uri:match("^file:") then
     return -- a closing OSC 8, or a non-file link: nothing to record
   end
@@ -249,6 +289,7 @@ function M._on_term_request(bufnr, ev)
     return
   end
   local path = M._url_to_path(uri)
+  dbg(("CAPTURE uri=%q -> path=%q readable=%s"):format(uri, path, tostring(vim.fn.filereadable(path) == 1)))
   if path == "" then
     return
   end
@@ -295,14 +336,32 @@ function M._on_press(bufnr)
   end
   local m = vim.fn.getmousepos()
   if not m or m.winid == 0 or not m.line or m.line <= 0 then
+    dbg(("press: no mouse pos (m=%s)"):format(vim.inspect(m)))
     return false
   end
   -- Only act on presses inside this terminal's window.
   if vim.api.nvim_win_get_buf(m.winid) ~= bufnr then
+    dbg(
+      ("press: click in winid=%s buf=%s, not our term buf=%s"):format(
+        tostring(m.winid),
+        tostring(vim.api.nvim_win_get_buf(m.winid)),
+        tostring(bufnr)
+      )
+    )
     return false
   end
   local row, col0 = m.line, math.max(0, m.column - 1) -- getmousepos col is 1-based
+  local token = M._parse_token(vim.api.nvim_buf_get_lines(bufnr, row - 1, row, false)[1], col0)
   local path, line = M._resolve_click(bufnr, row, col0)
+  dbg(
+    ("press: row=%d col0=%d token=%s resolved=%s npaths=%d"):format(
+      row,
+      col0,
+      token and ("%q"):format(token) or "nil",
+      path and ("%q"):format(path) or "nil",
+      #M._paths(bufnr)
+    )
+  )
   if not path then
     return false
   end
