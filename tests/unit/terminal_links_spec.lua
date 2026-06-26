@@ -33,8 +33,13 @@ describe("terminal_links", function()
     end)
 
     it("keeps a bare relative name (Claude's cwd-file form) instead of eating it as a host", function()
-      expect(tl._url_to_path("file://logger.lua")).to_be("logger.lua")
-      expect(tl._url_to_path("file://./logger.lua")).to_be("./logger.lua")
+      expect(tl._url_to_path("file://widget.lua")).to_be("widget.lua")
+      expect(tl._url_to_path("file://./widget.lua")).to_be("./widget.lua")
+    end)
+
+    it("drops the leading slash before a Windows drive letter", function()
+      expect(tl._url_to_path("file:///D:/work/widgets/button.lua")).to_be("D:/work/widgets/button.lua")
+      expect(tl._url_to_path("file:///C:/code/app/main.ts")).to_be("C:/code/app/main.ts")
     end)
   end)
 
@@ -55,10 +60,10 @@ describe("terminal_links", function()
     end)
 
     it("returns the same token regardless of click position within it", function()
-      local line = "x lua/init.lua:9 y"
+      local line = "x lib/core.lua:9 y"
       for _, col in ipairs({ 2, 8, 14, 15 }) do -- across the token incl. the :9
         local p = tl._parse_token(line, col)
-        expect(p).to_be("lua/init.lua")
+        expect(p).to_be("lib/core.lua")
       end
     end)
 

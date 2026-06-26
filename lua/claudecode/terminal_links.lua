@@ -59,7 +59,7 @@ local augroup = nil
 --- no-op otherwise, so it is safe to leave in. Scheduled because some call sites (autocmd
 --- callbacks) run in a fast event context where `nvim_echo` is not allowed.
 local function dbg(msg)
-  if not vim.g.claudecode_tl_debug then
+  if not (vim.g and vim.g.claudecode_tl_debug) then
     return
   end
   vim.schedule(function()
@@ -256,6 +256,9 @@ function M._url_to_path(uri)
       -- no '/' at all: a bare relative name (e.g. "logger.lua") — keep it verbatim
     end
   end
+  -- Windows: file:///D:/path yields a leading-slash "/D:/path"; drop the slash before the
+  -- drive letter so it is a valid "D:/path" (Neovim accepts the forward slashes).
+  rest = rest:gsub("^/(%a:)", "%1")
   rest = rest:gsub("#.*$", "")
   rest = rest:gsub("%%(%x%x)", function(h)
     return string.char(tonumber(h, 16))
