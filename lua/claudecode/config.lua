@@ -68,6 +68,7 @@ M.defaults = {
     { name = "Claude Sonnet (Latest)", value = "sonnet" },
     { name = "Claude Sonnet (Latest, 1M context)", value = "sonnet[1m]" },
     { name = "Claude Haiku (Latest)", value = "haiku" },
+    { name = "Claude Fable (Latest)", value = "fable" },
     { name = "Default (account recommended)", value = "default" },
   },
   terminal = nil, -- Will be lazy-loaded to avoid circular dependency
