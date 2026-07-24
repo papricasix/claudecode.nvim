@@ -540,6 +540,28 @@ local vim = {
       return vim._buffers[bufnr] and vim._buffers[bufnr].listed and 1 or 0
     end,
 
+    bufexists = function(ident)
+      if type(ident) == "number" then
+        return vim._buffers[ident] ~= nil and 1 or 0
+      end
+      for _, buf in pairs(vim._buffers) do
+        if buf.name == ident then
+          return 1
+        end
+      end
+      return 0
+    end,
+
+    win_findbuf = function(bufnr)
+      local wins = {}
+      for winid, win in pairs(vim._windows) do
+        if win.buf == bufnr then
+          wins[#wins + 1] = winid
+        end
+      end
+      return wins
+    end,
+
     mkdir = function(path, flags)
       return 1
     end,
@@ -1025,6 +1047,21 @@ local vim = {
         rawset(t, win, existing)
       end
       return existing
+    end,
+  }),
+
+  -- Buffer-local options: vim.bo[buf].<opt> reads/writes that buffer's options
+  -- table (the same one nvim_buf_get_option/add_buffer use), so a test can set
+  -- e.g. vim.bo[buf].modified = true and have production code observe it.
+  bo = setmetatable({}, {
+    __index = function(_, buf)
+      local b = vim._buffers[buf]
+      if b then
+        b.options = b.options or {}
+        return b.options
+      end
+      -- Unknown buffer: a throwaway table so option reads yield nil safely.
+      return {}
     end,
   }),
 

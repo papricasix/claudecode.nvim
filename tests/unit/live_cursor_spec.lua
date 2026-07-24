@@ -769,6 +769,113 @@ describe("live_cursor", function()
     end)
   end)
 
+  -- The live view opens each touched file with bufadd/bufload. Left alone these
+  -- pile up in the buffer list over a session, so show() reaps the ones it owns
+  -- (created itself, now off-screen, unmodified) as it moves on.
+  describe("ephemeral buffer reaping", function()
+    before_each(function()
+      vim._tabs = { [1] = true }
+      vim._current_tabpage = 1
+      vim._mock.add_window(1000, 1, { 1, 0 })
+      vim._win_tab[1000] = 1
+      vim._tab_windows[1] = { 1000 }
+      vim._current_window = 1000
+      vim._next_winid = 2000
+
+      vim.fn.bufload = function() end
+
+      package.loaded["claudecode.diff"] = {
+        find_main_editor_window = function()
+          return 1000
+        end,
+        is_live_for_file = function()
+          return false
+        end,
+      }
+    end)
+
+    after_each(function()
+      vim.fn.bufadd = nil
+      vim.fn.bufload = nil
+      package.loaded["claudecode.diff"] = nil
+    end)
+
+    -- bufadd that lazily materializes a fresh buffer per path (as real bufadd
+    -- does), so bufexists() reports "not open" until we first touch the file.
+    local function bufadd_creating(map)
+      return function(name)
+        local nr = map[name]
+        if not vim._buffers[nr] then
+          vim._mock.add_buffer(nr, name, { "l1", "l2", "l3" }, { buftype = "", modified = false })
+        end
+        return nr
+      end
+    end
+
+    it("reaps the previous file buffer once a new file takes the preview window", function()
+      live_cursor.setup(base_config({ enabled = true, mode = "preview", clear_delay_ms = 0 }))
+      vim.fn.bufadd = bufadd_creating({ ["/a"] = 61, ["/b"] = 62 })
+
+      live_cursor.show("/a", { start_line = 1 })
+      -- /a was created by us -> owned, and still on screen so it survives.
+      expect(live_cursor._state.owned_bufs[61]).to_be_true()
+      expect(vim.api.nvim_buf_is_valid(61)).to_be_true()
+
+      live_cursor.show("/b", { start_line = 1 })
+      -- /a left the window -> deleted and forgotten; /b is the new owned buffer.
+      expect(vim.api.nvim_buf_is_valid(61)).to_be_false()
+      expect(live_cursor._state.owned_bufs[61]).to_be_nil()
+      expect(live_cursor._state.owned_bufs[62]).to_be_true()
+      expect(vim.api.nvim_buf_is_valid(62)).to_be_true()
+    end)
+
+    it("never reaps a buffer that was already open before the live view touched it", function()
+      live_cursor.setup(base_config({ enabled = true, mode = "preview", clear_delay_ms = 0 }))
+      -- /a is already open (the user's own buffer) before Claude reads it.
+      vim._mock.add_buffer(70, "/a", { "a1", "a2" }, { buftype = "", modified = false })
+      vim.fn.bufadd = bufadd_creating({ ["/a"] = 70, ["/b"] = 71 })
+
+      live_cursor.show("/a", { start_line = 1 })
+      expect(live_cursor._state.owned_bufs[70]).to_be_nil() -- not ours
+
+      live_cursor.show("/b", { start_line = 1 })
+      -- /a is off-screen now but was never owned, so it stays open.
+      expect(vim.api.nvim_buf_is_valid(70)).to_be_true()
+    end)
+
+    it("keeps an owned buffer that has unsaved changes, retrying it later", function()
+      live_cursor.setup(base_config({ enabled = true, mode = "preview", clear_delay_ms = 0 }))
+      vim.fn.bufadd = bufadd_creating({ ["/a"] = 81, ["/b"] = 82, ["/c"] = 83 })
+
+      live_cursor.show("/a", { start_line = 1 })
+      expect(live_cursor._state.owned_bufs[81]).to_be_true()
+      -- The user edits the previewed file: it must not be deleted out from under them.
+      vim.bo[81].modified = true
+
+      live_cursor.show("/b", { start_line = 1 })
+      expect(vim.api.nvim_buf_is_valid(81)).to_be_true() -- modified -> survives
+      expect(live_cursor._state.owned_bufs[81]).to_be_true() -- still tracked for a later pass
+
+      -- Once saved, a later reap collects it.
+      vim.bo[81].modified = false
+      live_cursor.show("/c", { start_line = 1 })
+      expect(vim.api.nvim_buf_is_valid(81)).to_be_false()
+      expect(live_cursor._state.owned_bufs[81]).to_be_nil()
+    end)
+
+    it("cleanup reaps every owned buffer and clears the tracking set", function()
+      live_cursor.setup(base_config({ enabled = true, mode = "preview", clear_delay_ms = 0 }))
+      vim.fn.bufadd = bufadd_creating({ ["/a"] = 91 })
+
+      live_cursor.show("/a", { start_line = 1 })
+      expect(live_cursor._state.owned_bufs[91]).to_be_true()
+
+      live_cursor.cleanup()
+      expect(vim.api.nvim_buf_is_valid(91)).to_be_false()
+      expect(next(live_cursor._state.owned_bufs)).to_be_nil()
+    end)
+  end)
+
   -- Both modes resolve the editor window through find_editor_window(), which now
   -- prefers diff.find_window_closest_to_terminal() (matching the plan view) and
   -- falls back to find_main_editor_window() when that is unavailable.

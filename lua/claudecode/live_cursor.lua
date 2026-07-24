@@ -43,6 +43,7 @@ local state = {
   clear_timer = nil, -- inactivity timer handle
   settings_files = {}, -- temp --settings files to clean up on stop
   server_addr = nil, -- resolved RPC address we handed to the hook
+  owned_bufs = {}, -- set of file buffers WE opened (for later reaping) -> true
 }
 
 local EDIT_TOOLS = { Edit = true, Write = true, MultiEdit = true }
@@ -655,6 +656,29 @@ local function clear_unified(buf)
   end
 end
 
+---Delete the file buffers the live view opened once they are no longer on screen
+---and carry no unsaved changes. Only buffers WE created are tracked (see M.show —
+---a file you already had open is never owned), so this reaps our own ephemeral
+---previews without touching your buffers, keeping the buffer list from growing
+---over a long session. A still-displayed, modified, or currently-active buffer is
+---left alone and retried on a later pass (e.g. after you save or switch away).
+local function reap_owned()
+  for buf in pairs(state.owned_bufs) do
+    if not vim.api.nvim_buf_is_valid(buf) then
+      state.owned_bufs[buf] = nil
+    elseif buf ~= state.last_buf and #vim.fn.win_findbuf(buf) == 0 then
+      local ok_mod, modified = pcall(function()
+        return vim.bo[buf].modified
+      end)
+      -- force=false so a buffer with unsaved changes refuses deletion (pcall
+      -- swallows it) and stays owned for a later, safer pass.
+      if ok_mod and not modified and pcall(vim.api.nvim_buf_delete, buf, { force = false }) then
+        state.owned_bufs[buf] = nil
+      end
+    end
+  end
+end
+
 function M.clear()
   if state.last_buf and ns then
     pcall(vim.api.nvim_buf_clear_namespace, state.last_buf, ns, 0, -1)
@@ -700,6 +724,7 @@ local function arm_clear_timer()
     M.clear()
     state.clear_timer = nil
     close_idle_preview()
+    reap_owned()
   end, delay)
 end
 
@@ -718,6 +743,7 @@ function M.on_diff_opened(file_path) -- luacheck: ignore file_path
     pcall(vim.api.nvim_win_close, state.preview_win, true)
   end
   state.preview_win = nil
+  reap_owned()
 end
 
 ---Open/preview a file and highlight a line range, without moving focus.
@@ -734,12 +760,19 @@ function M.show(file_path, opts)
     return
   end
 
+  -- Whether this file was already open before we touched it. Only buffers we
+  -- create here become "owned" and eligible for reaping; a buffer you already
+  -- had open is never ours to delete.
+  local pre_existing = vim.fn.bufexists(file_path) == 1
   local buf = vim.fn.bufadd(file_path)
   if not buf or buf == 0 then
     return
   end
   pcall(vim.fn.bufload, buf)
   pcall(vim.api.nvim_win_set_buf, win, buf)
+  if not pre_existing then
+    state.owned_bufs[buf] = true
+  end
 
   -- Loading the file fires BufWinEnter, where a winbar plugin (dropbar, barbecue,
   -- lualine winbar, ...) may set its own winbar. Re-apply our marker on the next
@@ -848,6 +881,9 @@ function M.show(file_path, opts)
   end
 
   arm_clear_timer()
+  -- The previously-previewed file just left the window; reap it (and any earlier
+  -- stragglers) so the buffer list doesn't grow one entry per file Claude touches.
+  reap_owned()
 end
 
 ---Show an inline unified diff for an edit, in the resolved preview window.
@@ -928,6 +964,9 @@ function M.show_diff(file_path, new_string, old_string)
 
   schedule_preview_marker(win, { action = "write", file = file_path })
   arm_clear_timer()
+  -- The file buffer we may have previewed a moment ago is now off-screen (the
+  -- scratch diff buffer took the window); reap it and any earlier stragglers.
+  reap_owned()
   logger.debug("live_cursor", "edit diff for", file_path, "block", ls .. "-" .. le)
   return true
 end
@@ -992,7 +1031,12 @@ function M.cleanup()
   end
   state.diff_buf = nil
   state.preview_win = nil
+  -- Reap our ephemeral file buffers before forgetting them. last_buf is cleared
+  -- first so the final previewed buffer is no longer exempt from reaping; any
+  -- buffer with unsaved changes still refuses deletion and is simply forgotten.
   state.last_buf = nil
+  reap_owned()
+  state.owned_bufs = {}
 end
 
 -- Exposed for tests.
