@@ -71,6 +71,19 @@ local HIGHLIGHT_LINKS = {
 --- prompt, as opposed to actually asking you something.
 local IDLE_NOTIFICATION = "waiting for your input"
 
+--- The frames of the Claude Code CLI's own "working" spinner, offered so a
+--- tabline can animate a busy tab the way the CLI animates its own status line:
+--- `icons = { busy = require("claudecode.status").SPINNER }`. All six are
+--- single-width, so the bar does not jitter as they cycle.
+M.SPINNER = { "·", "✢", "✳", "∗", "✻", "✽" }
+
+--- Current animation frame, and the timer advancing it. The timer only runs
+--- while some tab actually shows an animated icon, so an all-idle Neovim ticks
+--- nothing: a repeating redraw of every tabline and statusline is not something
+--- to leave running for a glyph nobody is looking at.
+local frame = 1
+local spinner_timer = nil
+
 --------------------------------------------------------------------------------
 -- Setup
 --------------------------------------------------------------------------------
@@ -90,9 +103,17 @@ function M.is_enabled()
   return config ~= nil and config.enabled == true
 end
 
----Test/reload helper: forget every tab's state.
+---Test/reload helper: forget every tab's state and stop animating.
 function M.reset()
   entries = {}
+  if spinner_timer then
+    pcall(function()
+      spinner_timer:stop()
+      spinner_timer:close()
+    end)
+    spinner_timer = nil
+  end
+  frame = 1
 end
 
 --------------------------------------------------------------------------------
@@ -147,16 +168,75 @@ local function copy(entry)
   return out
 end
 
+---Refresh whatever draws the status, unless the user redraws it themselves.
+local function redraw()
+  if config and config.auto_redraw == false then
+    return
+  end
+  pcall(function()
+    vim.cmd("redrawtabline")
+    vim.cmd("redrawstatus")
+  end)
+end
+
+---The configured icon for a state: either a glyph or a list of frames.
+---@param state ClaudeCodeStatusState
+---@return string|string[]
+local function icon_spec(state)
+  local icons = (config and config.icons) or {}
+  local spec = icons[state]
+  if spec == nil then
+    spec = DEFAULT_ICONS[state]
+  end
+  return spec
+end
+
+---Start or stop the animation timer to match what is on screen. Animating costs
+---a repeating redraw of every tabline and statusline, so it runs only while a
+---tab actually shows a multi-frame icon -- and never when the user has taken
+---redrawing into their own hands (`auto_redraw = false`), where a timer we own
+---could not refresh anything anyway.
+local function sync_spinner()
+  local want = false
+  if not (config and (config.auto_redraw == false or config.spinner_ms == 0)) then
+    for _, entry in pairs(entries) do
+      local spec = icon_spec(entry.state)
+      if type(spec) == "table" and #spec > 1 then
+        want = true
+        break
+      end
+    end
+  end
+
+  if want and not spinner_timer then
+    local ok, timer = pcall(function()
+      return vim.loop.new_timer()
+    end)
+    if not ok or not timer then
+      return
+    end
+    spinner_timer = timer
+    local interval = (config and config.spinner_ms) or 120
+    pcall(function()
+      timer:start(interval, interval, function()
+        vim.schedule(M._tick)
+      end)
+    end)
+  elseif not want and spinner_timer then
+    pcall(function()
+      spinner_timer:stop()
+      spinner_timer:close()
+    end)
+    spinner_timer = nil
+    frame = 1
+  end
+end
+
 ---Tell the world a tab changed, and refresh the UI that draws it.
 ---@param entry ClaudeCodeStatus
 ---@param prev ClaudeCodeStatusState
 local function announce(entry, prev)
-  if not config or config.auto_redraw ~= false then
-    pcall(function()
-      vim.cmd("redrawtabline")
-      vim.cmd("redrawstatus")
-    end)
-  end
+  redraw()
   pcall(vim.api.nvim_exec_autocmds, "User", {
     pattern = "ClaudeCodeStatusChanged",
     modeline = false,
@@ -200,6 +280,7 @@ local function apply(tab, state, info)
   else
     entries[tab] = entry
   end
+  sync_spinner()
 
   local unchanged = prev_state == state
     and (prev and prev.tool) == entry.tool
@@ -288,6 +369,7 @@ function M.forget_closed_tabs()
       entries[tab] = nil
     end
   end
+  sync_spinner() -- the last busy tab may have been one of them
 end
 
 --------------------------------------------------------------------------------
@@ -327,16 +409,37 @@ function M.all()
 end
 
 ---Glyph configured for a tab's state (`""` when there is nothing to show).
+---An icon configured as a list of frames animates: the frame advances on a
+---timer while any tab shows one, so this returns whichever frame is current.
 ---@param tab integer|nil
 ---@return string
 function M.icon(tab)
-  local state = M.get_state(tab)
-  local icons = (config and config.icons) or {}
-  local icon = icons[state]
-  if icon == nil then
-    icon = DEFAULT_ICONS[state]
+  local spec = icon_spec(M.get_state(tab))
+  if type(spec) == "table" then
+    if #spec == 0 then
+      return ""
+    end
+    return spec[((frame - 1) % #spec) + 1] or ""
   end
-  return icon or ""
+  return spec or ""
+end
+
+---Whether the animation timer is currently running (i.e. some tab shows an
+---animated icon). Exposed for tests and for a consumer that wants to know.
+---@return boolean
+function M.is_spinning()
+  return spinner_timer ~= nil
+end
+
+---Advance the animation one frame and refresh whatever draws it. Called by the
+---timer; exposed so a test can step the animation without waiting on real time.
+---@private
+function M._tick()
+  frame = frame + 1
+  if frame > 1e6 then
+    frame = 1 -- keep the counter small; the icon is picked modulo the frame count
+  end
+  redraw()
 end
 
 ---Highlight group for a tab's state, or nil when there is nothing to draw.

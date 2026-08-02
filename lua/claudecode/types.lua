@@ -38,9 +38,10 @@
 -- Per-tab status tracking configuration
 ---@class ClaudeCodeStatusOptions
 ---@field enabled boolean Opt-in; injects the activity hooks at launch
----@field icons table<ClaudeCodeStatusState, string> Glyph per state
+---@field icons table<ClaudeCodeStatusState, string|string[]> Glyph per state, or a list of frames to animate it
 ---@field highlights table<ClaudeCodeStatusState, string> Highlight group per state
 ---@field auto_redraw boolean Redraw the tabline/statusline on every change
+---@field spinner_ms number Frame interval for animated icons (0 disables animation)
 
 -- Model selection option
 ---@class ClaudeCodeModelOption

@@ -493,9 +493,21 @@ require("claudecode").setup({
       idle = "ClaudeCodeStatusIdle", -- links to Comment
     },
     auto_redraw = true, -- redraw the tabline/statusline on every change
+    spinner_ms = 120, -- frame interval for animated icons (0 disables animation)
   },
 })
 ```
+
+**Animating a working tab.** Any icon may be a list of frames instead of a single glyph, and the plugin cycles it. `status.SPINNER` holds the Claude Code CLI's own spinner frames (`· ✢ ✳ ∗ ✻ ✽`, all single-width so the bar does not jitter):
+
+```lua
+status = {
+  enabled = true,
+  icons = { busy = require("claudecode.status").SPINNER },
+},
+```
+
+The timer runs only while some tab actually shows an animated icon — an all-idle Neovim ticks nothing — and never when `auto_redraw = false`, since then the redraw is yours to do.
 
 The states, per tab:
 

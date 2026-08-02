@@ -245,6 +245,67 @@ describe("status", function()
       expect(status.hl_group(2)).to_be_nil()
     end)
 
+    it("cycles an icon configured as a list of frames", function()
+      enable({ icons = { busy = { "a", "b", "c" } } })
+      note("PreToolUse", { tool_name = "Bash" })
+      expect(status.icon(1)).to_be("a")
+      status._tick()
+      expect(status.icon(1)).to_be("b")
+      status._tick()
+      expect(status.icon(1)).to_be("c")
+      status._tick()
+      expect(status.icon(1)).to_be("a") -- wraps
+    end)
+
+    it("ships the CLI's spinner frames, all single-width", function()
+      expect(#status.SPINNER > 1).to_be_true()
+      for _, f in ipairs(status.SPINNER) do
+        expect(type(f)).to_be("string")
+      end
+    end)
+
+    it("animates only while a tab shows an animated icon", function()
+      enable({ icons = { busy = { "a", "b" } } })
+      expect(status.is_spinning()).to_be_false()
+      note("PreToolUse", { tool_name = "Bash" })
+      expect(status.is_spinning()).to_be_true()
+      note("Stop") -- idle is a plain glyph
+      expect(status.is_spinning()).to_be_false()
+    end)
+
+    it("stops animating when the last animated tab is gone", function()
+      enable({ icons = { busy = { "a", "b" } } })
+      note("PreToolUse", { tool_name = "Bash" }, 1)
+      note("PreToolUse", { tool_name = "Bash" }, 2)
+      expect(status.is_spinning()).to_be_true()
+      status.clear(1)
+      expect(status.is_spinning()).to_be_true() -- tab 2 is still busy
+      vim._tabs[2] = nil
+      status.forget_closed_tabs()
+      expect(status.is_spinning()).to_be_false()
+    end)
+
+    it("never animates when the consumer owns redrawing, or when disabled", function()
+      enable({ icons = { busy = { "a", "b" } }, auto_redraw = false })
+      note("PreToolUse", { tool_name = "Bash" })
+      expect(status.is_spinning()).to_be_false()
+
+      status.reset()
+      enable({ icons = { busy = { "a", "b" } }, spinner_ms = 0 })
+      note("PreToolUse", { tool_name = "Bash" })
+      expect(status.is_spinning()).to_be_false()
+      expect(status.icon(1)).to_be("a") -- still shows a frame, just a still one
+    end)
+
+    it("validates frame lists", function()
+      package.loaded["claudecode.config"] = nil
+      local config = require("claudecode.config")
+      expect(pcall(config.validate, base_config({ enabled = true, icons = { busy = { "a", "b" } } }))).to_be_true()
+      expect(pcall(config.validate, base_config({ enabled = true, icons = { busy = {} } }))).to_be_false()
+      expect(pcall(config.validate, base_config({ enabled = true, icons = { busy = { 1, 2 } } }))).to_be_false()
+      expect(pcall(config.validate, base_config({ enabled = true, spinner_ms = -1 }))).to_be_false()
+    end)
+
     it("hands out copies, so a consumer cannot corrupt our state", function()
       enable()
       note("PreToolUse", { tool_name = "Bash" })

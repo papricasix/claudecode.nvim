@@ -58,7 +58,11 @@ M.defaults = {
   -- widens the injected hook set to every tool call.
   status = {
     enabled = false,
+    -- A glyph per state, or a list of frames to animate that state:
+    --   icons = { busy = require("claudecode.status").SPINNER }
+    -- animates a working tab with the CLI's own spinner.
     icons = { busy = "●", waiting = "◆", idle = "○", none = "" },
+    spinner_ms = 120, -- frame interval for animated icons (0 disables animation)
     highlights = {
       busy = "ClaudeCodeStatusBusy", -- defaults to a link to DiagnosticInfo
       waiting = "ClaudeCodeStatusWaiting", -- defaults to a link to DiagnosticWarn
@@ -345,6 +349,9 @@ function M.validate(config)
     if st.auto_redraw ~= nil then
       assert(type(st.auto_redraw) == "boolean", "status.auto_redraw must be a boolean")
     end
+    if st.spinner_ms ~= nil then
+      assert(type(st.spinner_ms) == "number" and st.spinner_ms >= 0, "status.spinner_ms must be a non-negative number")
+    end
     for _, field in ipairs({ "icons", "highlights" }) do
       if st[field] ~= nil then
         assert(type(st[field]) == "table", "status." .. field .. " must be a table")
@@ -353,7 +360,23 @@ function M.validate(config)
             key == "busy" or key == "waiting" or key == "idle" or key == "none",
             "status." .. field .. " keys must be 'busy', 'waiting', 'idle' or 'none'"
           )
-          assert(type(value) == "string", "status." .. field .. "." .. key .. " must be a string")
+          -- Icons may also be a list of frames to animate; highlights may not.
+          if field == "icons" and type(value) == "table" then
+            for _, frame in ipairs(value) do
+              assert(type(frame) == "string", "status.icons." .. key .. " frames must be strings")
+            end
+            assert(#value > 0, "status.icons." .. key .. " must not be an empty frame list")
+          else
+            assert(
+              type(value) == "string",
+              "status."
+                .. field
+                .. "."
+                .. key
+                .. " must be a string"
+                .. (field == "icons" and " or a list of frames" or "")
+            )
+          end
         end
       end
     end
