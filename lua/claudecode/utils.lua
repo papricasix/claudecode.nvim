@@ -14,6 +14,34 @@ function M.normalize_focus(focus)
   end
 end
 
+---Read n random bytes from a cryptographically secure source.
+---Tries libuv's OS CSPRNG first, then falls back to /dev/urandom.
+---Never falls back to math.random: a weak token is worse than a startup error.
+---@param n number The number of random bytes to read
+---@return string bytes A string of exactly n random bytes
+function M.random_bytes(n)
+  -- Prefer libuv's uv_random (OS CSPRNG). Use vim.loop.random (available on
+  -- Neovim 0.8+) rather than vim.uv.random (only aliased on 0.10+).
+  if vim.loop and vim.loop.random then
+    local ok, bytes = pcall(vim.loop.random, n)
+    if ok and type(bytes) == "string" and #bytes == n then
+      return bytes
+    end
+  end
+
+  -- Fallback: read directly from the kernel CSPRNG.
+  local file = io.open("/dev/urandom", "rb")
+  if file then
+    local bytes = file:read(n)
+    file:close()
+    if type(bytes) == "string" and #bytes == n then
+      return bytes
+    end
+  end
+
+  error("Failed to obtain " .. n .. " bytes of secure random data (no vim.loop.random or readable /dev/urandom)")
+end
+
 ---Split a command string into an argument vector using POSIX shell word rules.
 ---
 ---Honors single quotes, double quotes, and backslash escapes so terminal
