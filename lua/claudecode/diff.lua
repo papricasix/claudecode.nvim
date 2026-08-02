@@ -1471,6 +1471,135 @@ local function ensure_unified_initialized()
   end)
 end
 
+---Screen rows occupied by buffer lines `first`..`last` in `win`. One row per
+---line unless the window soft-wraps, in which case long lines take several.
+---@param win integer
+---@param buf integer
+---@param first integer 1-based first line
+---@param last integer 1-based last line
+---@return integer rows
+local function screen_rows(win, buf, first, last)
+  local plain = last - first + 1
+  local wrap_ok, wraps = pcall(function()
+    return vim.wo[win].wrap
+  end)
+  if not wrap_ok or not wraps then
+    return plain
+  end
+
+  local info_ok, info = pcall(vim.fn.getwininfo, win)
+  local textoff = (info_ok and info and info[1] and info[1].textoff) or 0
+  local width_ok, width = pcall(vim.api.nvim_win_get_width, win)
+  width = (width_ok and width or 0) - textoff
+  if width <= 0 then
+    return plain
+  end
+
+  local lines_ok, lines = pcall(vim.api.nvim_buf_get_lines, buf, first - 1, last, false)
+  if not lines_ok or not lines then
+    return plain
+  end
+  local rows = 0
+  for _, line in ipairs(lines) do
+    rows = rows + math.max(1, math.ceil(vim.fn.strdisplaywidth(line) / width))
+  end
+  return rows
+end
+
+---Measure the region unified.nvim marked as changed, in screen rows.
+---Added lines are real buffer lines, but deleted lines are virtual lines hung
+---off the extmarks — so the change is taller on screen than its line span, and
+---centering on the line span alone pushes the deleted lines off the top.
+---@param win integer Window showing the buffer (for width/wrap)
+---@param buf integer
+---@return table|nil region {first, last, rows, fill_above} (lines 1-based)
+function M._measure_diff_region(win, buf)
+  local cfg_ok, unified_config = pcall(require, "unified.config")
+  if not cfg_ok or not unified_config or not unified_config.ns_id then
+    return nil
+  end
+  local marks_ok, marks = pcall(vim.api.nvim_buf_get_extmarks, buf, unified_config.ns_id, 0, -1, { details = true })
+  if not marks_ok or type(marks) ~= "table" or #marks == 0 then
+    return nil
+  end
+
+  local first, last, virt_rows = nil, nil, 0
+  local virt_above = {}
+  for _, mark in ipairs(marks) do
+    local row, details = mark[2], mark[4] or {}
+    local mark_last = row
+    if details.end_row and details.end_row > row then
+      -- end_col 0 means the mark stops at the start of end_row, not on it.
+      mark_last = details.end_col == 0 and details.end_row - 1 or details.end_row
+    end
+    first = math.min(first or row, row)
+    last = math.max(last or mark_last, mark_last)
+
+    local count = details.virt_lines and #details.virt_lines or 0
+    virt_rows = virt_rows + count
+    if count > 0 and details.virt_lines_above then
+      virt_above[row] = (virt_above[row] or 0) + count
+    end
+  end
+  if not first then
+    return nil
+  end
+
+  local line_count = vim.api.nvim_buf_line_count(buf)
+  first = math.max(1, math.min(first + 1, line_count))
+  last = math.max(first, math.min(last + 1, line_count))
+  return {
+    first = first,
+    last = last,
+    rows = screen_rows(win, buf, first, last) + virt_rows,
+    fill_above = virt_above[first - 1] or 0,
+  }
+end
+
+---Where to scroll a change region so as much of it as possible is on screen.
+---Kept as pure math so it can be unit-tested: returns the line to put at the
+---window top plus how many of the region's leading deleted (virtual) lines to
+---show above it.
+---@param region table {first, rows, fill_above}
+---@param height integer Window height in screen rows
+---@return integer topline, integer topfill
+function M._diff_scroll_position(region, height)
+  -- Taller than the window: pin the first changed line — with the lines deleted
+  -- above it — at the top, so the change reads from its start.
+  if region.rows >= height then
+    return region.first, region.fill_above
+  end
+
+  -- Fits: split the leftover rows evenly above and below the whole change.
+  local pad = math.floor((height - region.rows) / 2)
+  local top = math.max(1, region.first - pad)
+  -- Real lines above the region already provide the headroom; the deleted lines
+  -- only need topfill when the region itself starts at the top of the window.
+  return top, top < region.first and 0 or region.fill_above
+end
+
+---Scroll `win` so the whole change is visible at a glance, centered when it
+---fits. Falls back to centering on the cursor when the region can't be measured.
+---Shared with the live cursor's ride-along preview, which renders its edits with
+---the same unified.nvim marks.
+---@param win integer
+---@param buf integer
+function M.center_diff_region(win, buf)
+  local region = M._measure_diff_region(win, buf)
+  local height_ok, height = pcall(vim.api.nvim_win_get_height, win)
+  if not region or not height_ok or type(height) ~= "number" or height <= 0 then
+    pcall(vim.api.nvim_win_call, win, function()
+      vim.cmd("normal! zz")
+    end)
+    return
+  end
+
+  local topline, topfill = M._diff_scroll_position(region, height)
+  pcall(vim.api.nvim_win_call, win, function()
+    vim.fn.winrestview({ topline = topline, topfill = topfill })
+  end)
+end
+
 ---Set up the blocking diff using unified.nvim's inline renderer.
 ---Single buffer containing the proposed content, inline +/- marks for the diff
 ---against the on-disk original. open_in_new_tab is intentionally ignored here.
@@ -1560,9 +1689,7 @@ function M._setup_blocking_diff_unified(params, resolution_callback)
         local line_count = vim.api.nvim_buf_line_count(new_buffer)
         local row = math.max(1, math.min(first_hunk_line, line_count))
         pcall(vim.api.nvim_win_set_cursor, target_window, { row, 0 })
-        pcall(vim.api.nvim_win_call, target_window, function()
-          vim.cmd("normal! zz")
-        end)
+        M.center_diff_region(target_window, new_buffer)
       end
 
       vim.b[new_buffer].claudecode_diff_tab_name = tab_name
