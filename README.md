@@ -500,7 +500,7 @@ require("claudecode").setup({
 })
 ```
 
-**Animating a working tab.** Any icon may be a list of frames instead of a single glyph, and the plugin cycles it. `status.SPINNER` is the Claude Code CLI's own spinner, taken from the CLI rather than approximated: six glyphs played forwards and then backwards — `· ✢ ✳ ✶ ✻ ✽ ✽ ✻ ✶ ✳ ✢ ·` — so the motion breathes instead of jumping from the last frame to the first. All are single-width, so the bar does not jitter, and the CLI's own pace is one frame per 120ms (the `spinner_ms` default). On Ghostty the CLI substitutes the last glyph, which `SPINNER` mirrors off `$TERM`:
+**Animating a working tab.** Any icon may be a list of frames instead of a single glyph, and the plugin cycles it. `status.SPINNER` is the Claude Code CLI's own spinner, taken from the CLI rather than approximated: six glyphs played forwards and then backwards — `· ✢ ✳ ✶ ✻ ✽ ✽ ✻ ✶ ✳ ✢ ·` — so the motion breathes instead of jumping from the last frame to the first. All are single-width, so the bar does not jitter, and the CLI's own pace is one frame per 120ms (the `spinner_ms` default). On Ghostty the CLI substitutes the last glyph, which `SPINNER` mirrors off `$TERM`. On Windows, PowerShell and Windows Terminal (including WSL Neovim, detected via `WT_SESSION`) `✳` U+2733 is drawn with the colour emoji font — it is the one frame Unicode lists as emoji-capable — so it is swapped for `✱` U+2731 there, the same asterisk without an emoji presentation. Any of this can be overridden by passing your own frame list.
 
 ```lua
 status = {

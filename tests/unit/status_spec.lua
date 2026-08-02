@@ -270,6 +270,37 @@ describe("status", function()
       expect(frames[4]).to_be("✶")
     end)
 
+    it("swaps the one emoji-capable frame on terminals that colour it", function()
+      local saved_has, saved_env = vim.fn.has, vim.env
+      local function frames_with(setup_env)
+        vim.fn.has = function()
+          return 0
+        end
+        vim.env = setup_env
+        package.loaded["claudecode.status"] = nil
+        local frames = require("claudecode.status").SPINNER
+        vim.fn.has, vim.env = saved_has, saved_env
+        package.loaded["claudecode.status"] = nil
+        status = require("claudecode.status")
+        return frames
+      end
+
+      -- ✳ is U+2733, the only frame Unicode lists as emoji-capable
+      expect(frames_with({})[3]).to_be("✳")
+      expect(frames_with({ WT_SESSION = "abc" })[3]).to_be("✱") -- Windows Terminal
+      expect(frames_with({ ConEmuANSI = "ON" })[3]).to_be("✱")
+
+      vim.fn.has = function(feature)
+        return feature == "win32" and 1 or 0
+      end
+      vim.env = {}
+      package.loaded["claudecode.status"] = nil
+      expect(require("claudecode.status").SPINNER[3]).to_be("✱")
+      vim.fn.has, vim.env = saved_has, saved_env
+      package.loaded["claudecode.status"] = nil
+      status = require("claudecode.status")
+    end)
+
     it("animates only while a tab shows an animated icon", function()
       enable({ icons = { busy = { "a", "b" } } })
       expect(status.is_spinning()).to_be_false()

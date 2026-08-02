@@ -82,6 +82,22 @@ local IDLE_NOTIFICATION = "waiting for your input"
 --- as they cycle, and the CLI advances one frame per 120ms (our `spinner_ms`
 --- default). On Ghostty it swaps the last glyph for the previous one, which we
 --- mirror off `$TERM` so the tabline matches the terminal it is drawn in.
+---Whether this terminal draws emoji-capable codepoints with the colour emoji
+---font instead of the text font. `✳` (U+2733) is the one frame Unicode lists as
+---emoji-capable, and Windows Terminal (PowerShell *and* WSL Neovim, hence the
+---`WT_SESSION` check rather than only `win32`) paints it as a coloured, often
+---double-width glyph, which both looks wrong and shifts the tabline every time
+---that frame comes round.
+---@return boolean
+local function prefers_text_glyphs()
+  local ok_win, win = pcall(vim.fn.has, "win32")
+  if ok_win and win == 1 then
+    return true
+  end
+  local env = vim.env or {}
+  return (env.WT_SESSION or "") ~= "" or (env.ConEmuANSI or "") ~= ""
+end
+
 local function spinner_frames()
   local base = { "·", "✢", "✳", "✶", "✻", "✽" }
   local ok, term = pcall(function()
@@ -89,6 +105,9 @@ local function spinner_frames()
   end)
   if ok and term == "xterm-ghostty" then
     base[6] = "✻"
+  end
+  if prefers_text_glyphs() then
+    base[3] = "✱" -- U+2731, the same asterisk shape with no emoji presentation
   end
   local frames = {}
   for i = 1, #base do
