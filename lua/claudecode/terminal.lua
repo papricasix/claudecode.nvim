@@ -288,9 +288,10 @@ end
 
 ---Gets the claude command string and necessary environment variables
 ---@param cmd_args string? Optional arguments to append to the command
+---@param effective_config table? The built terminal config (for the spawn cwd)
 ---@return string cmd_string The command string
 ---@return table env_table The environment variables table
-local function get_claude_command_and_env(cmd_args)
+local function get_claude_command_and_env(cmd_args, effective_config)
   -- Inline get_claude_command logic
   local cmd_from_config = defaults.terminal_cmd
   local base_cmd
@@ -325,11 +326,32 @@ local function get_claude_command_and_env(cmd_args)
 
   if sse_port_value then
     env_table["CLAUDE_CODE_SSE_PORT"] = tostring(sse_port_value)
+  else
+    -- Without the port the CLI falls back to scanning ~/.claude/ide/*.lock and
+    -- attaches to whatever it finds — often another Neovim, whose windows would
+    -- then receive this Claude's diffs and file opens. We still launch (a broken
+    -- integration should not cost you the terminal) but never silently.
+    require("claudecode.logger").error(
+      "terminal",
+      "No Claude Code server for this tab: the CLI will search for another editor to attach to, "
+        .. "so diffs and file opens may land in the wrong Neovim. Run :ClaudeCodeStart to fix this."
+    )
   end
 
   -- Merge custom environment variables from config
   for key, value in pairs(defaults.env) do
     env_table[key] = value
+  end
+
+  -- Session persistence: name this tab's conversation (`--session-id`), or pick
+  -- the one a restored Neovim session handed back (`--resume`). No-op when the
+  -- feature is off or the command already chooses a conversation itself.
+  local ss_ok, session_state = pcall(require, "claudecode.session_state")
+  if ss_ok then
+    local session_args = session_state.launch_args(cmd_string, effective_config and effective_config.cwd)
+    if session_args ~= "" then
+      cmd_string = cmd_string .. " " .. session_args
+    end
   end
 
   -- Live-cursor: inject the hook settings + RPC address (no-op when disabled).
@@ -346,6 +368,24 @@ local function get_claude_command_and_env(cmd_args)
   end
 
   return cmd_string, env_table
+end
+
+---Record which tabpage a freshly opened terminal buffer belongs to.
+---
+---`TermClose` reports only the buffer, and by then the terminal may not be in any
+---window, so the tab has to be stamped while we still know it. Every provider
+---keys its state by the *current* tabpage, so that is this terminal's tab by
+---construction. Read back by the `TermClose` watcher in `init.lua` to forget a
+---conversation the user ended.
+local function tag_terminal_tab()
+  local ok, bufnr = pcall(function()
+    return get_provider().get_active_bufnr()
+  end)
+  if ok and bufnr and vim.api.nvim_buf_is_valid(bufnr) then
+    pcall(function()
+      vim.b[bufnr].claudecode_tab = vim.api.nvim_get_current_tabpage()
+    end)
+  end
 end
 
 ---Common helper to open terminal without focus if not already visible
@@ -370,9 +410,10 @@ local function ensure_terminal_visible_no_focus(opts_override, cmd_args)
 
   -- Terminal is not visible, open it without focus
   local effective_config = build_config(opts_override)
-  local cmd_string, claude_env_table = get_claude_command_and_env(cmd_args)
+  local cmd_string, claude_env_table = get_claude_command_and_env(cmd_args, effective_config)
 
   provider.open(cmd_string, claude_env_table, effective_config, false) -- false = don't focus
+  tag_terminal_tab()
   return true
 end
 
@@ -536,9 +577,10 @@ end
 ---@param cmd_args string? Arguments to append to the claude command.
 function M.open(opts_override, cmd_args)
   local effective_config = build_config(opts_override)
-  local cmd_string, claude_env_table = get_claude_command_and_env(cmd_args)
+  local cmd_string, claude_env_table = get_claude_command_and_env(cmd_args, effective_config)
 
   get_provider().open(cmd_string, claude_env_table, effective_config)
+  tag_terminal_tab()
 end
 
 ---Closes the managed Claude terminal if it's open and valid.
@@ -551,7 +593,7 @@ end
 ---@param cmd_args string? Arguments to append to the claude command.
 function M.simple_toggle(opts_override, cmd_args)
   local effective_config = build_config(opts_override)
-  local cmd_string, claude_env_table = get_claude_command_and_env(cmd_args)
+  local cmd_string, claude_env_table = get_claude_command_and_env(cmd_args, effective_config)
 
   get_provider().simple_toggle(cmd_string, claude_env_table, effective_config)
 end
@@ -561,7 +603,7 @@ end
 ---@param cmd_args string|nil (optional) Arguments to append to the claude command.
 function M.focus_toggle(opts_override, cmd_args)
   local effective_config = build_config(opts_override)
-  local cmd_string, claude_env_table = get_claude_command_and_env(cmd_args)
+  local cmd_string, claude_env_table = get_claude_command_and_env(cmd_args, effective_config)
 
   get_provider().focus_toggle(cmd_string, claude_env_table, effective_config)
 end

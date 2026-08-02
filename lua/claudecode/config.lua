@@ -53,6 +53,14 @@ M.defaults = {
     label = "● Claude plan", -- winbar brand text for the plan window
     highlight = "ClaudeCodePlan", -- winbar highlight group; defaults to a link to DiagnosticInfo
   },
+  -- Per-tab Claude conversations survive a Neovim restart, riding whatever
+  -- already persists your Neovim session (see claudecode.session_state):
+  --   "off"      - do not track session ids (default)
+  --   "global"   - mirror them into g:CLAUDECODE_SESSION (needs 'sessionoptions'
+  --                to contain "globals"); restored on SessionLoadPost
+  --   "external" - track them, store nothing: a session manager calls
+  --                session_state.capture()/restore() itself
+  session_persistence = "off",
   terminal_links = {
     enabled = true, -- open file paths clicked in the Claude terminal in the editor (VS Code parity)
     click = true, -- intercept plain <LeftMouse> on a file:// link (non-links pass through to Claude)
@@ -312,6 +320,15 @@ function M.validate(config)
     check("mouse_motion", function(v)
       return type(v) == "boolean"
     end, "must be a boolean")
+  end
+
+  -- Validate session_persistence (optional; apply() supplies the default)
+  if config.session_persistence ~= nil then
+    local sp = config.session_persistence
+    assert(
+      sp == "off" or sp == "global" or sp == "external",
+      "session_persistence must be one of 'off', 'global', 'external'"
+    )
   end
 
   -- Validate env

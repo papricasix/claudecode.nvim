@@ -345,6 +345,10 @@ For deep technical details, see [ARCHITECTURE.md](./ARCHITECTURE.md).
       layout = "vertical", -- "vertical" or "horizontal" fallback split
       split_size_percentage = 0.5, -- fallback split size as a fraction of the screen (0..1)
     },
+
+    -- Session persistence (opt-in): restore each tab's Claude conversation when a
+    -- saved Neovim session is loaded. "off" | "global" | "external" -- see below.
+    session_persistence = "off",
   },
   keys = {
     -- Your keymaps here
@@ -418,6 +422,61 @@ opts = {
 ```
 
 Unlike the live cursor and plan view, this needs no launch hook — it reads the hyperlinks already in the terminal — so toggling the config takes effect on the next Claude terminal you open.
+
+#### Session Persistence
+
+If you keep one Claude per tab and restore your Neovim session on startup, this brings the conversations back with the tabs: each tab's Claude resumes the chat it was having.
+
+Every Claude the plugin launches is given a stable conversation id (`claude --session-id <uuid>`), so it can be asked for again later (`claude --resume <uuid>`). The id is recorded per tab and handed to whatever already persists your Neovim session — the plugin writes no state file of its own.
+
+- `session_persistence = "off"` — default; no ids are tracked.
+- `session_persistence = "global"` — the plugin mirrors the ids into `g:CLAUDECODE_SESSION` and reads them back on `SessionLoadPost`. Works with plain `:mksession`, [persistence.nvim](https://github.com/folke/persistence.nvim), and mini.sessions, as long as `'sessionoptions'` contains `globals`:
+
+  ```lua
+  vim.opt.sessionoptions:append("globals")
+  ```
+
+- `session_persistence = "external"` — the plugin tracks ids but stores nothing; your session manager saves and restores the payload itself through `require("claudecode.session_state").capture()` / `.restore(data)`.
+
+**Restoring is lazy.** Loading a session arms each tab; the CLI is only launched — resuming that tab's chat — when you next open that tab's Claude terminal. Nothing is spawned behind your back, and eight restored tabs don't mean eight Claude processes at startup.
+
+`:ClaudeCodeSessionRestore!` opens them all right away: it walks every armed tab, opens its Claude terminal (resuming that conversation), and leaves you on the tab and window you started from. Without `!` it only reports how many tabs are armed. Whenever session persistence is enabled the plugin binds this to **`<leader>aR`**; remap it with:
+
+```lua
+vim.keymap.set("n", "<leader>aR", "<cmd>ClaudeCodeSessionRestore!<cr>", { desc = "Restore Claude sessions in every tab" })
+```
+
+**Conversations you close stay closed.** Only chats that were still running when you quit Neovim come back. If you end Claude yourself — `/exit`, `Ctrl-D`, or the process dying — that tab's conversation is forgotten immediately: reopening its terminal starts a fresh chat, and a later session restore won't bring it back either. Hiding the terminal (`:ClaudeCodeClose`, toggling the split) does not end anything, so those chats are unaffected. One gap: the `external` terminal provider runs Claude outside Neovim, where there is no terminal buffer to watch, so a Claude closed there is still treated as restorable.
+
+**[auto-session](https://github.com/rmagatti/auto-session)** — its extra-data hook is a single slot, so compose it (the snippet below is the whole integration):
+
+```lua
+require("auto-session").setup({
+  save_extra_data = function()
+    return vim.json.encode({ claudecode = require("claudecode.session_state").capture() })
+  end,
+  restore_extra_data = function(_, extra_data)
+    local ok, blob = pcall(vim.json.decode, extra_data)
+    if ok and blob then
+      require("claudecode.session_state").restore(blob.claudecode)
+    end
+  end,
+})
+```
+
+**[resession.nvim](https://github.com/stevearc/resession.nvim)** — an extension ships with the plugin:
+
+```lua
+require("resession").setup({ extensions = { claudecode = {} } })
+```
+
+Notes:
+
+- Tabs are matched by **position**, not identity: tabpage handles change across a restart and `:mksession` cannot save tab-local variables, so the payload is keyed by tab number. Reordering tabs between save and load moves conversations with the positions.
+- A conversation is tied to the directory it started in. If a restored tab now points at a different directory, or the conversation is no longer on disk, that tab quietly starts a fresh chat instead of failing to resume.
+- A tab that already has a running Claude is never retargeted by a session load.
+- `:ClaudeCodeStatus` reports the current tab's conversation id.
+- If your session manager saves terminal buffers (`'sessionoptions'` containing `terminal`), consider `vim.opt.sessionoptions:remove("terminal")` — the plugin recreates its own terminal, and a restored dead one just gets in the way.
 
 ### Working Directory Control
 

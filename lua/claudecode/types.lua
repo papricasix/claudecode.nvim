@@ -136,6 +136,7 @@
 ---@field port integer|nil
 ---@field auth_token string|nil
 ---@field initialized boolean
+---@field shutting_down boolean? Set in VimLeavePre, so a TermClose after it reads as "Neovim is exiting"
 ---@field mention_queue ClaudeCodeMention[]
 ---@field mention_timer uv.uv_timer_t?  -- (compatible with vim.loop timer)
 ---@field connection_timer uv.uv_timer_t?  -- (compatible with vim.loop timer)

@@ -381,6 +381,16 @@ function M.setup(opts)
   require("claudecode.live_cursor").setup(M.state.config)
   require("claudecode.plan_view").setup(M.state.config)
   require("claudecode.terminal_links").setup(M.state.config)
+  require("claudecode.session_state").setup(M.state.config)
+
+  -- Sweep lock files left behind by editors that died without running their exit
+  -- hook. Once per Neovim, before any server of ours claims a port.
+  pcall(function()
+    local removed = require("claudecode.lockfile").cleanup_stale()
+    if removed > 0 then
+      logger.debug("init", "removed " .. removed .. " stale lock file(s)")
+    end
+  end)
 
   if M.state.config.auto_start then
     M.start(false)
@@ -392,6 +402,9 @@ function M.setup(opts)
   vim.api.nvim_create_autocmd("VimLeavePre", {
     group = vim.api.nvim_create_augroup("ClaudeCodeShutdown", { clear = true }),
     callback = function()
+      -- Marks every TermClose from here on as "Neovim is exiting", not "the user
+      -- closed this chat" (see the ClaudeCodeSessionClose autocmd).
+      M.state.shutting_down = true
       for tab_id, inst in pairs(M.instances) do
         if inst.server then
           M._stop_instance(tab_id)
@@ -412,10 +425,52 @@ function M.setup(opts)
     desc = "Automatically stop Claude Code integration when exiting Neovim",
   })
 
+  -- Restore the per-tab Claude session ids a saved Neovim session brought back.
+  -- Runs after the tabs are up, which is what the payload is keyed by. No-op
+  -- unless session_persistence = "global"; the "external" mode is driven by the
+  -- session manager itself (see claudecode.session_state).
+  vim.api.nvim_create_autocmd("SessionLoadPost", {
+    group = vim.api.nvim_create_augroup("ClaudeCodeSessionRestore", { clear = true }),
+    callback = function()
+      pcall(function()
+        require("claudecode.session_state").restore_from_global()
+      end)
+    end,
+    desc = "Resume each tab's Claude conversation from the restored Neovim session",
+  })
+
+  -- A Claude that ends while Neovim is still running was ended by the user, and
+  -- a conversation they closed should not come back. Neovim quitting also kills
+  -- the terminal, but the ordering tells the two apart: on exit Neovim fires
+  -- VimLeavePre (and VimLeave) *before* TermClose, so a TermClose that arrives
+  -- with the shutdown flag unset is the user's doing. Verified empirically —
+  -- during shutdown the job's own on_exit never runs at all, which is why this
+  -- watches TermClose rather than the providers' exit hooks.
+  if require("claudecode.session_state").is_enabled() then
+    vim.api.nvim_create_autocmd("TermClose", {
+      group = vim.api.nvim_create_augroup("ClaudeCodeSessionClose", { clear = true }),
+      callback = function(args)
+        if M.state.shutting_down then
+          return
+        end
+        pcall(function()
+          local tab = vim.b[args.buf].claudecode_tab
+          if tab then
+            require("claudecode.session_state").forget(tab)
+          end
+        end)
+      end,
+      desc = "Forget a Claude conversation the user closed, so it is not restored",
+    })
+  end
+
   -- Clean up instance when a tab is closed
   vim.api.nvim_create_autocmd("TabClosed", {
     group = vim.api.nvim_create_augroup("ClaudeCodeTabLifecycle", { clear = true }),
     callback = function()
+      pcall(function()
+        require("claudecode.session_state").forget_closed_tabs()
+      end)
       for tab_id, inst in pairs(M.instances) do
         if not vim.api.nvim_tabpage_is_valid(tab_id) then
           if inst.server then
@@ -449,6 +504,15 @@ function M.setup(opts)
     desc = "Toggle Claude Code file tracking",
     silent = true,
   })
+
+  -- Only bound when there are sessions to restore: with session_persistence off
+  -- the command has nothing to do, and an inert mapping just occupies the key.
+  if require("claudecode.session_state").is_enabled() then
+    vim.keymap.set("n", "<leader>aR", "<cmd>ClaudeCodeSessionRestore!<cr>", {
+      desc = "Restore Claude sessions in every tab",
+      silent = true,
+    })
+  end
 
   M.state.initialized = true
   return M
@@ -686,8 +750,49 @@ function M._create_commands()
     else
       logger.info("command", "Claude Code integration is not running on current tab")
     end
+    local session_state = require("claudecode.session_state")
+    if session_state.is_enabled() then
+      local record = session_state.get()
+      logger.info(
+        "command",
+        record and ("Claude session for this tab: " .. record.session_id) or "No Claude session recorded for this tab"
+      )
+    end
   end, {
     desc = "Show Claude Code integration status for current tab",
+  })
+
+  vim.api.nvim_create_user_command("ClaudeCodeSessionRestore", function(opts)
+    local session_state = require("claudecode.session_state")
+    if not session_state.is_enabled() then
+      logger.warn("command", "ClaudeCodeSessionRestore: session_persistence is 'off'")
+      return
+    end
+    -- Re-read the payload we own. A no-op in "external" mode, where the session
+    -- manager has already handed us the ids — so never gate the rest on it.
+    session_state.restore_from_global()
+
+    -- With `!`, walk the tabs and open each armed Claude right away instead of
+    -- waiting for that tab's first toggle (that is N Claude processes at once —
+    -- the lazy default exists for a reason).
+    if opts.bang then
+      local opened = session_state.open_pending()
+      logger.info(
+        "command",
+        opened > 0 and ("Resumed Claude in " .. opened .. " tab(s)") or "No tab is waiting on a saved Claude session"
+      )
+      return
+    end
+
+    local armed = session_state.pending_count()
+    logger.info(
+      "command",
+      armed > 0 and (armed .. " tab(s) will resume their Claude session on the next toggle")
+        or "No Claude sessions to restore"
+    )
+  end, {
+    bang = true,
+    desc = "Re-arm each tab's saved Claude conversation (! also opens the terminals)",
   })
 
   ---@param file_paths table
