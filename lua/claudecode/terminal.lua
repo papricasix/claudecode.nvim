@@ -377,6 +377,9 @@ end
 ---keys its state by the *current* tabpage, so that is this terminal's tab by
 ---construction. Read back by the `TermClose` watcher in `init.lua` to forget a
 ---conversation the user ended.
+---
+---Also the point where this tab first counts as "has a Claude", which is what
+---status tracking reports until the CLI's own hooks start arriving.
 local function tag_terminal_tab()
   local ok, bufnr = pcall(function()
     return get_provider().get_active_bufnr()
@@ -386,6 +389,9 @@ local function tag_terminal_tab()
       vim.b[bufnr].claudecode_tab = vim.api.nvim_get_current_tabpage()
     end)
   end
+  pcall(function()
+    require("claudecode.status").note_launch(vim.api.nvim_get_current_tabpage())
+  end)
 end
 
 ---Common helper to open terminal without focus if not already visible

@@ -53,6 +53,19 @@ M.defaults = {
     label = "● Claude plan", -- winbar brand text for the plan window
     highlight = "ClaudeCodePlan", -- winbar highlight group; defaults to a link to DiagnosticInfo
   },
+  -- Per-tab Claude activity ("busy" / "waiting" for you / "idle"), published for
+  -- tablines, statuslines and other plugins (see claudecode.status). Opt-in: it
+  -- widens the injected hook set to every tool call.
+  status = {
+    enabled = false,
+    icons = { busy = "●", waiting = "◆", idle = "○", none = "" },
+    highlights = {
+      busy = "ClaudeCodeStatusBusy", -- defaults to a link to DiagnosticInfo
+      waiting = "ClaudeCodeStatusWaiting", -- defaults to a link to DiagnosticWarn
+      idle = "ClaudeCodeStatusIdle", -- defaults to a link to Comment
+    },
+    auto_redraw = true, -- redraw the tabline/statusline whenever a tab's state changes
+  },
   -- Per-tab Claude conversations survive a Neovim restart, riding whatever
   -- already persists your Neovim session (see claudecode.session_state):
   --   "off"      - do not track session ids (default)
@@ -320,6 +333,30 @@ function M.validate(config)
     check("mouse_motion", function(v)
       return type(v) == "boolean"
     end, "must be a boolean")
+  end
+
+  -- Validate status (optional; apply() supplies defaults)
+  if config.status ~= nil then
+    local st = config.status
+    assert(type(st) == "table", "status must be a table")
+    if st.enabled ~= nil then
+      assert(type(st.enabled) == "boolean", "status.enabled must be a boolean")
+    end
+    if st.auto_redraw ~= nil then
+      assert(type(st.auto_redraw) == "boolean", "status.auto_redraw must be a boolean")
+    end
+    for _, field in ipairs({ "icons", "highlights" }) do
+      if st[field] ~= nil then
+        assert(type(st[field]) == "table", "status." .. field .. " must be a table")
+        for key, value in pairs(st[field]) do
+          assert(
+            key == "busy" or key == "waiting" or key == "idle" or key == "none",
+            "status." .. field .. " keys must be 'busy', 'waiting', 'idle' or 'none'"
+          )
+          assert(type(value) == "string", "status." .. field .. "." .. key .. " must be a string")
+        end
+      end
+    end
   end
 
   -- Validate session_persistence (optional; apply() supplies the default)

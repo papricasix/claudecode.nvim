@@ -21,6 +21,27 @@
 ---@field hide_terminal_in_new_tab boolean Hide Claude terminal in newly created diff tab
 ---@field on_new_file_reject ClaudeCodeNewFileRejectBehavior Behavior when rejecting a new-file diff
 
+-- Per-tab Claude activity state (see claudecode.status)
+---@alias ClaudeCodeStatusState "busy"|"waiting"|"idle"|"none"
+
+-- Per-tab Claude activity, as handed to consumers of claudecode.status
+---@class ClaudeCodeStatus
+---@field tab integer|nil Tabpage handle the status belongs to
+---@field tabnr integer|nil The tab's left-to-right position, when it can be read
+---@field state ClaudeCodeStatusState
+---@field tool string|nil Tool Claude is running (busy) or asking about (waiting)
+---@field message string|nil Notification text, for a "waiting" state
+---@field session_id string|nil Claude conversation id reported by the CLI
+---@field since number Monotonic ms (vim.loop.now) when this state was entered
+---@field updated_at number|nil Monotonic ms of the last event for this tab
+
+-- Per-tab status tracking configuration
+---@class ClaudeCodeStatusOptions
+---@field enabled boolean Opt-in; injects the activity hooks at launch
+---@field icons table<ClaudeCodeStatusState, string> Glyph per state
+---@field highlights table<ClaudeCodeStatusState, string> Highlight group per state
+---@field auto_redraw boolean Redraw the tabline/statusline on every change
+
 -- Model selection option
 ---@class ClaudeCodeModelOption
 ---@field name string
@@ -115,6 +136,7 @@
 ---@field connection_timeout number
 ---@field queue_timeout number
 ---@field diff_opts ClaudeCodeDiffOptions
+---@field status ClaudeCodeStatusOptions?
 ---@field models ClaudeCodeModelOption[]
 ---@field disable_broadcast_debouncing? boolean
 ---@field enable_broadcast_debouncing_in_tests? boolean

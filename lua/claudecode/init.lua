@@ -382,6 +382,7 @@ function M.setup(opts)
   require("claudecode.plan_view").setup(M.state.config)
   require("claudecode.terminal_links").setup(M.state.config)
   require("claudecode.session_state").setup(M.state.config)
+  require("claudecode.status").setup(M.state.config)
 
   -- Sweep lock files left behind by editors that died without running their exit
   -- hook. Once per Neovim, before any server of ours claims a port.
@@ -446,18 +447,28 @@ function M.setup(opts)
   -- with the shutdown flag unset is the user's doing. Verified empirically —
   -- during shutdown the job's own on_exit never runs at all, which is why this
   -- watches TermClose rather than the providers' exit hooks.
-  if require("claudecode.session_state").is_enabled() then
+  --
+  -- Status tracking rides the same watcher: a Claude that ended has no activity
+  -- to report, so its tab goes back to "none".
+  if require("claudecode.session_state").is_enabled() or require("claudecode.status").is_enabled() then
     vim.api.nvim_create_autocmd("TermClose", {
       group = vim.api.nvim_create_augroup("ClaudeCodeSessionClose", { clear = true }),
       callback = function(args)
+        local tab
+        pcall(function()
+          tab = vim.b[args.buf].claudecode_tab
+        end)
+        if not tab then
+          return
+        end
+        pcall(function()
+          require("claudecode.status").clear(tab)
+        end)
         if M.state.shutting_down then
           return
         end
         pcall(function()
-          local tab = vim.b[args.buf].claudecode_tab
-          if tab then
-            require("claudecode.session_state").forget(tab)
-          end
+          require("claudecode.session_state").forget(tab)
         end)
       end,
       desc = "Forget a Claude conversation the user closed, so it is not restored",
@@ -470,6 +481,9 @@ function M.setup(opts)
     callback = function()
       pcall(function()
         require("claudecode.session_state").forget_closed_tabs()
+      end)
+      pcall(function()
+        require("claudecode.status").forget_closed_tabs()
       end)
       for tab_id, inst in pairs(M.instances) do
         if not vim.api.nvim_tabpage_is_valid(tab_id) then
@@ -756,6 +770,22 @@ function M._create_commands()
       logger.info(
         "command",
         record and ("Claude session for this tab: " .. record.session_id) or "No Claude session recorded for this tab"
+      )
+    end
+    local status = require("claudecode.status")
+    if status.is_enabled() then
+      local lines = {}
+      for tab, entry in pairs(status.all()) do
+        local label = "tab " .. tostring(entry.tabnr or tab) .. ": " .. entry.state
+        if entry.tool then
+          label = label .. " (" .. entry.tool .. ")"
+        end
+        table.insert(lines, label)
+      end
+      table.sort(lines)
+      logger.info(
+        "command",
+        #lines > 0 and ("Claude activity - " .. table.concat(lines, ", ")) or "No Claude activity tracked in any tab"
       )
     end
   end, {

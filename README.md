@@ -478,6 +478,75 @@ Notes:
 - `:ClaudeCodeStatus` reports the current tab's conversation id.
 - If your session manager saves terminal buffers (`'sessionoptions'` containing `terminal`), consider `vim.opt.sessionoptions:remove("terminal")` — the plugin recreates its own terminal, and a restored dead one just gets in the way.
 
+#### Per-Tab Status (busy / waiting / idle)
+
+If you run one Claude per tab, this answers "which tab is working, and which one is waiting on me?" — and publishes it so your tabline, statusline, or any other plugin can draw a glyph next to the tab.
+
+```lua
+require("claudecode").setup({
+  status = {
+    enabled = true, -- opt-in
+    icons = { busy = "●", waiting = "◆", idle = "○", none = "" },
+    highlights = {
+      busy = "ClaudeCodeStatusBusy", -- links to DiagnosticInfo by default
+      waiting = "ClaudeCodeStatusWaiting", -- links to DiagnosticWarn
+      idle = "ClaudeCodeStatusIdle", -- links to Comment
+    },
+    auto_redraw = true, -- redraw the tabline/statusline on every change
+  },
+})
+```
+
+The states, per tab:
+
+| State     | Meaning                                                                     |
+| --------- | --------------------------------------------------------------------------- |
+| `busy`    | Claude is working: your prompt is in flight, or a tool is running           |
+| `waiting` | Claude needs **you**: a permission prompt, or a plan waiting to be accepted |
+| `idle`    | Claude is up and has finished its turn — ready for your next prompt         |
+| `none`    | No Claude in that tab (never launched, or it exited)                        |
+
+Reading it:
+
+```lua
+local status = require("claudecode.status")
+
+status.get_state(tab)  -- "busy" | "waiting" | "idle" | "none"  (tab defaults to the current one)
+status.get(tab)        -- full record: state, tool, message, session_id, since, tabnr
+status.all()           -- { [tabpage] = record } for every tab that has a Claude
+status.icon(tab)       -- the configured glyph for that tab's state ("" when none)
+status.hl_group(tab)   -- highlight group for that state (nil when none)
+```
+
+`status.get()` takes a **tabpage handle** — what `nvim_list_tabpages()` gives you — so a tabline can ask about the tab it is drawing. Every change also fires `User ClaudeCodeStatusChanged`, whose `data` carries `{ tab, tabnr, state, prev, status }`, so a statusline plugin can refresh on demand instead of polling.
+
+A minimal tabline that puts the glyph in front of each tab number:
+
+```lua
+function _G.ClaudeCodeTabline()
+  local status = require("claudecode.status")
+  local current = vim.api.nvim_get_current_tabpage()
+  local out = {}
+  for i, tab in ipairs(vim.api.nvim_list_tabpages()) do
+    local sel = (tab == current) and "%#TabLineSel#" or "%#TabLine#"
+    local icon, hl = status.icon(tab), status.hl_group(tab)
+    local glyph = (icon ~= "" and hl) and ("%#" .. hl .. "#" .. icon .. " " .. sel) or ""
+    out[#out + 1] = "%" .. i .. "T" .. sel .. " " .. glyph .. i .. " "
+  end
+  return table.concat(out) .. "%#TabLineFill#%T"
+end
+
+vim.o.tabline = "%!v:lua.ClaudeCodeTabline()"
+```
+
+Notes:
+
+- The state comes from Claude Code's own lifecycle hooks, injected at launch the same way the live cursor and plan view are (`claude --settings`, your own settings untouched). It applies to Claude terminals opened after `setup`.
+- This is the one feature that costs a hook invocation per tool call — it has to see every `PreToolUse`/`PostToolUse`, not just the file tools — which is why it is opt-in.
+- `waiting` needs a permission prompt to fire. A Claude running with permissions pre-approved (`--dangerously-skip-permissions`, or an allow-list covering everything it does) goes straight from `busy` to `idle` — except for plan mode, where the plan itself is the thing waiting on you.
+- It relies on hook events (`UserPromptSubmit`, `Notification`, `Stop`, `SessionEnd`) that a very old `claude` binary may not know; keep the CLI reasonably current.
+- `:ClaudeCodeStatus` prints the tracked state of every tab.
+
 ### Working Directory Control
 
 You can fix the Claude terminal's working directory regardless of `autochdir` and buffer-local cwd changes. Options (precedence order):

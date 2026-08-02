@@ -79,6 +79,14 @@ local function session_enabled()
   return ok and ss.is_enabled() == true
 end
 
+--- Whether per-tab status tracking wants the launch hook injected. It needs the
+--- widest set of events of any feature (see below).
+---@return boolean
+local function status_enabled()
+  local ok, st = pcall(require, "claudecode.status")
+  return ok and st.is_enabled() == true
+end
+
 --------------------------------------------------------------------------------
 -- Setup
 --------------------------------------------------------------------------------
@@ -119,7 +127,8 @@ function M.build_launch_injection()
   local lc_on = is_enabled()
   local plan_on = plan_enabled()
   local session_on = session_enabled()
-  if not lc_on and not plan_on and not session_on then
+  local status_on = status_enabled()
+  if not lc_on and not plan_on and not session_on and not status_on then
     return nil
   end
 
@@ -167,24 +176,49 @@ function M.build_launch_injection()
     table.insert(pre_tools, "ExitPlanMode")
   end
   local settings = { hooks = {} }
-  if #pre_tools > 0 then
-    -- For the file tools we use only PreToolUse: a PostToolUse would clear the
-    -- highlight the instant a near-instant Read finishes, so live-cursor relies
-    -- on its inactivity timer instead.
-    -- Only registered when some feature actually wants tool events: an empty
-    -- matcher would match *every* tool call and fire the hook for nothing.
-    settings.hooks.PreToolUse = { { matcher = table.concat(pre_tools, "|"), hooks = { hook } } }
+  ---@param event string Claude Code hook event name.
+  ---@param matcher string|nil Tool matcher, omitted for events that carry no tool.
+  local function register(event, matcher)
+    settings.hooks[event] = { matcher and { matcher = matcher, hooks = { hook } } or { hooks = { hook } } }
   end
-  if session_on then
+
+  if status_on then
+    -- Status tracks *activity*, so it needs every tool call rather than the file
+    -- tools above, and both sides of one: PostToolUse is the only event between
+    -- answering a permission prompt and the tool's result, so without it a tab
+    -- would stay "waiting" for the whole run. This is the one feature that costs
+    -- a hook invocation per tool call.
+    register("PreToolUse", "*")
+    register("PostToolUse", "*")
+    register("UserPromptSubmit")
+    -- `Notification` matches on the notification *type*, so we ask only for the
+    -- ones that say something about the conversation's state and let Claude drop
+    -- the rest (auth_success, elicitation_*, ...). A CLI that predates typed
+    -- notification matchers ignores the matcher and sends us everything, which
+    -- `status.note` still classifies correctly from the message.
+    register("Notification", "permission_prompt|agent_needs_input|idle_prompt")
+    register("Stop")
+    register("SessionEnd")
+  else
+    if #pre_tools > 0 then
+      -- For the file tools we use only PreToolUse: a PostToolUse would clear the
+      -- highlight the instant a near-instant Read finishes, so live-cursor relies
+      -- on its inactivity timer instead.
+      -- Only registered when some feature actually wants tool events: an empty
+      -- matcher would match *every* tool call and fire the hook for nothing.
+      register("PreToolUse", table.concat(pre_tools, "|"))
+    end
+    if plan_on then
+      -- For the plan view, PostToolUse(ExitPlanMode) is the "user accepted" signal
+      -- that closes the plan window. Scoped to ExitPlanMode so it never fires for
+      -- the file tools above.
+      register("PostToolUse", "ExitPlanMode")
+    end
+  end
+  if session_on or status_on then
     -- SessionStart carries the id the CLI runs under (including after /clear or a
     -- manual --resume), which is what session persistence stores per tab.
-    settings.hooks.SessionStart = { { hooks = { hook } } }
-  end
-  if plan_on then
-    -- For the plan view, PostToolUse(ExitPlanMode) is the "user accepted" signal
-    -- that closes the plan window. Scoped to ExitPlanMode so it never fires for
-    -- the file tools above.
-    settings.hooks.PostToolUse = { { matcher = "ExitPlanMode", hooks = { hook } } }
+    register("SessionStart")
   end
 
   local tmp = vim.fn.tempname()
@@ -315,6 +349,13 @@ end
 function M.dispatch(event, source_tab)
   local tool = event.tool_name
   local ehn = event.hook_event_name
+
+  -- Per-tab activity status. Fed first and from every event kind (including the
+  -- ones below that return early), since it is the only consumer that cares about
+  -- Stop/Notification/UserPromptSubmit.
+  pcall(function()
+    require("claudecode.status").note(event, source_tab)
+  end)
 
   -- Every hook payload names the session it came from. Recording it makes the
   -- id we persist per tab authoritative rather than the one we guessed at launch.

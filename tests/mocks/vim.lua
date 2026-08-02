@@ -124,6 +124,11 @@ local vim = {
       end
     end,
 
+    nvim_exec_autocmds = function(events, opts)
+      vim._fired_autocmds = vim._fired_autocmds or {}
+      table.insert(vim._fired_autocmds, { events = events, opts = opts })
+    end,
+
     nvim_create_autocmd = function(events, opts)
       local group = opts.group or "default"
       if not vim._autocmds[group] then
@@ -1153,6 +1158,7 @@ vim._mock = {
     vim._next_winid = 1000
     vim._commands = {}
     vim._autocmds = {}
+    vim._fired_autocmds = {}
     vim._vars = {}
     vim._options = {}
     vim._last_command = nil
