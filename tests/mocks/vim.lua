@@ -1050,6 +1050,18 @@ local vim = {
     end,
   }),
 
+  -- Window-local variables: vim.w[win].<name> = value
+  w = setmetatable({}, {
+    __index = function(t, win)
+      local existing = rawget(t, win)
+      if not existing then
+        existing = {}
+        rawset(t, win, existing)
+      end
+      return existing
+    end,
+  }),
+
   -- Buffer-local options: vim.bo[buf].<opt> reads/writes that buffer's options
   -- table (the same one nvim_buf_get_option/add_buffer use), so a test can set
   -- e.g. vim.bo[buf].modified = true and have production code observe it.

@@ -36,8 +36,16 @@ local config = nil
 --- Highlight namespace, created in setup().
 local ns = nil
 
+--- Arms the autocmds that notice the user taking the preview window over.
+--- Forward-declared: setup() runs before the window plumbing is defined.
+---@type fun()
+local ensure_preview_watcher
+
 local state = {
   preview_win = nil, -- window handle reused in "preview" mode
+  preview_buf = nil, -- buffer WE last put in that window (to spot a user takeover)
+  marker = nil, -- { win, winbar, winhighlight }: window options the marker overwrote
+  augroup = nil, -- autocmd group watching the preview window
   last_buf = nil, -- last buffer we painted into (for clearing)
   diff_buf = nil, -- scratch buffer holding the inline unified diff for edits
   clear_timer = nil, -- inactivity timer handle
@@ -88,6 +96,7 @@ function M.setup(full_config)
   if (config.preview_highlight or "ClaudeCodeLivePreview") == "ClaudeCodeLivePreview" then
     pcall(vim.api.nvim_set_hl, 0, "ClaudeCodeLivePreview", { link = "DiagnosticOk", default = true })
   end
+  ensure_preview_watcher()
 end
 
 --------------------------------------------------------------------------------
@@ -455,6 +464,48 @@ local function winbar_text(info)
   return table.concat(parts, " · ")
 end
 
+---Read a window option, or nil if the window is gone.
+---@param win integer
+---@param name string
+---@return string|nil
+local function get_winopt(win, name)
+  local ok, value = pcall(function()
+    return vim.wo[win][name]
+  end)
+  return ok and value or nil
+end
+
+---Restore a window option we overwrote, when we have a remembered value.
+---@param win integer
+---@param name string
+---@param value string|nil
+local function set_winopt(win, name, value)
+  if value == nil then
+    return
+  end
+  pcall(function()
+    vim.wo[win][name] = value
+  end)
+end
+
+---Put the preview window's `winbar`/`winhighlight` back to what they were before
+---we marked it. Keeps the remembered values, so the marker can be re-applied.
+---
+---This must run *before* any buffer leaves the preview window. Neovim stores
+---window-local options per (window, buffer) pair and restores them when that
+---buffer returns to that window: a swap made while the marker is up records it,
+---and re-opening the file later resurrects the caption with no code of ours
+---running. Stripping first is what keeps the recorded values clean.
+---@param win integer|nil
+local function strip_preview_marker(win)
+  local marker = state.marker
+  if not marker or not win or marker.win ~= win or not vim.api.nvim_win_is_valid(win) then
+    return
+  end
+  set_winopt(win, "winbar", marker.winbar)
+  set_winopt(win, "winhighlight", marker.winhighlight)
+end
+
 ---Mark a freshly-created preview window so the user can tell it is a live preview,
 ---and what Claude is currently reading/writing.
 ---@param win integer
@@ -462,6 +513,17 @@ end
 local function apply_preview_marker(win, info)
   local hl = config.preview_highlight or "ClaudeCodeLivePreview"
   local did_winbar, did_divider = false, false
+  -- Remember what the window looked like before we touched it, so the marker can
+  -- be undone without clobbering a winbar/winhighlight the user (or a plugin)
+  -- had set. 'winhighlight' in particular is window-local only — not remembered
+  -- per buffer — so blanking it on release would be a visible loss.
+  if not state.marker or state.marker.win ~= win then
+    state.marker = {
+      win = win,
+      winbar = get_winopt(win, "winbar"),
+      winhighlight = get_winopt(win, "winhighlight"),
+    }
+  end
   if config.preview_winbar ~= false then
     -- Escape '%' (statusline meta) in the visible text only; the highlight
     -- directive '%#group#' and the '%=' alignment items must stay literal.
@@ -501,6 +563,24 @@ local function schedule_preview_marker(win, info)
       apply_preview_marker(win, info)
     end
   end)
+end
+
+---Put `buf` in the preview window, the only way we ever should.
+---
+---Two things have to happen around the swap. The marker comes off first, so the
+---options Neovim snapshots for the *outgoing* buffer are the window's own and
+---re-opening that file later doesn't bring the caption back with it (see
+---strip_preview_marker). And `preview_buf` is recorded *before* the swap, since
+---`nvim_win_set_buf` fires BufWinEnter synchronously — the takeover watcher runs
+---inside this call and must see the new buffer as ours, not as the user's doing.
+---@param win integer
+---@param buf integer
+local function swap_preview_buf(win, buf)
+  strip_preview_marker(win)
+  if win == state.preview_win then
+    state.preview_buf = buf
+  end
+  pcall(vim.api.nvim_win_set_buf, win, buf)
 end
 
 ---Scroll `win` so the change at `line` (spanning `range_len` lines) is visible,
@@ -544,6 +624,10 @@ local function resolve_window()
     end
     if new_win and vim.api.nvim_win_is_valid(new_win) then
       state.preview_win = new_win
+      -- The split starts out showing the base window's buffer. Record it so the
+      -- takeover watcher doesn't read the inherited buffer as the user putting
+      -- their own file here, in the gap before the caller swaps ours in.
+      state.preview_buf = vim.api.nvim_win_get_buf(new_win)
       -- Tag the preview window so the review diff's window discovery skips it and
       -- never opens a diff into the ride-along split (see diff.find_main_editor_window).
       pcall(function()
@@ -754,22 +838,120 @@ function M.clear()
   clear_unified(state.diff_buf)
 end
 
----Close the reserved preview window when Claude goes idle, unless the user is
----currently focused in it (don't yank the rug out while they're reading/editing).
+---Stop treating the reserved split as our preview window: undo the marker, drop
+---the tag review diffs avoid, and forget it. The next event opens a fresh one.
+---
+---`handover` is for when the window outlives us with a previewed file still in
+---it (the user is reading there): the buffer becomes theirs — unowned so we
+---never reap it out from under them, listed so it shows up in the buffer list
+---like any file they opened, and stripped of our highlight.
+---@param handover boolean|nil
+local function release_preview_window(handover)
+  local win = state.preview_win
+  if win and vim.api.nvim_win_is_valid(win) then
+    strip_preview_marker(win)
+    pcall(function()
+      vim.w[win].claudecode_live_preview = nil
+    end)
+    if handover then
+      local buf = vim.api.nvim_win_get_buf(win)
+      if state.owned_bufs[buf] then
+        state.owned_bufs[buf] = nil
+        pcall(function()
+          vim.bo[buf].buflisted = true
+        end)
+      end
+      if ns then
+        pcall(vim.api.nvim_buf_clear_namespace, buf, ns, 0, -1)
+      end
+      if state.last_buf == buf then
+        state.last_buf = nil
+      end
+    end
+  end
+  state.marker = nil
+  state.preview_win = nil
+  state.preview_buf = nil
+end
+
+---Watch for the user taking the preview window over. Idempotent; armed from
+---setup().
+---
+---A file picker, a `:edit`, a jump to a definition — anything that puts another
+---buffer in that window means it is no longer a preview, and leaving our marker
+---on it is how a plain file ends up wearing the "Claude live preview" caption
+---and the green separator.
+ensure_preview_watcher = function()
+  if state.augroup then
+    return
+  end
+  state.augroup = vim.api.nvim_create_augroup("ClaudeCodeLiveCursorPreview", { clear = true })
+
+  vim.api.nvim_create_autocmd({ "BufWinEnter", "WinEnter" }, {
+    group = state.augroup,
+    callback = function()
+      local win = state.preview_win
+      if not win then
+        return
+      end
+      if not vim.api.nvim_win_is_valid(win) then
+        release_preview_window(false)
+        return
+      end
+      local previewed = state.preview_buf
+      if vim.api.nvim_win_get_buf(win) == previewed then
+        return -- still showing what we put there
+      end
+      release_preview_window(true)
+      -- The file we had been previewing just left the screen. Unpaint it and
+      -- stop treating it as the active buffer so it is reaped like any other
+      -- preview, instead of lingering as an unlisted stray.
+      if previewed and vim.api.nvim_buf_is_valid(previewed) then
+        if ns then
+          pcall(vim.api.nvim_buf_clear_namespace, previewed, ns, 0, -1)
+        end
+        if state.last_buf == previewed then
+          state.last_buf = nil
+        end
+      end
+      -- Deleting a buffer from inside a buffer-event autocmd is refused; reap on
+      -- the next tick.
+      vim.schedule(reap_owned)
+    end,
+  })
+
+  -- Our buffer is about to leave the preview window by someone else's doing.
+  -- Strip the marker while it is still up, so the per-(window, buffer) options
+  -- Neovim snapshots at that moment don't carry it (see strip_preview_marker).
+  vim.api.nvim_create_autocmd("BufWinLeave", {
+    group = state.augroup,
+    callback = function(args)
+      if state.preview_win and args.buf == state.preview_buf then
+        strip_preview_marker(state.preview_win)
+      end
+    end,
+  })
+end
+
+---Close the reserved preview window when Claude goes idle. If the user is
+---focused in it we don't yank the rug out from under them — but we do stop
+---calling it ours: the marker comes off (its caption is stale the moment the
+---preview stops updating) and the window, with whatever it shows, is theirs.
 local function close_idle_preview()
   if config.mode ~= "preview" then
     return
   end
   local win = state.preview_win
   if not win or not vim.api.nvim_win_is_valid(win) then
-    state.preview_win = nil
+    release_preview_window(false)
     return
   end
   if vim.api.nvim_get_current_win() == win then
-    return -- focused: leave it; the next idle timeout closes it after they leave
+    release_preview_window(true)
+    return
   end
+  release_preview_window(false)
   pcall(vim.api.nvim_win_close, win, true)
-  state.preview_win = nil
 end
 
 local function stop_clear_timer()
@@ -791,6 +973,12 @@ local function arm_clear_timer()
   state.clear_timer = vim.defer_fn(function()
     M.clear()
     state.clear_timer = nil
+    -- The paint is gone, so the most recently previewed buffer is no longer the
+    -- "active" one: drop it from last_buf, which reap_owned exempts. Without
+    -- this the final file of every burst of activity stays behind forever —
+    -- loaded, unlisted (so invisible in the buffer list), and carrying the
+    -- window's remembered preview marker for the next time it is opened.
+    state.last_buf = nil
     close_idle_preview()
     reap_owned()
   end, delay)
@@ -807,10 +995,13 @@ end
 function M.on_diff_opened(file_path) -- luacheck: ignore file_path
   M.clear()
   stop_clear_timer()
-  if state.preview_win and vim.api.nvim_win_is_valid(state.preview_win) then
-    pcall(vim.api.nvim_win_close, state.preview_win, true)
+  local preview_win = state.preview_win
+  release_preview_window(false)
+  if preview_win and vim.api.nvim_win_is_valid(preview_win) then
+    pcall(vim.api.nvim_win_close, preview_win, true)
   end
-  state.preview_win = nil
+  -- The previewed buffer is off-screen now; nothing keeps it "active".
+  state.last_buf = nil
   reap_owned()
 end
 
@@ -837,7 +1028,7 @@ function M.show(file_path, opts)
     return
   end
   pcall(vim.fn.bufload, buf)
-  pcall(vim.api.nvim_win_set_buf, win, buf)
+  swap_preview_buf(win, buf)
   if not pre_existing then
     state.owned_bufs[buf] = true
   end
@@ -991,7 +1182,7 @@ local function scratch_preview(file_path, lines)
   -- Drop any flat highlight from a previous read before switching to the diff.
   M.clear()
   state.last_buf = nil
-  pcall(vim.api.nvim_win_set_buf, win, buf)
+  swap_preview_buf(win, buf)
   return win, buf
 end
 
@@ -1179,14 +1370,17 @@ function M.cleanup()
 
   M.clear()
   stop_clear_timer()
-  if state.preview_win and vim.api.nvim_win_is_valid(state.preview_win) then
-    pcall(vim.api.nvim_win_close, state.preview_win, true)
+  local preview_win = state.preview_win
+  -- Undo the marker (and forget the window) before closing it, so a window that
+  -- refuses to close is at least handed back looking like the user's own.
+  release_preview_window(false)
+  if preview_win and vim.api.nvim_win_is_valid(preview_win) then
+    pcall(vim.api.nvim_win_close, preview_win, true)
   end
   if state.diff_buf and vim.api.nvim_buf_is_valid(state.diff_buf) then
     pcall(vim.api.nvim_buf_delete, state.diff_buf, { force = true })
   end
   state.diff_buf = nil
-  state.preview_win = nil
   -- Reap our ephemeral file buffers before forgetting them. last_buf is cleared
   -- first so the final previewed buffer is no longer exempt from reaping; any
   -- buffer with unsaved changes still refuses deletion and is simply forgotten.
@@ -1200,6 +1394,8 @@ M._state = state
 M._is_enabled = is_enabled
 M._close_idle_preview = close_idle_preview
 M._apply_preview_marker = apply_preview_marker
+M._strip_preview_marker = strip_preview_marker
+M._release_preview_window = release_preview_window
 M._winbar_text = winbar_text
 M._locate_block = locate_block
 M._common_context = common_context

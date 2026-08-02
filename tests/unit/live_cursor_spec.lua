@@ -539,16 +539,23 @@ describe("live_cursor", function()
       expect(live_cursor._state.preview_win).to_be_nil()
     end)
 
-    it("keeps the preview window when it is focused", function()
+    it("hands a focused preview window over instead of closing it", function()
       live_cursor.setup(base_config({ enabled = true, mode = "preview" }))
+      vim._mock.add_buffer(1, "/proj/a.lua", "local a = 1")
       vim._windows[1000] = { buf = 1 }
       vim.api.nvim_set_current_win(1000) -- focused in the preview
       live_cursor._state.preview_win = 1000
+      live_cursor._state.preview_buf = 1
+      live_cursor._state.owned_bufs[1] = true
 
       live_cursor._close_idle_preview()
 
+      -- The window stays (they are reading in it) but stops being ours: no stale
+      -- marker, and the buffer becomes a normal listed buffer we never reap.
       expect(vim.api.nvim_win_is_valid(1000)).to_be_true()
-      expect(live_cursor._state.preview_win).to_be(1000)
+      expect(live_cursor._state.preview_win).to_be_nil()
+      expect(live_cursor._state.owned_bufs[1]).to_be_nil()
+      expect(vim.bo[1].buflisted).to_be_true()
     end)
 
     it("does nothing in open mode", function()
@@ -636,6 +643,40 @@ describe("live_cursor", function()
       live_cursor._apply_preview_marker(1004, { action = "read", file = "/proj/jan%2025.md" })
       -- The visible text doubles '%' (statusline meta); the directive keeps one.
       expect(vim.wo[1004].winbar).to_be("%#ClaudeCodeLivePreview#● Claude live preview · reading · jan%%2025.md")
+    end)
+
+    it("puts the window's own winbar and winhighlight back when stripped", function()
+      live_cursor.setup(base_config({ enabled = true, mode = "preview" }))
+      vim._windows[1005] = { buf = 1 }
+      -- What the user (or their winbar/statusline plugin) had on the window.
+      vim.wo[1005].winbar = "MY OWN WINBAR"
+      vim.wo[1005].winhighlight = "Normal:MyNormal"
+
+      live_cursor._apply_preview_marker(1005, { action = "read", file = "/proj/a.lua" })
+      assert.is_truthy(vim.wo[1005].winbar:match("Claude live preview"))
+
+      live_cursor._strip_preview_marker(1005)
+      expect(vim.wo[1005].winbar).to_be("MY OWN WINBAR")
+      expect(vim.wo[1005].winhighlight).to_be("Normal:MyNormal")
+    end)
+
+    it("releasing the preview window undoes the marker and drops the tag", function()
+      live_cursor.setup(base_config({ enabled = true, mode = "preview" }))
+      vim._windows[1006] = { buf = 1 }
+      vim.wo[1006].winbar = ""
+      vim.wo[1006].winhighlight = ""
+      live_cursor._state.preview_win = 1006
+      live_cursor._state.preview_buf = 1
+      live_cursor._apply_preview_marker(1006, { action = "read", file = "/proj/a.lua" })
+      vim.w[1006].claudecode_live_preview = true
+
+      live_cursor._release_preview_window(false)
+
+      expect(vim.wo[1006].winbar).to_be("")
+      expect(vim.wo[1006].winhighlight).to_be("")
+      expect(vim.w[1006].claudecode_live_preview).to_be_nil()
+      expect(live_cursor._state.preview_win).to_be_nil()
+      expect(live_cursor._state.preview_buf).to_be_nil()
     end)
   end)
 
