@@ -129,3 +129,71 @@ describe("TCP server disconnect handling", function()
     assert.spy(callbacks.on_disconnect).was_called(1)
   end)
 end)
+
+describe("TCP port selection", function()
+  local tcp
+  local original_new_tcp
+
+  local function callbacks()
+    return {
+      on_message = spy.new(function() end),
+      on_connect = spy.new(function() end),
+      on_disconnect = spy.new(function() end),
+      on_error = spy.new(function() end),
+    }
+  end
+
+  --- Pretend the first `busy` ports we try are already served by another process:
+  --- bind succeeds (libuv sets SO_REUSEADDR) and only listen reports EADDRINUSE.
+  local function taken_ports(busy)
+    local attempts = 0
+    vim.loop.new_tcp = function()
+      local handle = original_new_tcp()
+      handle.listen = function(_, _, _)
+        attempts = attempts + 1
+        if attempts <= busy then
+          return nil, "EADDRINUSE: address already in use"
+        end
+        return true
+      end
+      return handle
+    end
+    return function()
+      return attempts
+    end
+  end
+
+  before_each(function()
+    package.loaded["claudecode.server.tcp"] = nil
+    tcp = require("claudecode.server.tcp")
+    original_new_tcp = vim.loop.new_tcp
+  end)
+
+  after_each(function()
+    vim.loop.new_tcp = original_new_tcp
+  end)
+
+  it("treats a port it can bind but not listen on as taken", function()
+    taken_ports(1)
+    expect(tcp._port_is_free(10000)).to_be_false()
+    expect(tcp._port_is_free(10001)).to_be_true()
+  end)
+
+  it("moves to the next port instead of failing the whole start", function()
+    local attempts = taken_ports(3)
+    local server, err = tcp.create_server({ port_range = { min = 10000, max = 10010 } }, callbacks(), nil)
+    assert.is_nil(err)
+    assert.is_table(server)
+    expect(attempts()).to_be(4)
+    expect(server.port >= 10000 and server.port <= 10010).to_be_true()
+  end)
+
+  it("reports the last error when no port in the range is free", function()
+    taken_ports(math.huge)
+    local server, err = tcp.create_server({ port_range = { min = 10000, max = 10002 } }, callbacks(), nil)
+    assert.is_nil(server)
+    assert.is_string(err)
+    assert.is_truthy(err:find("No free port", 1, true))
+    assert.is_truthy(err:find("EADDRINUSE", 1, true))
+  end)
+end)

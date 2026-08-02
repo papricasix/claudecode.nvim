@@ -14,61 +14,82 @@ local M = {}
 ---@field on_disconnect function Callback for client disconnections
 ---@field on_error fun(err_msg: string) Callback for errors
 
----Find an available port by attempting to bind
----@param min_port number Minimum port to try
----@param max_port number Maximum port to try
----@return number|nil port Available port number, or nil if none found
-function M.find_available_port(min_port, max_port)
-  if min_port > max_port then
-    return nil -- Or handle error appropriately
-  end
+--- How many ports to try before giving up. The configured range is tens of
+--- thousands wide, so a real machine wins on the first or second attempt; the cap
+--- only stops a pathological "everything is taken" case from freezing Neovim.
+local MAX_BIND_ATTEMPTS = 50
 
+---Candidate ports from the configured range, in random order.
+---@param min_port number
+---@param max_port number
+---@return number[]
+local function shuffled_ports(min_port, max_port)
+  if min_port > max_port then
+    return {}
+  end
   local ports = {}
   for i = min_port, max_port do
     table.insert(ports, i)
   end
-
-  -- Shuffle the ports
   utils.shuffle_array(ports)
+  return ports
+end
 
-  -- Try to bind to a port from the shuffled list
-  for _, port in ipairs(ports) do
-    local test_server = vim.loop.new_tcp()
-    if test_server then
-      local success = test_server:bind("127.0.0.1", port)
-      test_server:close()
-
-      if success then
-        return port
-      end
-    end
-    -- Continue to next port if test_server creation failed or bind failed
+---Whether a port can actually be *served* on.
+---
+---Binding is not enough to answer that. libuv sets `SO_REUSEADDR` on every TCP
+---bind, and on macOS that lets `bind()` succeed against a port another process is
+---already listening on — the conflict only surfaces at `listen()`. A bind-only
+---probe therefore reports a second Neovim's port as free, and the server then
+---dies with EADDRINUSE. So probe with `listen()` as well, then let go.
+---@param port number
+---@return boolean
+function M._port_is_free(port)
+  local probe = vim.loop.new_tcp()
+  if not probe then
+    return false
   end
+  local ok = probe:bind("127.0.0.1", port) and probe:listen(128, function() end)
+  probe:close()
+  return ok and true or false
+end
 
+---Find an available port by attempting to bind and listen
+---@param min_port number Minimum port to try
+---@param max_port number Maximum port to try
+---@return number|nil port Available port number, or nil if none found
+function M.find_available_port(min_port, max_port)
+  for _, port in ipairs(shuffled_ports(min_port, max_port)) do
+    if M._port_is_free(port) then
+      return port
+    end
+  end
   return nil
 end
 
 ---Create and start a TCP server
+---
+---Binds and listens on the real socket rather than probing first and re-binding:
+---the port a probe cleared can be taken by the time we come back for it, and the
+---probe cannot see a foreign listener at bind time anyway (see `_port_is_free`).
+---A port that fails is simply the wrong port — we move to the next candidate
+---instead of aborting the whole start.
 ---@param config ClaudeCodeConfig Server configuration
 ---@param callbacks table Callback functions
 ---@param auth_token string|nil Authentication token for validating connections
 ---@return TCPServer|nil server The server object, or nil on error
 ---@return string|nil error Error message if failed
 function M.create_server(config, callbacks, auth_token)
-  local port = M.find_available_port(config.port_range.min, config.port_range.max)
-  if not port then
-    return nil, "No available ports in range " .. config.port_range.min .. "-" .. config.port_range.max
-  end
-
-  local tcp_server = vim.loop.new_tcp()
-  if not tcp_server then
-    return nil, "Failed to create TCP server"
+  local min_port, max_port = config.port_range.min, config.port_range.max
+  local ports = shuffled_ports(min_port, max_port)
+  if #ports == 0 then
+    return nil, "No available ports in range " .. min_port .. "-" .. max_port
   end
 
   -- Create server object
   local server = {
-    server = tcp_server,
-    port = port,
+    server = nil,
+    port = nil,
     auth_token = auth_token,
     clients = {},
     on_message = callbacks.on_message or function() end,
@@ -77,28 +98,51 @@ function M.create_server(config, callbacks, auth_token)
     on_error = callbacks.on_error or function() end,
   }
 
-  local bind_success, bind_err = tcp_server:bind("127.0.0.1", port)
-  if not bind_success then
-    tcp_server:close()
-    return nil, "Failed to bind to port " .. port .. ": " .. (bind_err or "unknown error")
-  end
+  local attempts = math.min(#ports, MAX_BIND_ATTEMPTS)
+  local last_err
+  for i = 1, attempts do
+    local port = ports[i]
+    local tcp_server = vim.loop.new_tcp()
+    if not tcp_server then
+      return nil, "Failed to create TCP server"
+    end
+    server.server = tcp_server
+    server.port = port
 
-  -- Start listening
-  local listen_success, listen_err = tcp_server:listen(128, function(err)
-    if err then
-      callbacks.on_error("Listen error: " .. err)
-      return
+    local bind_success, bind_err = tcp_server:bind("127.0.0.1", port)
+    if bind_success then
+      local listen_success, listen_err = tcp_server:listen(128, function(err)
+        if err then
+          callbacks.on_error("Listen error: " .. err)
+          return
+        end
+
+        M._handle_new_connection(server)
+      end)
+      if listen_success then
+        return server, nil
+      end
+      last_err = "listen on port " .. port .. " failed: " .. (listen_err or "unknown error")
+    else
+      last_err = "bind to port " .. port .. " failed: " .. (bind_err or "unknown error")
     end
 
-    M._handle_new_connection(server)
-  end)
-
-  if not listen_success then
     tcp_server:close()
-    return nil, "Failed to listen on port " .. port .. ": " .. (listen_err or "unknown error")
+    server.server = nil
+    server.port = nil
+    require("claudecode.logger").debug("server", "port " .. port .. " is taken, trying another (" .. last_err .. ")")
   end
 
-  return server, nil
+  return nil,
+    "No free port in range "
+      .. min_port
+      .. "-"
+      .. max_port
+      .. " after "
+      .. attempts
+      .. " attempts (last error: "
+      .. tostring(last_err)
+      .. ")"
 end
 
 ---Handle a new client connection

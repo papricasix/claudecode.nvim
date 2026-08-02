@@ -409,15 +409,32 @@ end
 
 local rng_seeded = false
 
+---Seed the PRNG once per process, from more than the wall clock.
+---
+---`os.time()` has one-second resolution, so two Neovim instances started within
+---the same second seed identically, shuffle identically, and then pick the very
+---same "random" port — which is how a 55000-port range still manages to collide.
+---Mixing in the pid and a nanosecond clock gives each process its own ordering.
+local function seed_rng()
+  local entropy = os.time()
+  local ok_pid, pid = pcall(vim.fn.getpid)
+  if ok_pid and type(pid) == "number" then
+    entropy = entropy + pid * 7919
+  end
+  local ok_hr, hr = pcall(vim.loop.hrtime)
+  if ok_hr and type(hr) == "number" then
+    entropy = entropy + hr % 1000000007
+  end
+  math.randomseed(math.floor(entropy))
+end
+
 ---Shuffle an array in place using Fisher-Yates algorithm
 ---@param tbl table The array to shuffle
 function M.shuffle_array(tbl)
-  -- Seed the PRNG once per process so port selection order varies across editor
-  -- starts. Seeding lazily on first use (rather than on every call, as a prior
-  -- version did with os.time()) avoids identical orderings within the same
-  -- second while still giving each process a distinct sequence.
+  -- Seeded lazily on first use (rather than on every call, as a prior version did
+  -- with os.time()) so orderings within one process stay distinct.
   if not rng_seeded then
-    math.randomseed(os.time())
+    seed_rng()
     rng_seeded = true
   end
   for i = #tbl, 2, -1 do
