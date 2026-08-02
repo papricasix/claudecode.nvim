@@ -71,11 +71,36 @@ local HIGHLIGHT_LINKS = {
 --- prompt, as opposed to actually asking you something.
 local IDLE_NOTIFICATION = "waiting for your input"
 
---- The frames of the Claude Code CLI's own "working" spinner, offered so a
---- tabline can animate a busy tab the way the CLI animates its own status line:
---- `icons = { busy = require("claudecode.status").SPINNER }`. All six are
---- single-width, so the bar does not jitter as they cycle.
-M.SPINNER = { "·", "✢", "✳", "∗", "✻", "✽" }
+--- The Claude Code CLI's own "working" spinner, for
+--- `icons = { busy = require("claudecode.status").SPINNER }`.
+---
+--- Taken from the CLI itself rather than approximated. It animates six glyphs
+--- and then plays them **backwards** — `[...frames, ...frames.reverse()]` in its
+--- own words — so the motion breathes rather than jumping from the last frame
+--- back to the first; the twelve entries here are that full sequence, doubled
+--- turning points included. All are single-width, so a tabline does not jitter
+--- as they cycle, and the CLI advances one frame per 120ms (our `spinner_ms`
+--- default). On Ghostty it swaps the last glyph for the previous one, which we
+--- mirror off `$TERM` so the tabline matches the terminal it is drawn in.
+local function spinner_frames()
+  local base = { "·", "✢", "✳", "✶", "✻", "✽" }
+  local ok, term = pcall(function()
+    return vim.env and vim.env.TERM or ""
+  end)
+  if ok and term == "xterm-ghostty" then
+    base[6] = "✻"
+  end
+  local frames = {}
+  for i = 1, #base do
+    frames[i] = base[i]
+  end
+  for i = #base, 1, -1 do
+    frames[#frames + 1] = base[i]
+  end
+  return frames
+end
+
+M.SPINNER = spinner_frames()
 
 --- Current animation frame, and the timer advancing it. The timer only runs
 --- while some tab actually shows an animated icon, so an all-idle Neovim ticks

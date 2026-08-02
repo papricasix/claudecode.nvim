@@ -54,6 +54,9 @@ local CONFLICTING_FLAGS = {
 ---@field session_id string The UUID passed to the CLI for this tab.
 ---@field cwd string|nil Directory Claude was launched in (resume is scoped to it).
 ---@field resumed boolean|nil Whether this id came back from a restored session.
+---@field fallback string|nil Last id of this tab's that the CLI wrote a transcript
+--- for, kept so an id that never becomes a conversation cannot cost the tab the
+--- one it had.
 
 --- Live sessions: [tabpage handle] = ClaudeCodeSessionRecord
 local records = {}
@@ -195,6 +198,33 @@ local function transcript_exists(session_id)
   return result
 end
 
+---The id worth handing to a session manager: one the CLI has actually written a
+---transcript for.
+---
+---An id we minted is only a *name* until the user sends their first message —
+---the CLI creates no transcript before that, and `--resume` on such an id fails.
+---Persisting it anyway is what made restores rot: opening a tab's terminal and
+---not talking in it replaced the tab's real conversation with an id that could
+---never come back, so the next session resumed some tabs and started the rest
+---fresh, over and over. So a record also carries the last id of its tab that did
+---exist, and an unproven id falls back to it rather than overwriting it.
+---@param record ClaudeCodeSessionRecord|nil
+---@return string|nil id nil when the tab has nothing resumable.
+local function persistable_id(record)
+  if type(record) ~= "table" or type(record.session_id) ~= "string" or record.session_id == "" then
+    return nil
+  end
+  -- `~= false` so an undeterminable check (no projects dir yet, a glob error)
+  -- keeps the id rather than discarding a conversation over a missing answer.
+  if transcript_exists(record.session_id) ~= false then
+    return record.session_id
+  end
+  if type(record.fallback) == "string" and record.fallback ~= "" and transcript_exists(record.fallback) ~= false then
+    return record.fallback
+  end
+  return nil
+end
+
 ---Whether a command line already picks a conversation itself.
 ---@param cmd_string string|nil
 ---@return boolean
@@ -232,7 +262,8 @@ function M.launch_args(cmd_string, resolved_cwd)
     cwd = ok_cwd and current or nil
   end
 
-  local record = records[tab_id]
+  local previous = records[tab_id]
+  local record = previous
   if not record then
     record = M._claim_pending(tab_id, cwd)
   end
@@ -242,7 +273,9 @@ function M.launch_args(cmd_string, resolved_cwd)
       logger.error("session", "could not generate a session id: " .. tostring(id))
       return ""
     end
-    record = { session_id = id, cwd = cwd }
+    -- Brand new and therefore not resumable yet; keep whatever this tab last had
+    -- so a Claude that is opened and never talked to costs nothing.
+    record = { session_id = id, cwd = cwd, fallback = persistable_id(previous) }
   end
 
   records[tab_id] = record
@@ -304,6 +337,9 @@ function M.note_session_id(tab_id, session_id, cwd)
     session_id = session_id,
     cwd = (type(cwd) == "string" and cwd ~= "" and cwd) or (record and record.cwd) or nil,
     resumed = record and record.resumed or nil,
+    -- The tab just moved to a different conversation (/clear, a manual resume);
+    -- the one it leaves stays the fallback until this one has a transcript.
+    fallback = persistable_id(record),
   }
   logger.debug("session", "tab " .. tostring(tab_id) .. " is running session " .. session_id)
   M.sync_global()
@@ -327,9 +363,13 @@ function M.capture()
     -- Pending entries are included so quitting before ever opening Claude in a
     -- restored tab does not silently drop that tab's conversation.
     local record = records[tab_id] or pending[tab_id]
-    if record and record.session_id then
+    -- Only ids the CLI has a transcript for: see `persistable_id`. A tab whose
+    -- Claude never became a conversation is left out entirely, so it opens fresh
+    -- next time instead of being armed with an id that cannot be resumed.
+    local id = persistable_id(record)
+    if id then
       tabs[tostring(vim.api.nvim_tabpage_get_number(tab_id))] = {
-        session_id = record.session_id,
+        session_id = id,
         cwd = record.cwd,
       }
       any = true

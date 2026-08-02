@@ -257,11 +257,17 @@ describe("status", function()
       expect(status.icon(1)).to_be("a") -- wraps
     end)
 
-    it("ships the CLI's spinner frames, all single-width", function()
-      expect(#status.SPINNER > 1).to_be_true()
-      for _, f in ipairs(status.SPINNER) do
+    it("ships the CLI's spinner as the ping-pong sequence the CLI plays", function()
+      local frames = status.SPINNER
+      expect(#frames).to_be(12) -- six glyphs, then the same six backwards
+      for _, f in ipairs(frames) do
         expect(type(f)).to_be("string")
       end
+      for i = 1, 6 do
+        expect(frames[i]).to_be(frames[13 - i])
+      end
+      expect(frames[1]).to_be("·")
+      expect(frames[4]).to_be("✶")
     end)
 
     it("animates only while a tab shows an animated icon", function()

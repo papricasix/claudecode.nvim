@@ -16,6 +16,17 @@ describe("session_state", function()
     end
   end
 
+  --- Pretend only the listed session ids have a transcript on disk.
+  local function stub_transcripts_for(ids)
+    vim.fn.isdirectory = function()
+      return 1
+    end
+    vim.fn.glob = function(pattern)
+      local id = pattern:match("([^/]+)%.jsonl$")
+      return ids[id] and { "/home/user/.claude/projects/-proj/" .. id .. ".jsonl" } or {}
+    end
+  end
+
   before_each(function()
     if vim and vim._mock and vim._mock.reset then
       vim._mock.reset()
@@ -187,6 +198,38 @@ describe("session_state", function()
       expect(session_state.restore({ version = 99, tabs = { ["1"] = { session_id = "x" } } })).to_be_false()
       expect(session_state.restore("not json at all")).to_be_false()
       expect(session_state.restore(nil)).to_be_false()
+    end)
+
+    it("leaves out a Claude that never became a conversation", function()
+      -- The CLI writes no transcript until the first message, and `--resume` on
+      -- such an id fails. Persisting it armed the tab with something unresumable,
+      -- which is what made restores resume some tabs and start the rest fresh.
+      enable()
+      session_state.launch_args("claude", "/proj")
+      stub_transcripts(false)
+      expect(session_state.capture()).to_be_nil()
+    end)
+
+    it("keeps the tab's last real conversation when the new one has no transcript", function()
+      enable()
+      stub_transcripts_for({ ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"] = true })
+      session_state.note_session_id(1, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "/proj")
+      -- The tab moves on (a /clear, say) before that conversation exists on disk.
+      session_state.note_session_id(1, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "/proj")
+      expect(session_state.capture().tabs["1"].session_id).to_be("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+
+      -- Once the new one is real it takes over.
+      stub_transcripts_for({ ["bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"] = true })
+      expect(session_state.capture().tabs["1"].session_id).to_be("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+    end)
+
+    it("forgets a closed conversation rather than falling back to it", function()
+      enable()
+      stub_transcripts_for({ ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"] = true })
+      session_state.note_session_id(1, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "/proj")
+      expect(session_state.forget(1)).to_be_true()
+      session_state.launch_args("claude", "/proj")
+      expect(session_state.capture()).to_be_nil()
     end)
 
     it("keeps unclaimed restored ids in the next capture", function()

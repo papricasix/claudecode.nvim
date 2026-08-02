@@ -500,7 +500,7 @@ require("claudecode").setup({
 })
 ```
 
-**Animating a working tab.** Any icon may be a list of frames instead of a single glyph, and the plugin cycles it. `status.SPINNER` holds the Claude Code CLI's own spinner frames (`· ✢ ✳ ∗ ✻ ✽`, all single-width so the bar does not jitter):
+**Animating a working tab.** Any icon may be a list of frames instead of a single glyph, and the plugin cycles it. `status.SPINNER` is the Claude Code CLI's own spinner, taken from the CLI rather than approximated: six glyphs played forwards and then backwards — `· ✢ ✳ ✶ ✻ ✽ ✽ ✻ ✶ ✳ ✢ ·` — so the motion breathes instead of jumping from the last frame to the first. All are single-width, so the bar does not jitter, and the CLI's own pace is one frame per 120ms (the `spinner_ms` default). On Ghostty the CLI substitutes the last glyph, which `SPINNER` mirrors off `$TERM`:
 
 ```lua
 status = {
