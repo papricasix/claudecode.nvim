@@ -446,6 +446,8 @@ Every Claude the plugin launches is given a stable conversation id (`claude --se
 vim.keymap.set("n", "<leader>aR", "<cmd>ClaudeCodeSessionRestore!<cr>", { desc = "Restore Claude sessions in every tab" })
 ```
 
+**Only chats you actually had are saved.** The CLI writes a conversation's transcript on your first message, so a Claude you open and never talk to has nothing to resume. Those tabs are left out of the saved session — they open a fresh chat next time instead of being armed with an id that cannot come back — and a tab that had a real conversation before keeps it rather than losing it to the empty one.
+
 **Conversations you close stay closed.** Only chats that were still running when you quit Neovim come back. If you end Claude yourself — `/exit`, `Ctrl-D`, or the process dying — that tab's conversation is forgotten immediately: reopening its terminal starts a fresh chat, and a later session restore won't bring it back either. Hiding the terminal (`:ClaudeCodeClose`, toggling the split) does not end anything, so those chats are unaffected. One gap: the `external` terminal provider runs Claude outside Neovim, where there is no terminal buffer to watch, so a Claude closed there is still treated as restorable.
 
 **[auto-session](https://github.com/rmagatti/auto-session)** — its extra-data hook is a single slot, so compose it (the snippet below is the whole integration):
@@ -508,6 +510,16 @@ status = {
 ```
 
 The timer runs only while some tab actually shows an animated icon — an all-idle Neovim ticks nothing — and never when `auto_redraw = false`, since then the redraw is yours to do.
+
+To match the colour the CLI paints its own spinner in, override the highlight with Claude's clay orange (`--clay: #d97757` in the CLI's palette) — re-applying it on `ColorScheme`, which wipes highlight groups:
+
+```lua
+local function brand()
+  vim.api.nvim_set_hl(0, "ClaudeCodeStatusBusy", { fg = "#d97757" })
+end
+brand()
+vim.api.nvim_create_autocmd("ColorScheme", { callback = brand })
+```
 
 The states, per tab:
 
