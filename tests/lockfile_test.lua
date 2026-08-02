@@ -542,3 +542,118 @@ describe("Lockfile Module", function()
     end)
   end)
 end)
+
+describe("Lockfile stale cleanup", function()
+  -- The stubs below replace io.open/os.remove for the duration of each test, so
+  -- the sweep can be exercised without touching a real (platform-specific) disk.
+  -- luacheck: globals io os
+  local lockfile
+  local files, removed, liveness
+  local orig = {}
+
+  --- Stand in for every filesystem/process call cleanup_stale makes, so the test
+  --- is hermetic and behaves identically on Linux, macOS, and Windows.
+  local function install_stubs()
+    orig.glob = vim.fn.glob
+    orig.kill = vim.loop.kill
+    orig.io_open = io.open
+    orig.os_remove = os.remove
+
+    vim.fn.glob = function()
+      local paths = {}
+      for path in pairs(files) do
+        paths[#paths + 1] = path
+      end
+      table.sort(paths)
+      return paths
+    end
+
+    -- libuv reports the same errnos on every platform: 0 for a live process,
+    -- ESRCH when it is gone, EPERM when it is alive but owned by someone else.
+    vim.loop.kill = function(pid, _)
+      local state = liveness[pid] or "alive"
+      if state == "alive" then
+        return 0
+      elseif state == "dead" then
+        return nil, "ESRCH: no such process"
+      end
+      return nil, "EPERM: operation not permitted"
+    end
+
+    io.open = function(path, mode)
+      local content = files[path]
+      if content == nil then
+        return orig.io_open(path, mode)
+      end
+      return {
+        read = function()
+          return content
+        end,
+        close = function() end,
+      }
+    end
+
+    os.remove = function(path)
+      if files[path] ~= nil then
+        files[path] = nil
+        removed[#removed + 1] = path
+        return true
+      end
+      return orig.os_remove(path)
+    end
+  end
+
+  before_each(function()
+    package.loaded["claudecode.lockfile"] = nil
+    lockfile = require("claudecode.lockfile")
+    lockfile.lock_dir = "/mock/ide"
+    files, removed, liveness = {}, {}, {}
+    install_stubs()
+  end)
+
+  after_each(function()
+    vim.fn.glob = orig.glob
+    vim.loop.kill = orig.kill
+    io.open = orig.io_open
+    os.remove = orig.os_remove
+  end)
+
+  local function lock(port, body)
+    files["/mock/ide/" .. port .. ".lock"] = body
+  end
+
+  it("removes only locks whose process is provably gone", function()
+    lock(10001, '{"pid":999999,"ideName":"Neovim"}')
+    lock(10002, '{"pid":4242,"ideName":"Neovim"}')
+    liveness[999999] = "dead"
+    liveness[4242] = "alive"
+
+    assert(lockfile.cleanup_stale() == 1)
+    assert(removed[1] == "/mock/ide/10001.lock")
+    assert(files["/mock/ide/10002.lock"] ~= nil)
+  end)
+
+  it("keeps a lock whose process exists but belongs to another user", function()
+    lock(10003, '{"pid":1,"ideName":"Neovim"}')
+    liveness[1] = "eperm"
+
+    assert(lockfile.cleanup_stale() == 0)
+    assert(files["/mock/ide/10003.lock"] ~= nil)
+  end)
+
+  it("leaves alone a lock it cannot read a pid from", function()
+    lock(10004, "not json at all")
+    lock(10005, '{"ideName":"Neovim"}')
+
+    assert(lockfile.cleanup_stale() == 0)
+    assert(files["/mock/ide/10004.lock"] ~= nil)
+    assert(files["/mock/ide/10005.lock"] ~= nil)
+  end)
+
+  it("survives a lock directory that cannot be listed", function()
+    vim.fn.glob = function()
+      error("no such directory")
+    end
+    assert(lockfile.cleanup_stale() == 0)
+  end)
+end)

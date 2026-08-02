@@ -19,38 +19,10 @@ end
 
 M.lock_dir = get_lock_dir()
 
----Read n random bytes from a cryptographically secure source.
----Tries libuv's OS CSPRNG first, then falls back to /dev/urandom.
----Never falls back to math.random: a weak token is worse than a startup error.
----@param n number The number of random bytes to read
----@return string bytes A string of exactly n random bytes
-local function get_random_bytes(n)
-  -- Prefer libuv's uv_random (OS CSPRNG). Use vim.loop.random (available on
-  -- Neovim 0.8+) rather than vim.uv.random (only aliased on 0.10+).
-  if vim.loop and vim.loop.random then
-    local ok, bytes = pcall(vim.loop.random, n)
-    if ok and type(bytes) == "string" and #bytes == n then
-      return bytes
-    end
-  end
-
-  -- Fallback: read directly from the kernel CSPRNG.
-  local file = io.open("/dev/urandom", "rb")
-  if file then
-    local bytes = file:read(n)
-    file:close()
-    if type(bytes) == "string" and #bytes == n then
-      return bytes
-    end
-  end
-
-  error("Failed to obtain " .. n .. " bytes of secure random data (no vim.loop.random or readable /dev/urandom)")
-end
-
 ---Generate a cryptographically secure authentication token.
 ---@return string token A 32-character lowercase hex string (128 bits of entropy)
 local function generate_auth_token()
-  local bytes = get_random_bytes(16)
+  local bytes = require("claudecode.utils").random_bytes(16)
 
   -- Hex-encode the random bytes into a 32-character lowercase string.
   local token = bytes:gsub(".", function(c)
@@ -225,6 +197,73 @@ function M.remove(port)
   end
 
   return true
+end
+
+---Whether a process is still running.
+---
+---`uv.kill(pid, 0)` sends no signal; it only asks whether the process exists, and
+---libuv reports the same errnos on Linux, macOS, and Windows. The distinction
+---that matters is `EPERM` — the process is alive but owned by someone else — so
+---only an explicit `ESRCH` counts as dead. Anything else (a platform where the
+---call is unsupported, an unexpected errno) is treated as alive, because the
+---cost of guessing wrong is deleting a lock another editor is still using.
+---@param pid number
+---@return boolean
+local function pid_is_alive(pid)
+  local called, ok, err = pcall(vim.loop.kill, pid, 0)
+  if not called or ok then
+    return true
+  end
+  return tostring(err or ""):find("ESRCH", 1, true) == nil
+end
+
+---The pid recorded in a lock file, if it can be read.
+---@param path string
+---@return number|nil
+local function read_lock_pid(path)
+  local file = io.open(path, "r")
+  if not file then
+    return nil
+  end
+  local content = file:read("*all")
+  file:close()
+  if not content or content == "" then
+    return nil
+  end
+  local ok, data = pcall(vim.json.decode, content)
+  if not ok or type(data) ~= "table" then
+    return nil
+  end
+  return tonumber(data.pid)
+end
+
+---Delete lock files whose owning process is gone.
+---
+---A lock is removed on `VimLeavePre`, which a crash or `kill -9` never reaches,
+---so dead entries would otherwise pile up forever in a directory the Claude CLI
+---scans. That scan only happens when `CLAUDE_CODE_SSE_PORT` is unset (our server
+---failed to start), where a dead lock costs the CLI a failed connection.
+---
+---The directory is shared with every other editor and user, so this is
+---deliberately timid: a lock is removed only when its pid is *provably* gone, and
+---one we cannot parse is always left alone.
+---@return number removed How many lock files were deleted.
+function M.cleanup_stale()
+  local ok, entries = pcall(vim.fn.glob, M.lock_dir .. "/*.lock", true, true)
+  if not ok or type(entries) ~= "table" then
+    return 0
+  end
+
+  local removed = 0
+  for _, path in ipairs(entries) do
+    local pid = read_lock_pid(path)
+    if pid and not pid_is_alive(pid) then
+      if pcall(os.remove, path) then
+        removed = removed + 1
+      end
+    end
+  end
+  return removed
 end
 
 ---Update the lock file for the given port
