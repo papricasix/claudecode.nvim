@@ -236,6 +236,73 @@ describe("live_cursor", function()
       expect(shown[1].opts.locate_fallback).to_be("foo\nbar")
     end)
 
+    it("previews a Write from the payload content, not the (not-yet-written) file", function()
+      package.loaded["claudecode.diff"] = {
+        is_live_for_file = function()
+          return false
+        end,
+      }
+      local written = {}
+      live_cursor.show_write = function(file, content, before)
+        table.insert(written, { file = file, content = content, before = before })
+        return true
+      end
+      live_cursor.dispatch({
+        hook_event_name = "PreToolUse",
+        tool_name = "Write",
+        tool_input = { file_path = "/does/not/exist.lua", content = "local a = 1\n" },
+      })
+      expect(#written).to_be(1)
+      expect(written[1].file).to_be("/does/not/exist.lua")
+      expect(written[1].content).to_be("local a = 1\n")
+      -- Nothing on disk yet: the pre-write image is empty, so the whole file
+      -- renders as an addition.
+      expect(written[1].before).to_be("")
+      -- The empty file buffer is never opened.
+      expect(#shown).to_be(0)
+    end)
+
+    it("falls back to the line highlight for a Write with no content payload", function()
+      package.loaded["claudecode.diff"] = {
+        is_live_for_file = function()
+          return false
+        end,
+      }
+      local called = false
+      live_cursor.show_write = function()
+        called = true
+        return true
+      end
+      live_cursor.dispatch({
+        hook_event_name = "PreToolUse",
+        tool_name = "Write",
+        tool_input = { file_path = "/x" },
+      })
+      expect(called).to_be_false()
+      expect(#shown).to_be(1)
+      expect(shown[1].opts.start_line).to_be(1)
+    end)
+
+    it("does not take the whole-file path for an Edit", function()
+      package.loaded["claudecode.diff"] = {
+        is_live_for_file = function()
+          return false
+        end,
+      }
+      local called = false
+      live_cursor.show_write = function()
+        called = true
+        return true
+      end
+      live_cursor.dispatch({
+        hook_event_name = "PreToolUse",
+        tool_name = "Edit",
+        tool_input = { file_path = "/x", old_string = "foo", new_string = "bar", content = "whole" },
+      })
+      expect(called).to_be_false()
+      expect(#shown).to_be(1)
+    end)
+
     it("ignores events without a file path", function()
       live_cursor.dispatch({ hook_event_name = "PreToolUse", tool_name = "Read", tool_input = {} })
       expect(#shown).to_be(0)
@@ -592,6 +659,16 @@ describe("live_cursor", function()
       local s, e = live_cursor._locate_block(buf, "beta")
       expect(s).to_be(2)
       expect(e).to_be(2)
+    end)
+
+    it("matches a CRLF snippet against the LF lines readfile gives us", function()
+      -- Claude reports a Windows file's text with CRLF line endings, but every
+      -- buffer/readfile line we compare against has already had the CR stripped.
+      -- Without normalising, nothing would ever match on Windows.
+      local buf = set_buf({ "alpha", "beta", "gamma" })
+      local s, e = live_cursor._locate_block(buf, "beta\r\ngamma\r\n")
+      expect(s).to_be(2)
+      expect(e).to_be(3)
     end)
 
     it("returns nil when the block is not present", function()

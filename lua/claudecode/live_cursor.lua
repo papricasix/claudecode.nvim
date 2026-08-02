@@ -63,6 +63,14 @@ local function plan_enabled()
   return ok and pv.is_enabled() == true
 end
 
+--- Whether session persistence wants the launch hook injected, so the CLI reports
+--- the session id it actually runs under.
+---@return boolean
+local function session_enabled()
+  local ok, ss = pcall(require, "claudecode.session_state")
+  return ok and ss.is_enabled() == true
+end
+
 --------------------------------------------------------------------------------
 -- Setup
 --------------------------------------------------------------------------------
@@ -101,7 +109,8 @@ end
 function M.build_launch_injection()
   local lc_on = is_enabled()
   local plan_on = plan_enabled()
-  if not lc_on and not plan_on then
+  local session_on = session_enabled()
+  if not lc_on and not plan_on and not session_on then
     return nil
   end
 
@@ -148,14 +157,20 @@ function M.build_launch_injection()
   if plan_on then
     table.insert(pre_tools, "ExitPlanMode")
   end
-  local settings = {
-    hooks = {
-      -- For the file tools we use only PreToolUse: a PostToolUse would clear the
-      -- highlight the instant a near-instant Read finishes, so live-cursor relies
-      -- on its inactivity timer instead.
-      PreToolUse = { { matcher = table.concat(pre_tools, "|"), hooks = { hook } } },
-    },
-  }
+  local settings = { hooks = {} }
+  if #pre_tools > 0 then
+    -- For the file tools we use only PreToolUse: a PostToolUse would clear the
+    -- highlight the instant a near-instant Read finishes, so live-cursor relies
+    -- on its inactivity timer instead.
+    -- Only registered when some feature actually wants tool events: an empty
+    -- matcher would match *every* tool call and fire the hook for nothing.
+    settings.hooks.PreToolUse = { { matcher = table.concat(pre_tools, "|"), hooks = { hook } } }
+  end
+  if session_on then
+    -- SessionStart carries the id the CLI runs under (including after /clear or a
+    -- manual --resume), which is what session persistence stores per tab.
+    settings.hooks.SessionStart = { { hooks = { hook } } }
+  end
   if plan_on then
     -- For the plan view, PostToolUse(ExitPlanMode) is the "user accepted" signal
     -- that closes the plan window. Scoped to ExitPlanMode so it never fires for
@@ -247,8 +262,24 @@ local function edit_texts(input, tool)
   if tool == "MultiEdit" and type(input.edits) == "table" and type(input.edits[1]) == "table" then
     return input.edits[1].new_string, input.edits[1].old_string
   end
-  -- Edit carries new/old_string; Write has neither (whole-file) -> nil, nil.
+  -- Edit carries new/old_string; Write has neither (it carries whole-file
+  -- `content` instead, handled separately) -> nil, nil.
   return input.new_string, input.old_string
+end
+
+---The file's current on-disk content, as one string. Returns "" when the file
+---does not exist yet — the pre-image of a `Write` that creates it.
+---@param file_path string
+---@return string
+local function disk_text(file_path)
+  if vim.fn.filereadable(file_path) ~= 1 then
+    return ""
+  end
+  local ok, lines = pcall(vim.fn.readfile, file_path)
+  if not ok or type(lines) ~= "table" then
+    return ""
+  end
+  return table.concat(lines, "\n")
 end
 
 ---Fallback plan-text extractor: the longest string value in a tool_input table.
@@ -275,6 +306,17 @@ end
 function M.dispatch(event, source_tab)
   local tool = event.tool_name
   local ehn = event.hook_event_name
+
+  -- Every hook payload names the session it came from. Recording it makes the
+  -- id we persist per tab authoritative rather than the one we guessed at launch.
+  if type(event.session_id) == "string" then
+    pcall(function()
+      require("claudecode.session_state").note_session_id(source_tab, event.session_id, event.cwd)
+    end)
+  end
+  if ehn == "SessionStart" then
+    return -- carries no tool; it exists purely for the id above
+  end
 
   -- Plan view: ExitPlanMode carries the plan markdown. Routed independently of the
   -- live-cursor enabled gate, since the two features toggle separately. PreToolUse
@@ -341,6 +383,12 @@ function M.dispatch(event, source_tab)
   elseif EDIT_TOOLS[tool] then
     local delay = config.diff_suppress_ms or 250
     local new_text, old_text = edit_texts(input, tool)
+    -- `Write` hands us the whole new file up front, so we never have to find it
+    -- on disk (see M.show_write). Snapshot the pre-write content *now*: the tool
+    -- only runs once this hook returns, so by the time the deferred preview fires
+    -- the file may already hold the new content and would diff to nothing.
+    local content = (tool == "Write" and type(input.content) == "string") and input.content or nil
+    local before = content and disk_text(file) or nil
     vim.defer_fn(function()
       -- Re-check the tab here too: the user may have switched during the delay.
       if wrong_tab(source_tab) then
@@ -350,6 +398,10 @@ function M.dispatch(event, source_tab)
       local diff = get_diff()
       if diff and diff.is_live_for_file and diff.is_live_for_file(file) then
         logger.debug("live_cursor", tool, file, "suppressed (review diff open)")
+        return
+      end
+      -- Whole-file write: render the payload's content directly.
+      if content and M.show_write(file, content, before) then
         return
       end
       -- Prefer a real inline diff (unified.nvim); fall back to the highlight.
@@ -525,18 +577,34 @@ end
 -- Painting
 --------------------------------------------------------------------------------
 
----Split a snippet into lines, dropping the spurious empty final element a
----trailing newline produces.
+---Split text into lines the way `readfile()` does, since every comparison we
+---make is against its output: drop the spurious empty final element a trailing
+---newline produces, and drop the CR of a CRLF file. Without the latter a Windows
+---file's every line differs from its on-disk form and the whole file reads as
+---changed.
+---@param text string
+---@return string[]
+local function split_lines(text)
+  local lines = vim.split(text, "\n", { plain = true })
+  for i, line in ipairs(lines) do
+    if line:sub(-1) == "\r" then
+      lines[i] = line:sub(1, -2)
+    end
+  end
+  if #lines > 1 and lines[#lines] == "" then
+    table.remove(lines)
+  end
+  return lines
+end
+
+---`split_lines` for an optional snippet: nil in, nil out.
 ---@param text string|nil
 ---@return string[]|nil
 local function snippet_lines(text)
   if type(text) ~= "string" or text == "" then
     return nil
   end
-  local lines = vim.split(text, "\n", { plain = true })
-  if #lines > 1 and lines[#lines] == "" then
-    table.remove(lines)
-  end
+  local lines = split_lines(text)
   if #lines == 0 then
     return nil
   end
@@ -886,6 +954,78 @@ function M.show(file_path, opts)
   reap_owned()
 end
 
+---Load `lines` into the reusable scratch preview buffer and show it in the
+---resolved preview window, without moving focus. Returns nil when there is no
+---window to preview into or the buffer could not be created.
+---@param file_path string Only used to pick the filetype.
+---@param lines string[]
+---@return integer|nil win
+---@return integer|nil buf
+local function scratch_preview(file_path, lines)
+  local win = resolve_window()
+  if not win then
+    return nil
+  end
+
+  -- Scratch buffer holding the new content (reused across edits).
+  local buf = state.diff_buf
+  if not buf or not vim.api.nvim_buf_is_valid(buf) then
+    buf = vim.api.nvim_create_buf(false, true)
+    if not buf or buf == 0 then
+      return nil
+    end
+    pcall(vim.api.nvim_buf_set_option, buf, "buftype", "nofile")
+    pcall(vim.api.nvim_buf_set_option, buf, "bufhidden", "hide")
+    pcall(vim.api.nvim_buf_set_option, buf, "swapfile", false)
+    state.diff_buf = buf
+  end
+  clear_unified(buf)
+  pcall(vim.api.nvim_buf_set_option, buf, "modifiable", true)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  local d = get_diff()
+  local ft = d and d.detect_filetype and d.detect_filetype(file_path, nil)
+  if ft and ft ~= "" then
+    pcall(vim.api.nvim_set_option_value, "filetype", ft, { buf = buf })
+  end
+
+  -- Drop any flat highlight from a previous read before switching to the diff.
+  M.clear()
+  state.last_buf = nil
+  pcall(vim.api.nvim_win_set_buf, win, buf)
+  return win, buf
+end
+
+---Render the inline unified diff of the scratch buffer against `old_text` and
+---scroll the change into view. Returns false if unified.nvim refused it.
+---@param win integer
+---@param buf integer
+---@param old_text string The pre-change content of the whole file.
+---@param anchor integer 1-based line to scroll to if unified reports no hunks.
+---@param anchor_len integer How many lines that anchor spans.
+---@return boolean ok
+local function apply_unified(win, buf, old_text, anchor, anchor_len)
+  ensure_unified()
+  local unified_diff = require("unified.diff")
+  if not pcall(unified_diff.show_against_text, buf, old_text) then
+    return false
+  end
+
+  -- Scroll the change into view the way the review diff does: centered when the
+  -- whole change — the deleted lines unified.nvim renders as virtual lines
+  -- included — fits the window, otherwise pinned with its first changed line at
+  -- the top. Falls back to the flat-highlight scrolling if that isn't available.
+  local hunks = vim.b[buf].unified_hunks or {}
+  local row = math.max(1, math.min(hunks[1] or anchor, vim.api.nvim_buf_line_count(buf)))
+  local d = get_diff()
+  if d and d.center_diff_region then
+    pcall(vim.api.nvim_win_set_cursor, win, { row, 0 })
+    d.center_diff_region(win, buf)
+  else
+    scroll_into_view(win, row, anchor_len)
+  end
+  return true
+end
+
 ---Show an inline unified diff for an edit, in the resolved preview window.
 ---Reconstructs the pre-edit file (post-edit content with new_string swapped back
 ---to old_string at its located position) and renders the real diff via
@@ -918,49 +1058,13 @@ function M.show_diff(file_path, new_string, old_string)
   -- Reconstruct the pre-edit file: swap the new block back to old_string.
   local old_text = table.concat(reconstruct_old(file_lines, ls, le, snippet_lines(old_string)), "\n")
 
-  local win = resolve_window()
-  if not win then
+  local win, buf = scratch_preview(file_path, file_lines)
+  if not win or not buf then
     return false
   end
-
-  -- Scratch buffer holding the new content (reused across edits).
-  local buf = state.diff_buf
-  if not buf or not vim.api.nvim_buf_is_valid(buf) then
-    buf = vim.api.nvim_create_buf(false, true)
-    if not buf or buf == 0 then
-      return false
-    end
-    pcall(vim.api.nvim_buf_set_option, buf, "buftype", "nofile")
-    pcall(vim.api.nvim_buf_set_option, buf, "bufhidden", "hide")
-    pcall(vim.api.nvim_buf_set_option, buf, "swapfile", false)
-    state.diff_buf = buf
-  end
-  clear_unified(buf)
-  pcall(vim.api.nvim_buf_set_option, buf, "modifiable", true)
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, file_lines)
-  local d = get_diff()
-  local ft = d and d.detect_filetype and d.detect_filetype(file_path, nil)
-  if ft and ft ~= "" then
-    pcall(vim.api.nvim_set_option_value, "filetype", ft, { buf = buf })
-  end
-
-  -- Drop any flat highlight from a previous read before switching to the diff.
-  M.clear()
-  state.last_buf = nil
-  pcall(vim.api.nvim_win_set_buf, win, buf)
-
-  ensure_unified()
-  local unified_diff = require("unified.diff")
-  local rok = pcall(unified_diff.show_against_text, buf, old_text)
-  if not rok then
+  if not apply_unified(win, buf, old_text, ls, le - ls + 1) then
     return false
   end
-
-  -- Scroll the first changed hunk into view. A short change is centered (which
-  -- keeps leading deleted lines in the upper half); a long one is pinned near the
-  -- top with headroom (which keeps those deleted virtual lines on screen too).
-  local hunks = vim.b[buf].unified_hunks or {}
-  scroll_into_view(win, math.max(1, math.min(hunks[1] or ls, vim.api.nvim_buf_line_count(buf))), le - ls + 1)
 
   schedule_preview_marker(win, { action = "write", file = file_path })
   arm_clear_timer()
@@ -968,6 +1072,58 @@ function M.show_diff(file_path, new_string, old_string)
   -- scratch diff buffer took the window); reap it and any earlier stragglers.
   reap_owned()
   logger.debug("live_cursor", "edit diff for", file_path, "block", ls .. "-" .. le)
+  return true
+end
+
+---Preview a whole-file `Write`.
+---
+---`Write` fires its PreToolUse hook *before* the tool runs, so for a file Claude
+---is creating there is nothing on disk to open — previewing the path yields an
+---empty buffer, and it stays empty because the write may land much later (after
+---you answer the permission prompt) or never (if you reject it). The payload
+---already carries the entire new file, so we render that instead: the content in
+---the scratch buffer, diffed against the pre-write content (`""` for a file being
+---created, so every line reads as an addition). When unified.nvim is absent we
+---still show the content, just without the diff colouring.
+---
+---The auto-close timer is armed here, i.e. from the moment the content is on
+---screen, and a later preview replaces this one as usual.
+---@param file_path string
+---@param content string Whole new file content, from the tool payload.
+---@param before string|nil Pre-write disk content, snapshotted at dispatch time
+---       (by the time we run, the write may already have landed). Read here if omitted.
+---@return boolean ok
+function M.show_write(file_path, content, before)
+  local lines = vim.split(content or "", "\n", { plain = true })
+  -- A trailing newline (nearly every file has one) leaves a spurious empty final
+  -- element; the buffer's own end-of-file newline supplies it.
+  if #lines > 1 and lines[#lines] == "" then
+    table.remove(lines)
+  end
+
+  local win, buf = scratch_preview(file_path, lines)
+  if not win or not buf then
+    return false
+  end
+
+  local diffed = false
+  if unified_available() then
+    diffed = apply_unified(win, buf, before or disk_text(file_path), 1, #lines)
+  end
+  if not diffed then
+    scroll_into_view(win, 1, 1) -- plain content: show it from the top
+  end
+
+  schedule_preview_marker(win, { action = "write", file = file_path })
+  arm_clear_timer()
+  reap_owned()
+  logger.debug(
+    "live_cursor",
+    "write preview for",
+    file_path,
+    tostring(#lines) .. " lines",
+    "diffed=" .. tostring(diffed)
+  )
   return true
 end
 
