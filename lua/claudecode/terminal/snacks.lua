@@ -61,8 +61,14 @@ local function build_opts(config, env_table, focus)
   return {
     env = env_table,
     cwd = config.cwd,
+    -- `start_insert` is a one-shot "enter insert now", so it follows `focus`: an
+    -- unfocused open must not drag you into the terminal. `auto_insert` is a
+    -- different thing — it installs a lasting BufEnter autocmd that starts insert
+    -- whenever you step into the terminal window later — so it must NOT follow
+    -- `focus`, or a terminal opened without focus (the session-restore path opens
+    -- every tab's Claude that way) would never capture your typing again.
     start_insert = focus,
-    auto_insert = focus,
+    auto_insert = true,
     auto_close = false,
     win = vim.tbl_deep_extend("force", {
       position = config.split_side,
