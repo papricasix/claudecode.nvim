@@ -16,7 +16,7 @@
 ---   Notification              -> waiting  (permission prompt), or idle when the
 ---                                         message is the "waiting for your input"
 ---                                         idle nudge
----   Stop                      -> idle     (Claude finished its turn)
+---   Stop                      -> done     (finished; `idle` if you were looking)
 ---   SessionStart / SessionEnd -> idle / none
 ---
 --- `PostToolUse` matters more than it looks: it is what ends a permission wait
@@ -24,6 +24,11 @@
 --- result. That is also why enabling this feature widens the injected `PreToolUse`
 --- matcher to every tool — the file-tool matcher the live cursor uses would leave
 --- a `Bash` call reading as idle.
+---
+--- `done` versus `idle` is the "you have not read this yet" distinction: a turn
+--- that ends while you are on some other tab (or with Neovim in the background)
+--- lands in `done`, and arriving at the tab — or refocusing Neovim — clears it to
+--- `idle`. A tabline can therefore shout only about answers you have not seen.
 ---
 --- State is keyed by tabpage *handle* (what `nvim_list_tabpages()` hands you), so
 --- a tabline can ask about the tab it is drawing. It is intentionally not keyed
@@ -33,7 +38,7 @@
 --- Consuming it:
 ---
 ---   local status = require("claudecode.status")
----   status.get_state(tab)   -- "busy" | "waiting" | "idle" | "none"
+---   status.get_state(tab)   -- "busy" | "waiting" | "done" | "idle" | "none"
 ---   status.icon(tab)        -- the configured glyph for that state
 ---   status.hl_group(tab)    -- highlight group for that state (nil when "none")
 ---   status.all()            -- { [tabpage] = ClaudeCodeStatus }
@@ -52,11 +57,12 @@ local config = nil
 --- Live state: [tabpage handle] = ClaudeCodeStatus. A tab with no entry is "none".
 local entries = {}
 
-local DEFAULT_ICONS = { busy = "●", waiting = "◆", idle = "○", none = "" }
+local DEFAULT_ICONS = { busy = "●", waiting = "◆", done = "●", idle = "○", none = "" }
 
 local DEFAULT_HIGHLIGHTS = {
   busy = "ClaudeCodeStatusBusy",
   waiting = "ClaudeCodeStatusWaiting",
+  done = "ClaudeCodeStatusDone",
   idle = "ClaudeCodeStatusIdle",
 }
 
@@ -64,6 +70,7 @@ local DEFAULT_HIGHLIGHTS = {
 local HIGHLIGHT_LINKS = {
   ClaudeCodeStatusBusy = "DiagnosticInfo",
   ClaudeCodeStatusWaiting = "DiagnosticWarn",
+  ClaudeCodeStatusDone = "DiagnosticOk",
   ClaudeCodeStatusIdle = "Comment",
 }
 
@@ -71,17 +78,6 @@ local HIGHLIGHT_LINKS = {
 --- prompt, as opposed to actually asking you something.
 local IDLE_NOTIFICATION = "waiting for your input"
 
---- The Claude Code CLI's own "working" spinner, for
---- `icons = { busy = require("claudecode.status").SPINNER }`.
----
---- Taken from the CLI itself rather than approximated. It animates six glyphs
---- and then plays them **backwards** — `[...frames, ...frames.reverse()]` in its
---- own words — so the motion breathes rather than jumping from the last frame
---- back to the first; the twelve entries here are that full sequence, doubled
---- turning points included. All are single-width, so a tabline does not jitter
---- as they cycle, and the CLI advances one frame per 120ms (our `spinner_ms`
---- default). On Ghostty it swaps the last glyph for the previous one, which we
---- mirror off `$TERM` so the tabline matches the terminal it is drawn in.
 ---Whether this terminal draws emoji-capable codepoints with the colour emoji
 ---font instead of the text font. `✳` (U+2733) is the one frame Unicode lists as
 ---emoji-capable, and Windows Terminal (PowerShell *and* WSL Neovim, hence the
@@ -98,6 +94,17 @@ local function prefers_text_glyphs()
   return (env.WT_SESSION or "") ~= "" or (env.ConEmuANSI or "") ~= ""
 end
 
+--- The Claude Code CLI's own "working" spinner, for
+--- `icons = { busy = require("claudecode.status").SPINNER }`.
+---
+--- Taken from the CLI itself rather than approximated. It animates six glyphs
+--- and then plays them **backwards** — `[...frames, ...frames.reverse()]` in its
+--- own words — so the motion breathes rather than jumping from the last frame
+--- back to the first; the twelve entries here are that full sequence, doubled
+--- turning points included. All are single-width, so a tabline does not jitter
+--- as they cycle, and the CLI advances one frame per 120ms (our `spinner_ms`
+--- default). On Ghostty it swaps the last glyph for the previous one, which we
+--- mirror off `$TERM` so the tabline matches the terminal it is drawn in.
 local function spinner_frames()
   local base = { "·", "✢", "✳", "✶", "✻", "✽" }
   local ok, term = pcall(function()
@@ -138,6 +145,41 @@ function M.setup(full_config)
   for group, link in pairs(HIGHLIGHT_LINKS) do
     pcall(vim.api.nvim_set_hl, 0, group, { link = link, default = true })
   end
+  M.ensure_visit_watcher()
+end
+
+---Watch for the user reading a finished answer: arriving at a tab clears its
+---`done`, and so does coming back to Neovim, since an answer that landed while
+---the editor was in the background was never actually seen.
+function M.ensure_visit_watcher()
+  if not M.is_enabled() then
+    return
+  end
+  pcall(function()
+    local group = vim.api.nvim_create_augroup("ClaudeCodeStatusVisit", { clear = true })
+    vim.api.nvim_create_autocmd({ "TabEnter", "TabNewEntered" }, {
+      group = group,
+      callback = function()
+        M.mark_read()
+      end,
+      desc = "Mark this tab's finished Claude answer as read",
+    })
+    vim.api.nvim_create_autocmd("FocusGained", {
+      group = group,
+      callback = function()
+        M.set_focused(true)
+        M.mark_read()
+      end,
+      desc = "Coming back to Neovim reads the current tab's Claude answer",
+    })
+    vim.api.nvim_create_autocmd("FocusLost", {
+      group = group,
+      callback = function()
+        M.set_focused(false)
+      end,
+      desc = "An answer arriving while Neovim is in the background was not seen",
+    })
+  end)
 end
 
 ---Whether status tracking is on. When off nothing is recorded and every tab
@@ -276,6 +318,35 @@ local function sync_spinner()
   end
 end
 
+---Whether Neovim itself has focus. Terminals that report focus keep this
+---honest; one that does not simply leaves it true, which degrades to "the tab
+---you are on counts as seen".
+local focused = true
+
+---The state a finished turn lands in: `idle` when you were looking at that tab
+---when the answer arrived, `done` when it landed somewhere you were not — the
+---distinction between "Claude is done" and "Claude is done and you have not seen
+---it yet", which is the whole point of a tab indicator.
+---@param tab integer|nil Tabpage the answer arrived in.
+---@return ClaudeCodeStatusState
+local function finished_state(tab)
+  local resolved = normalize_tab(tab)
+  if not resolved or not focused then
+    return "done"
+  end
+  local ok, current = pcall(vim.api.nvim_get_current_tabpage)
+  if ok and current == resolved then
+    return "idle"
+  end
+  return "done"
+end
+
+---Record whether Neovim has focus (wired to `FocusGained`/`FocusLost`).
+---@param value boolean
+function M.set_focused(value)
+  focused = value ~= false
+end
+
 ---Tell the world a tab changed, and refresh the UI that draws it.
 ---@param entry ClaudeCodeStatus
 ---@param prev ClaudeCodeStatusState
@@ -372,13 +443,29 @@ function M.note(event, source_tab)
     local message = type(event.message) == "string" and event.message or ""
     if message:lower():find(IDLE_NOTIFICATION, 1, true) then
       -- Not a question: the "you have been idle" nudge Claude sends at the prompt.
-      apply(source_tab, "idle", { session_id = session_id })
+      apply(source_tab, finished_state(source_tab), { session_id = session_id })
     else
       apply(source_tab, "waiting", { tool = tool, message = message ~= "" and message or nil, session_id = session_id })
     end
   elseif ehn == "Stop" then
-    apply(source_tab, "idle", { session_id = session_id })
+    apply(source_tab, finished_state(source_tab), { session_id = session_id })
   end
+end
+
+---Mark a tab's finished answer as read, which is what turns `done` into `idle`.
+---Wired to the user arriving at the tab (`TabEnter`) or coming back to Neovim
+---(`FocusGained`); `waiting` is deliberately untouched, since looking at a
+---question is not answering it.
+---@param tab integer|nil Defaults to the current tab.
+---@return boolean marked Whether a tab actually went from `done` to `idle`.
+function M.mark_read(tab)
+  local resolved = normalize_tab(tab)
+  local entry = resolved and entries[resolved]
+  if not entry or entry.state ~= "done" then
+    return false
+  end
+  apply(resolved, "idle", { session_id = entry.session_id })
+  return true
 end
 
 ---Note that a Claude terminal was launched in a tab, so it reads as present

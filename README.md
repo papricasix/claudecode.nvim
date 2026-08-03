@@ -488,10 +488,11 @@ If you run one Claude per tab, this answers "which tab is working, and which one
 require("claudecode").setup({
   status = {
     enabled = true, -- opt-in
-    icons = { busy = "●", waiting = "◆", idle = "○", none = "" },
+    icons = { busy = "●", waiting = "◆", done = "●", idle = "○", none = "" },
     highlights = {
       busy = "ClaudeCodeStatusBusy", -- links to DiagnosticInfo by default
       waiting = "ClaudeCodeStatusWaiting", -- links to DiagnosticWarn
+      done = "ClaudeCodeStatusDone", -- links to DiagnosticOk
       idle = "ClaudeCodeStatusIdle", -- links to Comment
     },
     auto_redraw = true, -- redraw the tabline/statusline on every change
@@ -527,8 +528,11 @@ The states, per tab:
 | --------- | --------------------------------------------------------------------------- |
 | `busy`    | Claude is working: your prompt is in flight, or a tool is running           |
 | `waiting` | Claude needs **you**: a permission prompt, or a plan waiting to be accepted |
-| `idle`    | Claude is up and has finished its turn — ready for your next prompt         |
+| `done`    | Finished, and you have not looked at the answer yet                         |
+| `idle`    | Finished and seen — ready for your next prompt                              |
 | `none`    | No Claude in that tab (never launched, or it exited)                        |
+
+`done` versus `idle` is the "unread" distinction: a turn that ends while you are on another tab lands in `done`, and arriving at that tab clears it to `idle` — so the filled glyph marks answers you have not read, and the hollow one everything you have. An answer that arrives while Neovim itself is in the background counts as unread too (`FocusLost`/`FocusGained`), since you were not there to see it. Looking at a tab never clears `waiting`: reading a question is not answering it.
 
 Reading it:
 

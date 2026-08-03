@@ -61,11 +61,12 @@ M.defaults = {
     -- A glyph per state, or a list of frames to animate that state:
     --   icons = { busy = require("claudecode.status").SPINNER }
     -- animates a working tab with the CLI's own spinner.
-    icons = { busy = "●", waiting = "◆", idle = "○", none = "" },
+    icons = { busy = "●", waiting = "◆", done = "●", idle = "○", none = "" },
     spinner_ms = 120, -- frame interval for animated icons (0 disables animation)
     highlights = {
       busy = "ClaudeCodeStatusBusy", -- defaults to a link to DiagnosticInfo
       waiting = "ClaudeCodeStatusWaiting", -- defaults to a link to DiagnosticWarn
+      done = "ClaudeCodeStatusDone", -- finished but unread; defaults to a link to DiagnosticOk
       idle = "ClaudeCodeStatusIdle", -- defaults to a link to Comment
     },
     auto_redraw = true, -- redraw the tabline/statusline whenever a tab's state changes
@@ -357,8 +358,8 @@ function M.validate(config)
         assert(type(st[field]) == "table", "status." .. field .. " must be a table")
         for key, value in pairs(st[field]) do
           assert(
-            key == "busy" or key == "waiting" or key == "idle" or key == "none",
-            "status." .. field .. " keys must be 'busy', 'waiting', 'idle' or 'none'"
+            key == "busy" or key == "waiting" or key == "done" or key == "idle" or key == "none",
+            "status." .. field .. " keys must be 'busy', 'waiting', 'done', 'idle' or 'none'"
           )
           -- Icons may also be a list of frames to animate; highlights may not.
           if field == "icons" and type(value) == "table" then

@@ -22,7 +22,7 @@
 ---@field on_new_file_reject ClaudeCodeNewFileRejectBehavior Behavior when rejecting a new-file diff
 
 -- Per-tab Claude activity state (see claudecode.status)
----@alias ClaudeCodeStatusState "busy"|"waiting"|"idle"|"none"
+---@alias ClaudeCodeStatusState "busy"|"waiting"|"done"|"idle"|"none"
 
 -- Per-tab Claude activity, as handed to consumers of claudecode.status
 ---@class ClaudeCodeStatus

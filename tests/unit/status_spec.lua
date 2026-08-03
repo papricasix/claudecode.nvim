@@ -155,16 +155,16 @@ describe("status", function()
 
     it("keeps each tab's Claude separate", function()
       note("PreToolUse", { tool_name = "Bash" }, 1)
-      note("Stop", {}, 2)
+      note("Stop", {}, 2) -- finished on a tab we are not looking at
       expect(status.get_state(1)).to_be("busy")
-      expect(status.get_state(2)).to_be("idle")
+      expect(status.get_state(2)).to_be("done")
     end)
 
     it("lists only the tabs that have a Claude", function()
       note("Stop", {}, 2)
       local all = status.all()
       expect(all[1]).to_be_nil()
-      expect(all[2].state).to_be("idle")
+      expect(all[2].state).to_be("done")
     end)
 
     it("ignores events stamped with a tab that is gone", function()
@@ -191,6 +191,67 @@ describe("status", function()
       note("PreToolUse", { tool_name = "Bash" })
       status.clear(1)
       expect(status.get_state(1)).to_be("none")
+    end)
+  end)
+
+  describe("read and unread answers", function()
+    before_each(function()
+      enable()
+      status.set_focused(true)
+    end)
+
+    it("lands a finished turn in done when you were looking elsewhere", function()
+      note("PreToolUse", { tool_name = "Bash" }, 2)
+      note("Stop", {}, 2) -- current tab is 1
+      expect(status.get_state(2)).to_be("done")
+    end)
+
+    it("lands it in idle when you were on that tab", function()
+      note("Stop", {}, 1)
+      expect(status.get_state(1)).to_be("idle")
+    end)
+
+    it("counts an answer that arrived while Neovim was in the background as unread", function()
+      status.set_focused(false)
+      note("Stop", {}, 1) -- your tab, but you were in another app
+      expect(status.get_state(1)).to_be("done")
+      status.set_focused(true)
+      expect(status.mark_read(1)).to_be_true()
+      expect(status.get_state(1)).to_be("idle")
+    end)
+
+    it("clears done when the tab is visited", function()
+      note("Stop", {}, 2)
+      expect(status.get_state(2)).to_be("done")
+      expect(status.mark_read(2)).to_be_true()
+      expect(status.get_state(2)).to_be("idle")
+      expect(status.mark_read(2)).to_be_false() -- nothing left to read
+    end)
+
+    it("never reads away a question or ongoing work", function()
+      note("Notification", { message = "Claude needs your permission to use Bash" }, 2)
+      expect(status.mark_read(2)).to_be_false()
+      expect(status.get_state(2)).to_be("waiting")
+
+      note("PreToolUse", { tool_name = "Bash" }, 2)
+      expect(status.mark_read(2)).to_be_false()
+      expect(status.get_state(2)).to_be("busy")
+    end)
+
+    it("keeps the session id across the done -> idle transition", function()
+      note("Stop", {}, 2)
+      status.mark_read(2)
+      expect(status.get(2).session_id).to_be("sess-1")
+    end)
+
+    it("serves done its own glyph and highlight", function()
+      status.setup(base_config({ enabled = true, icons = { done = "D", idle = "I" } }))
+      note("Stop", {}, 2)
+      expect(status.icon(2)).to_be("D")
+      expect(status.hl_group(2)).to_be("ClaudeCodeStatusDone")
+      status.mark_read(2)
+      expect(status.icon(2)).to_be("I")
+      expect(status.hl_group(2)).to_be("ClaudeCodeStatusIdle")
     end)
   end)
 
