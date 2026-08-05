@@ -9,12 +9,7 @@ local M = {}
 ---Path to the lock file directory
 ---@return string lock_dir The path to the lock file directory
 local function get_lock_dir()
-  local claude_config_dir = os.getenv("CLAUDE_CONFIG_DIR")
-  if claude_config_dir and claude_config_dir ~= "" then
-    return vim.fn.expand(claude_config_dir .. "/ide")
-  else
-    return vim.fn.expand("~/.claude/ide")
-  end
+  return require("claudecode.utils").claude_config_dir() .. "/ide"
 end
 
 M.lock_dir = get_lock_dir()

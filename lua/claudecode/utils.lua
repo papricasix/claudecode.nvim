@@ -148,4 +148,22 @@ function M.parse_command(cmd)
   return argv
 end
 
+---Where the Claude CLI keeps its state.
+---
+---One rule, because three features read it — the lock files it discovers editors
+---through (`lockfile`), the transcript store a conversation lives in
+---(`agents.transcript`), and the check for whether a session id can be resumed
+---(`session_state`). Three copies of it meant a change to the rule — a Windows
+---case, an XDG fallback — would silently leave those features disagreeing about
+---where the CLI's state is, and the disagreement shows up as "the session exists
+---but cannot be restored".
+---@return string dir
+function M.claude_config_dir()
+  local override = os.getenv("CLAUDE_CONFIG_DIR")
+  if override and override ~= "" then
+    return vim.fn.expand(override)
+  end
+  return vim.fn.expand("~/.claude")
+end
+
 return M
