@@ -194,6 +194,38 @@ describe("status", function()
     end)
   end)
 
+  describe("a turn the user cancelled", function()
+    before_each(function()
+      enable()
+    end)
+
+    it("ends a busy tab", function()
+      -- Pressing <Esc> fires no Claude Code hook at all — verified against the
+      -- real CLI by driving a session through a pty with every hook event
+      -- registered. Without this the tab stays busy and the spinner animates
+      -- (redrawing every tabline) until the next prompt. The transcript's
+      -- `[Request interrupted by user]` entry is what calls this.
+      note("UserPromptSubmit", {}, 1)
+      expect(status.get_state(1)).to_be("busy")
+      expect(status.note_interrupt(1)).to_be_true()
+      expect(status.get_state(1)).to_be("idle")
+    end)
+
+    it("leaves a tab that is not working alone", function()
+      -- The reason this is not driven off the keypress: <Esc> also closes panels
+      -- in Claude's TUI, and during a turn with no tool calls no later event
+      -- would correct a wrong guess.
+      note("Notification", { message = "Claude needs your permission to run git push" }, 1)
+      expect(status.get_state(1)).to_be("waiting")
+      expect(status.note_interrupt(1)).to_be(false)
+      expect(status.get_state(1)).to_be("waiting")
+    end)
+
+    it("ignores a tab with no Claude", function()
+      expect(status.note_interrupt(3)).to_be(false)
+    end)
+  end)
+
   describe("read and unread answers", function()
     before_each(function()
       enable()
@@ -316,6 +348,37 @@ describe("status", function()
       expect(status.icon(1)).to_be("c")
       status._tick()
       expect(status.icon(1)).to_be("a") -- wraps
+    end)
+
+    it("keeps one beat when two timers drive the same frame", function()
+      -- The agents view runs its own spinner timer and advances this counter too,
+      -- so a busy agent and a busy tab show the same glyph. Both timers ticking
+      -- must not add up to double speed.
+      enable({ icons = { busy = { "a", "b", "c" } } })
+      note("PreToolUse", { tool_name = "Bash" })
+
+      local clock = 1000
+      local saved_now = vim.loop.now
+      vim.loop.now = function()
+        return clock
+      end
+      finally(function()
+        vim.loop.now = saved_now
+      end)
+
+      expect(status.icon(1)).to_be("a")
+      status._tick(120) -- status's own timer
+      expect(status.icon(1)).to_be("b")
+      clock = clock + 40
+      status._tick(120) -- the agents view, on its own phase: too soon
+      expect(status.icon(1)).to_be("b")
+      clock = clock + 80 -- a full interval since the last advance
+      status._tick(120)
+      expect(status.icon(1)).to_be("c")
+
+      -- A manual step (a test, not a timer) always advances.
+      status._tick()
+      expect(status.icon(1)).to_be("a")
     end)
 
     it("ships the CLI's spinner as the ping-pong sequence the CLI plays", function()

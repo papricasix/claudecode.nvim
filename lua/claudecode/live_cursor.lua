@@ -87,19 +87,55 @@ local function status_enabled()
   return ok and st.is_enabled() == true
 end
 
+--- Whether agents mode wants the hooks. It only does when its live state is
+--- actually hook-driven: under polling the transcripts answer everything except
+--- sub-second status, which is not worth a headless Neovim per tool call *per
+--- running agent*.
+---@return boolean
+local function agents_enabled()
+  local ok, av = pcall(require, "claudecode.agents_view")
+  return ok and av.wants_hooks() == true
+end
+
+--- Whether agents mode is switched on at all, regardless of whether its live
+--- state is hook-driven. It needs exactly one event under polling too: the
+--- `PostToolUse(ExitPlanMode)` that dismisses the float a plan file was shown in.
+--- One hook invocation per plan *answered* — the cost that makes hooks opt-in is
+--- the `"*"` matcher, not this.
+---@return boolean
+local function agents_on_at_all()
+  local ok, av = pcall(require, "claudecode.agents_view")
+  return ok and av.is_enabled() == true
+end
+
 --------------------------------------------------------------------------------
 -- Setup
 --------------------------------------------------------------------------------
+
+---The group a "Claude read these lines" whole-line mark is painted in.
+---
+---Re-asserts the default for our *own* group every time rather than only at
+---setup: if the colorscheme loaded afterwards, or the group was never defined,
+---an extmark referencing it would paint nothing. A user-supplied group is left
+---alone, and `default = true` lets a colorscheme win.
+---
+---Exported because the agents file view marks the same thing with the same
+---meaning — hardcoding the group name there ignored `live_cursor.highlight`, so
+---the two views disagreed for anyone who set it.
+---@return string
+function M.read_highlight()
+  local hl = (config and config.highlight) or "ClaudeCodeLiveCursor"
+  if hl == "ClaudeCodeLiveCursor" then
+    pcall(vim.api.nvim_set_hl, 0, "ClaudeCodeLiveCursor", { link = "Visual", default = true })
+  end
+  return hl
+end
 
 ---@param full_config table The full plugin config (expects a `live_cursor` field).
 function M.setup(full_config)
   config = (full_config and full_config.live_cursor) or {}
   ns = vim.api.nvim_create_namespace("claudecode_live_cursor")
-  -- Provide a sensible default highlight only for our own group, leaving any
-  -- user-supplied group untouched. `default = true` lets a user colorscheme win.
-  if (config.highlight or "ClaudeCodeLiveCursor") == "ClaudeCodeLiveCursor" then
-    pcall(vim.api.nvim_set_hl, 0, "ClaudeCodeLiveCursor", { link = "Visual", default = true })
-  end
+  M.read_highlight()
   -- Theme-fitting green for the preview marker; user can override the group.
   if (config.preview_highlight or "ClaudeCodeLivePreview") == "ClaudeCodeLivePreview" then
     pcall(vim.api.nvim_set_hl, 0, "ClaudeCodeLivePreview", { link = "DiagnosticOk", default = true })
@@ -128,7 +164,9 @@ function M.build_launch_injection()
   local plan_on = plan_enabled()
   local session_on = session_enabled()
   local status_on = status_enabled()
-  if not lc_on and not plan_on and not session_on and not status_on then
+  local agents_on = agents_enabled()
+  local plan_close_on = plan_on or agents_on_at_all()
+  if not lc_on and not plan_on and not session_on and not status_on and not agents_on and not plan_close_on then
     return nil
   end
 
@@ -182,12 +220,15 @@ function M.build_launch_injection()
     settings.hooks[event] = { matcher and { matcher = matcher, hooks = { hook } } or { hooks = { hook } } }
   end
 
-  if status_on then
+  if status_on or agents_on then
     -- Status tracks *activity*, so it needs every tool call rather than the file
     -- tools above, and both sides of one: PostToolUse is the only event between
     -- answering a permission prompt and the tool's result, so without it a tab
-    -- would stay "waiting" for the whole run. This is the one feature that costs
-    -- a hook invocation per tool call.
+    -- would stay "waiting" for the whole run. Agents mode wants the same set for
+    -- the same reason, plus PostToolUse specifically: the transcript's record of
+    -- a tool is written when the tool *returns*, so that is when its line counts
+    -- are worth re-reading. This is the one feature that costs a hook invocation
+    -- per tool call.
     register("PreToolUse", "*")
     register("PostToolUse", "*")
     register("UserPromptSubmit")
@@ -208,14 +249,16 @@ function M.build_launch_injection()
       -- matcher would match *every* tool call and fire the hook for nothing.
       register("PreToolUse", table.concat(pre_tools, "|"))
     end
-    if plan_on then
-      -- For the plan view, PostToolUse(ExitPlanMode) is the "user accepted" signal
-      -- that closes the plan window. Scoped to ExitPlanMode so it never fires for
-      -- the file tools above.
+    if plan_close_on then
+      -- PostToolUse(ExitPlanMode) is the "user accepted" signal. It closes the
+      -- plan window for the plan view, and the float a plan file was shown in for
+      -- agents mode. Scoped to ExitPlanMode so it never fires for the file tools
+      -- above — and registered whenever either feature is on, including agents
+      -- mode under polling, which asks for no other hook at all.
       register("PostToolUse", "ExitPlanMode")
     end
   end
-  if session_on or status_on then
+  if session_on or status_on or agents_on then
     -- SessionStart carries the id the CLI runs under (including after /clear or a
     -- manual --resume), which is what session persistence stores per tab.
     register("SessionStart")
@@ -294,6 +337,33 @@ local function wrong_tab(source_tab)
   return ok and cur ~= source_tab
 end
 
+---Whether this event came from a Claude that agents mode is hosting.
+---
+---Agents mode owns its whole tabpage: every window in it is one of its four
+---panes. A preview or a plan that takes one over is not showing the user a file,
+---it is dismantling the layout the view exists to give them — and with no
+---editor window to fall back on, the preview lands wherever the cursor happens
+---to be, which is worse still. So these events drive the status and the agents
+---model (fed before this check) and nothing that opens a window.
+---@param event table
+---@param source_tab integer|nil
+---@return boolean
+local function from_agents_mode(event, source_tab)
+  local ok, agents = pcall(require, "claudecode.agents_view")
+  if ok and type(agents.is_agents_tab) == "function" and agents.is_agents_tab(source_tab) then
+    return true
+  end
+  -- The stamp is the tab the CLI was launched in; the registry knows which
+  -- conversations the view runs whatever the stamp says.
+  if type(event.session_id) == "string" then
+    local ok_reg, registry = pcall(require, "claudecode.agents.registry")
+    if ok_reg and type(registry.is_live) == "function" and registry.is_live(event.session_id) then
+      return true
+    end
+  end
+  return false
+end
+
 ---Snippets to locate the edit by. We prefer new_string (the file is usually
 ---already edited by the time we look, in auto/accept mode) and fall back to
 ---old_string (when the buffer still shows pre-edit content).
@@ -357,6 +427,12 @@ function M.dispatch(event, source_tab)
     require("claudecode.status").note(event, source_tab)
   end)
 
+  -- Agents mode keys by conversation rather than tab, since several agents share
+  -- its tabpage; it folds the same events into per-agent state and live counts.
+  pcall(function()
+    require("claudecode.agents_view").note(event, source_tab)
+  end)
+
   -- Every hook payload names the session it came from. Recording it makes the
   -- id we persist per tab authoritative rather than the one we guessed at launch.
   if type(event.session_id) == "string" then
@@ -366,6 +442,23 @@ function M.dispatch(event, source_tab)
   end
   if ehn == "SessionStart" then
     return -- carries no tool; it exists purely for the id above
+  end
+
+  -- A plan Claude wrote to a file and showed you with `openFile` is over once you
+  -- have answered the prompt in the terminal, so the float it is in gets out of
+  -- the way. Scoped to that conversation *and* to floats opened for viewing: a
+  -- diff float is a question still waiting for an answer, and closing one is not
+  -- answering it. Runs before the guard below because a float is exactly what the
+  -- agents tab does have to spare.
+  if ehn == "PostToolUse" and tool == "ExitPlanMode" and type(event.session_id) == "string" then
+    pcall(function()
+      require("claudecode.float").close_all(event.session_id, "open")
+    end)
+  end
+
+  -- Everything below opens a window. Agents mode has none to spare.
+  if from_agents_mode(event, source_tab) then
+    return
   end
 
   -- Plan view: ExitPlanMode carries the plan markdown. Routed independently of the
@@ -1150,12 +1243,7 @@ function M.show(file_path, opts)
     s = math.max(1, math.min(s, line_count))
     e = math.max(s, math.min(e, line_count))
 
-    local hl = config.highlight or "ClaudeCodeLiveCursor"
-    -- Re-assert the default group: if the colorscheme loaded after setup, or the
-    -- group was never defined, an extmark referencing it would paint nothing.
-    if hl == "ClaudeCodeLiveCursor" then
-      pcall(vim.api.nvim_set_hl, 0, "ClaudeCodeLiveCursor", { link = "Visual", default = true })
-    end
+    local hl = M.read_highlight()
 
     -- Highlight whole lines across the range (capped) so it is unmistakable.
     local last = math.min(e, s + 999)

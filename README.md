@@ -201,6 +201,233 @@ Configure the plugin with the detected path:
 - `:ClaudeCodeCloseAllDiffs` - Close pending Claude diffs (leaves accepted/saved diffs intact)
 - `:ClaudeCodeLiveCursor [preview|open|off]` - Toggle the live Claude cursor (see [Live Claude Cursor](#live-claude-cursor))
 - `:ClaudeCodePlanView [on|off]` - Toggle showing Claude's plan-mode plan in an editor split (see [Plan View](#plan-view))
+- `:ClaudeCodeAgents [on|off]` - Toggle the agents view: several Claudes on one project, side by side (see [Agents Mode](#agents-mode))
+- `:ClaudeCodeAgentNew` - Start a new agent in the agents view
+
+## Agents Mode
+
+Several Claudes on one project, in one tabpage — with the answer to "which of
+them is working, which one wants me, and what has each actually changed."
+
+```text
+┌───────────────┬─────────────────────────────┬──────────────────────┐
+│ Changes       │                             │ Sessions             │
+│               │   the selected agent's      │  ✳ Fix session res…  │
+│ M session_st… │   Claude terminal           │    2m    +90    -5   │
+│    +90   -5   │                             │  ○ Expose tab statu… │
+│ A spec.lua    │                             │    1d   +865  -100   │
+│    +45   -0   │                             ├──────────────────────┤
+│               │                             │ Activity             │
+│               │                             │  14:03 edit  statu…  │
+│               │                             │  14:04 added git.l…  │
+└───────────────┴─────────────────────────────┴──────────────────────┘
+```
+
+Opt in, then press `<leader>aA`:
+
+```lua
+opts = {
+  agents = { enabled = true },
+}
+```
+
+**The session list is every conversation this project has had**, read from
+Claude Code's own transcripts — so it survives restarts, and it includes
+sessions you started outside the agents view. Each row shows the CLI's own title
+for the conversation, how long ago it ran, and how many lines it added and
+removed. Those counts are Claude's own record of the edits it made, so they stay
+accurate while an agent is still working. The list opens ordered by when each
+conversation last did something — the newest timestamp inside the transcript,
+not the file's modification time, which the CLI also bumps with bookkeeping
+writes days later. So resuming an old session does not move it up the list;
+talking to it does.
+
+**The order then holds still.** Rows do not re-sort themselves as agents work,
+because every criterion worth sorting by moves while you are reading: with three
+agents running, the row you were reaching for is somewhere else by the time you
+get there. A session that starts later is sorted into its place once and stays
+there too.
+
+- `<CR>` on a session shows it. If it is already running, you get its live
+  terminal; if not, it resumes. A conversation running in one of your other tabs
+  jumps you there instead of resuming it twice.
+- `?` in any pane shows the keys that reach it — the pane's own on top, the ones
+  that work anywhere below. It lists what is actually bound, so a key you
+  rebound or turned off shows up rebound or not at all.
+- `a` starts a new agent, `x` stops the one under the cursor, `r` re-reads
+  everything and re-sorts the list.
+- `gs` in any of the three list panes chooses the order: recent activity, name,
+  changes, or status. Picking the one already in force reverses it, and the menu
+  is where that order is stated — it names the direction in the criterion's own
+  words ("newest first", "A → Z"). The choice lasts as long as the view is open;
+  the next open starts from `agents.sessions.sort` again.
+- `dd` deletes the session under the cursor after a confirmation dialog (a
+  snacks.nvim float when you have it, `vim.fn.confirm` otherwise). This removes
+  the conversation's transcript from disk, so it is gone for good and can no
+  longer be resumed — from here or from the CLI. A session whose agent is still
+  running is refused; stop it with `x` first.
+- Switching agents leaves the previous one **running**. That is the point: start
+  three, come back to whichever finishes first.
+- `<C-n>` and `<C-p>` move through the session list from anywhere in the tab —
+  including inside the agent's terminal, without leaving insert mode. A running
+  conversation is swapped into the centre pane at once. A stopped one is
+  **selected but not started**: the counts, the file list and the activity feed
+  all follow the selection, so you can read what a session did before deciding to
+  reopen it, and the centre pane says which key starts it. Press `i` (the same
+  key that puts you in a running agent's terminal) or `<CR>` to pick it up where
+  it left off.
+- The view **opens already pointed at your newest session**, as though you had
+  pressed `<C-n>` once — so `i` from any pane starts that one, and nothing has to
+  be chosen before the panes have something to show.
+- The Activity pane lists the selected agent's tool calls **newest first**, so
+  what it is doing now is at the top rather than scrolled off the bottom.
+- `.` in the Activity or Changes pane diffs that file against **git HEAD** —
+  everything uncommitted in it, whoever put it there — rather than against what
+  the session started from. Useful once several agents have been over the same
+  tree. A file not in HEAD reads as all new; one that matches HEAD says so
+  instead of opening an empty diff.
+- `gf` in the Activity or Changes pane opens the **file itself, in a new tab** —
+  what is on disk, to work in, rather than a view of what the agent did to it.
+  The other two keys answer questions about the row; this one leaves the row
+  behind. A file that is no longer on disk says so instead of opening an empty
+  buffer.
+- `<CR>` in the Activity or Changes pane opens that file in a floating window,
+  showing **what the agent did to it**: an inline diff of the session's changes,
+  or, for a read in the Activity pane, the lines it read highlighted. See
+  [what the file view shows](#what-the-file-view-shows).
+- Inside such a float, `<C-n>` and `<C-p>` step to the **next and previous row of
+  the pane it came from** rather than to the next session — so you can read
+  through everything an agent changed without closing the float between files.
+  The float itself stays put and its content is swapped, the pane's cursor
+  follows, and the baseline stays whichever you opened with (the session's
+  changes for `<CR>`, git HEAD for `.`). Holding the key scrolls through the list
+  and opens the row you settle on.
+- `q` closes the view; the agents keep running unless you set
+  `kill_on_close = true`.
+
+Each agent gets its own connection to Neovim, so a diff, a file open or an
+`@` mention reaches the agent it belongs to and no other. Diffs open as floating
+windows titled with the agent that asked, cascading so several are answerable at
+once — accept with `:w` and reject with `:q`, exactly as elsewhere.
+
+**Counts in the Changes pane are what the agent did**, not the net state of your
+working tree: an edit that was later reverted still counts. The `M`/`A`/`D`/`?`
+letter beside each file is git's, and is the on-disk truth.
+
+### What the file view shows
+
+A row in the Changes or Activity pane is a record of work, so opening it shows
+that work rather than the file:
+
+- **A file the agent changed** opens as the file as it is now, with the session's
+  changes rendered inline — the same view you get while an edit is happening,
+  only for everything that session did to the file.
+- **A read in the Activity pane** opens the file with the lines that read covered
+  highlighted.
+- **A file the agent created** reads as one long addition, since there was
+  nothing before it.
+
+The diff is reconstructed by undoing the session's own edits, so a file that
+moved on afterwards — later sessions, your own editing — can have changes that
+are no longer there. Those are left out and the title says so
+(`foo.lua  (3/5 changes still present)`). When none of them survive, or the file
+was deleted, or you do not have unified.nvim, the patches themselves are shown
+as a diff instead; that is Claude's own record and cannot be stale.
+
+Live state comes from Claude Code's lifecycle hooks when you already have
+[per-tab status](#per-tab-status) enabled, and otherwise from watching the
+transcripts, which costs nothing but lags the status dot by up to half a second.
+Force either with `agents = { source = "hooks" }` or `"poll"` — hooks run a
+headless Neovim per tool call, per running agent.
+
+<details>
+<summary>All agents options</summary>
+
+```lua
+opts = {
+  agents = {
+    enabled = false,
+    source = "auto",              -- "hooks" | "poll" | "auto"
+    poll_ms = 500,
+    layout = { left_width = 0.23, right_width = 0.23, sessions_height = 0.55 },
+                                  -- the terminal absorbs the rest (0.54 by default)
+    sessions = {
+      limit = 30,                 -- most recent transcripts to list
+      include_empty = true,       -- list conversations that changed no file
+      -- The order the list opens in: "recent" | "name" | "changes" | "status"
+      -- ("added" and "title" are the old names for two of them, still accepted).
+      -- The list is then frozen — rows keep their places instead of shuffling as
+      -- agents work — and `gs` re-orders it for as long as the view is open.
+      sort = "recent",
+      foreign = true,             -- also list Claudes running in your other tabs
+    },
+    feed_limit = 500,             -- activity events kept per session
+    refresh_ms = 150,
+    git = true,                   -- annotate Changes with git status letters
+    git_refresh_ms = 1500,
+    -- The animation's pace is `status.spinner_ms` — one spinner, one setting,
+    -- however many places show it. Set this only to make the agents view run at
+    -- a different rate from the tabline.
+    -- spinner_ms = 120,
+    -- A new Activity row arrives at full colour and settles into a quieter one;
+    -- a +N/-N that has just moved lights up and drops back. `fade = false`
+    -- switches both off. Sampled by the spinner's frame tick, so with
+    -- `auto_redraw = false` or `spinner_ms = 0` a row simply arrives at its
+    -- resting colour instead of travelling there.
+    fade = {
+      enabled = true,
+      hold_ms = 3000,             -- an Activity row stays lifted this long,
+      steps = 25,                 -- then fades over (steps - 1) * step_ms, ~3s
+      step_ms = 120,              -- per step; matches spinner_ms, which samples it
+      boost = 0.5,                -- how far a fresh row is lifted above its colour
+                                  -- (0 = only fade, never brighten)
+      dim = 0.55,                 -- how far a rested row blends into the background
+      flash_ms = 3000,            -- a changed count lights up and then spends
+                                  -- ~all of this fading back (no flat hold)
+      flash_level = 0.8,          -- how bright the lit text is on the count's block
+    },
+    fold_batch = 2,               -- transcripts read per tick while filling the list
+    follow_cursor = false,        -- selecting follows the cursor
+    restore_panes = true,
+    kill_on_close = false,        -- stop running agents when the view closes
+    focus = "center",             -- "center" | "sessions"
+    resume_mode = "resume",       -- "resume" | "fork" (--fork-session)
+    -- Overrides the top-level `float` block for agent-opened floats only.
+    float = { width = 0.7, height = 0.7, border = "rounded", cascade_offset = 2 },
+    keymaps = {
+      select = "<CR>", new = "a", stop = "x", delete = "dd", refresh = "r",
+      sort = "gs",                -- choose what the list is ordered by
+      close = "q", open = "<CR>", git_diff = ".", goto_file = "gf", help = "?",
+      next_pane = "<Tab>", focus_term = "i",
+      -- Cycle the selected session from any pane, and from inside the agent's
+      -- terminal (bound there in terminal mode too). Inside a file float the same
+      -- keys step through that pane's rows instead:
+      next_session = "<C-n>", prev_session = "<C-p>",
+    },
+    -- The terminal pane uses the background snacks gives its windows (SnacksNormal
+    -- when snacks is loaded, else NormalFloat); the sidebars keep the editor's
+    -- Normal. To make the terminal blend in too:
+    --   highlights = { normal = "Normal", normal_nc = "Normal" }
+    -- Every pane element can be pointed at your own group. Defaults, all set as
+    -- links so a colorscheme keeps the last word:
+    --   highlights = {
+    --     title = "ClaudeCodeAgentsTitle",       -- links to Normal
+    --     time  = "ClaudeCodeAgentsTime",        -- Comment
+    --     kind  = "ClaudeCodeAgentsKind",        -- Comment (Activity's read/edit column)
+    --     path  = "ClaudeCodeAgentsPath",        -- Directory
+    --     added = "ClaudeCodeAgentsAdded",       -- DiffAdd
+    --     removed = "ClaudeCodeAgentsRemoved",   -- DiffDelete
+    --     selected = "ClaudeCodeAgentsSelected", -- CursorLine
+    --     header = "ClaudeCodeAgentsHelpHeader", -- Title
+    --     key = "ClaudeCodeAgentsKey",           -- Special
+    --   }
+  },
+}
+```
+
+Any keymap can be set to `false` to leave the key unbound.
+
+</details>
 
 ## Working with Diffs
 
@@ -305,7 +532,7 @@ For deep technical details, see [ARCHITECTURE.md](./ARCHITECTURE.md).
     -- Diff Integration
     diff_opts = {
       provider = "auto", -- "auto" (unified.nvim if installed, else native), "native", or "unified"
-      layout = "vertical", -- "vertical" or "horizontal" (native provider only)
+      layout = "vertical", -- "vertical", "horizontal", or "float" (see `float` below)
       open_in_new_tab = false, -- ignored by the unified provider
       keep_terminal_focus = false, -- If true, moves focus back to terminal after diff opens
       hide_terminal_in_new_tab = false,
@@ -314,6 +541,17 @@ For deep technical details, see [ARCHITECTURE.md](./ARCHITECTURE.md).
       -- Legacy aliases (still supported):
       -- vertical_split = true,
       -- open_in_current_tab = true,
+    },
+
+    -- Geometry for every floating window Claude opens for a file or a diff:
+    -- `diff_opts.layout = "float"`, and agents mode, which floats regardless
+    -- since none of its panes is an editor window a diff could take over.
+    -- `agents.float` overrides this for agent-opened floats.
+    float = {
+      width = 0.7, -- fraction of the screen
+      height = 0.7,
+      border = "rounded", -- anything nvim_open_win accepts
+      cascade_offset = 2, -- rows/columns each stacked float is offset by
     },
 
     -- Live Claude cursor (opt-in): a real-time view of what Claude is reading/editing
@@ -381,6 +619,8 @@ Toggle it at runtime with `:ClaudeCodeLiveCursor`:
 - `:ClaudeCodeLiveCursor off` — disable and clear any highlight.
 
 Because the hook is injected when Claude launches, enabling mid-session takes effect the next time you start Claude; disabling stops the highlighting immediately.
+
+Agents in the [agents view](#agents-mode) never preview. Every window in that tabpage is one of its panes, so there is no editor window to ride along in — a preview there would take over a pane instead of showing you a file. The same goes for the plan view.
 
 #### Plan View
 

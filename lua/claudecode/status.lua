@@ -132,8 +132,47 @@ M.SPINNER = spinner_frames()
 --- while some tab actually shows an animated icon, so an all-idle Neovim ticks
 --- nothing: a repeating redraw of every tabline and statusline is not something
 --- to leave running for a glyph nobody is looking at.
+---
+--- The frame is deliberately global rather than per tab, so every view showing a
+--- spinner shows the *same* one — but that also means more than one timer can be
+--- driving it (the agents view runs its own, since its rows are keyed by
+--- conversation, not by tab). `last_advance_ms` is what keeps the sequence at
+--- one frame per interval no matter how many tickers there are; see `M._tick`.
 local frame = 1
 local spinner_timer = nil
+local spinner_interval = nil
+local last_advance_ms = nil
+
+--- Views that need the clock running even when no tab shows an animated icon,
+--- `[name] = interval_ms`. See `M.request_frames`.
+local frame_requests = {}
+
+--- Views that draw the animation somewhere a `redrawtabline` cannot reach — the
+--- agents view paints its own buffers — keyed by name so re-registering
+--- replaces rather than stacks. They are called on the tick that *advances* the
+--- frame, whichever timer that was, so every spinner on screen changes glyph in
+--- the same tick instead of on its own timer's phase.
+local frame_listeners = {}
+
+---@param name string
+---@param fn fun()|nil nil unregisters.
+function M.on_frame(name, fn)
+  frame_listeners[name] = fn
+end
+
+local function notify_frame()
+  if next(frame_listeners) == nil then
+    return
+  end
+  -- Scheduled, not called inline: a listener repaints buffers, and doing that
+  -- from inside the redraw this function follows is a good way to corrupt
+  -- Neovim's state. It still lands in the same frame, just after it.
+  vim.schedule(function()
+    for _, fn in pairs(frame_listeners) do
+      pcall(fn)
+    end
+  end)
+end
 
 --------------------------------------------------------------------------------
 -- Setup
@@ -146,6 +185,11 @@ function M.setup(full_config)
     pcall(vim.api.nvim_set_hl, 0, group, { link = link, default = true })
   end
   M.ensure_visit_watcher()
+  -- A reload may have turned the feature off, and the transcript watcher's clock
+  -- is ours to stop; it re-arms itself the next time a tab goes busy.
+  pcall(function()
+    require("claudecode.interrupt_watch").sync()
+  end)
 end
 
 ---Watch for the user reading a finished answer: arriving at a tab clears its
@@ -200,6 +244,7 @@ function M.reset()
     spinner_timer = nil
   end
   frame = 1
+  last_advance_ms = nil
 end
 
 --------------------------------------------------------------------------------
@@ -283,7 +328,15 @@ end
 ---redrawing into their own hands (`auto_redraw = false`), where a timer we own
 ---could not refresh anything anyway.
 local function sync_spinner()
-  local want = false
+  -- What the animation clock has to serve: any tab drawing a multi-frame icon,
+  -- plus any view that asked for frames because it animates something a tabline
+  -- redraw cannot reach (the agents view's rows are keyed by conversation, so no
+  -- tab's state describes them).
+  -- `status.spinner_ms` is *the* animation pace: the user set it to say how fast
+  -- Claude's spinner should move, and every view showing that spinner is showing
+  -- the same one.
+  local base = (config and config.spinner_ms) or 120
+  local want, interval = false, nil
   if not (config and (config.auto_redraw == false or config.spinner_ms == 0)) then
     for _, entry in pairs(entries) do
       local spec = icon_spec(entry.state)
@@ -292,6 +345,29 @@ local function sync_spinner()
         break
       end
     end
+  end
+  for _, requested in pairs(frame_requests) do
+    want = true
+    -- Only an *explicit* rate overrides the configured pace, and the fastest of
+    -- those wins since one clock cannot serve two. A plain request (`true`) is a
+    -- view saying "keep the clock running", not "run it at my speed" — taking a
+    -- minimum over its default would silently overrule the user: with
+    -- `status.spinner_ms = 250` and the agents view defaulted to 120, opening
+    -- that tab sped the tabline up to more than twice its configured pace.
+    if requested ~= true and (not interval or requested < interval) then
+      interval = requested
+    end
+  end
+  interval = interval or base
+
+  -- A running timer at the wrong rate is restarted rather than left alone: the
+  -- rate can change when a requester comes or goes.
+  if want and spinner_timer and spinner_interval ~= interval then
+    pcall(function()
+      spinner_timer:stop()
+      spinner_timer:close()
+    end)
+    spinner_timer = nil
   end
 
   if want and not spinner_timer then
@@ -302,10 +378,12 @@ local function sync_spinner()
       return
     end
     spinner_timer = timer
-    local interval = (config and config.spinner_ms) or 120
+    spinner_interval = interval
     pcall(function()
       timer:start(interval, interval, function()
-        vim.schedule(M._tick)
+        vim.schedule(function()
+          M._tick(interval)
+        end)
       end)
     end)
   elseif not want and spinner_timer then
@@ -314,8 +392,62 @@ local function sync_spinner()
       spinner_timer:close()
     end)
     spinner_timer = nil
-    frame = 1
+    spinner_interval = nil
+    -- The frame is **not** reset. It is shared with every other view drawing a
+    -- spinner, and resetting it here yanked those animations back to their first
+    -- glyph every time some tab's Claude happened to finish (measured: a pane
+    -- jumped ✻ → ✢ mid-cycle, which is what "random order" looks like). Nothing
+    -- needs it to start at 1; the icon is picked modulo the frame count.
   end
+end
+
+---Ask for the animation clock to run even when no tab shows an animated icon.
+---
+---**There is exactly one clock in the process, and this is how you share it.**
+---The agents view used to run a second timer over the same global frame counter,
+---because its rows are keyed by conversation and `sync_spinner` only counts
+---tabs. Two timers driving one counter is a race held in check only by `_tick`'s
+---interval guard, and it leaked: measured, leaving the agents tab and coming
+---back left the view's timer armed *in addition to* status's, doubling `_tick`
+---calls (10 → 20 per 1.2s) for one animation. Both were repeating full-UI
+---redraws. Asking for frames instead means the second timer never exists.
+---
+---Paired with `on_frame`, which is how a requester learns the frame moved.
+
+---Who currently wants the clock, for tests and for debugging a spinner that will
+---not stop.
+---@return table<string, number>
+function M._frame_requests()
+  return vim.deepcopy(frame_requests)
+end
+
+---The rate the animation clock is actually running at, or nil when it is not.
+---The pace a user configures and the pace they get have been two different
+---numbers before now; this is how a test tells them apart.
+---@return number|nil
+function M._spinner_interval()
+  return spinner_timer and spinner_interval or nil
+end
+
+---@param name string Same key as `on_frame`; re-requesting replaces.
+---@param interval_ms number|nil A rate to *override* `status.spinner_ms` with.
+---       Omit it — the normal case — to run at the configured pace.
+function M.request_frames(name, interval_ms)
+  if type(name) ~= "string" then
+    return
+  end
+  frame_requests[name] = (type(interval_ms) == "number" and interval_ms > 0) and interval_ms or true
+  sync_spinner()
+end
+
+---Withdraw a frame request, so the clock can stop when nothing else wants it.
+---@param name string
+function M.release_frames(name)
+  if type(name) ~= "string" or frame_requests[name] == nil then
+    return
+  end
+  frame_requests[name] = nil
+  sync_spinner()
 end
 
 ---Whether Neovim itself has focus. Terminals that report focus keep this
@@ -345,6 +477,15 @@ end
 ---@param value boolean
 function M.set_focused(value)
   focused = value ~= false
+end
+
+---Whether Neovim has focus, for the other places that decide whether an answer
+---counts as seen — `agents.model` runs the same rule per conversation, and it
+---must not have its own idea of this. True when nothing tracks focus, which is
+---the same degradation `finished_state` accepts.
+---@return boolean
+function M.is_focused()
+  return focused
 end
 
 ---Tell the world a tab changed, and refresh the UI that draws it.
@@ -397,6 +538,18 @@ local function apply(tab, state, info)
   end
   sync_spinner()
 
+  -- A cancelled turn is reported by no hook at all, so `busy` is the one state
+  -- that cannot end on its own. Arm the transcript watcher on the way in — it
+  -- records where the file ends, which is what makes any marker it later sees
+  -- belong to *this* turn — and let it re-check whether it still has work.
+  pcall(function()
+    local watch = require("claudecode.interrupt_watch")
+    if state == "busy" and prev_state ~= "busy" then
+      watch.arm(entry.session_id)
+    end
+    watch.sync()
+  end)
+
   local unchanged = prev_state == state
     and (prev and prev.tool) == entry.tool
     and (prev and prev.message) == entry.message
@@ -411,6 +564,60 @@ end
 -- Ingest (driven by live_cursor.dispatch, which owns the hook transport)
 --------------------------------------------------------------------------------
 
+---Classify one Claude Code hook event into a status state.
+---
+---Pure: no enabled check, no tab lookup, nothing written. Kept separate from
+---`note` so a consumer keyed by something other than a tabpage can reuse the
+---rules — the agents view tracks several Claudes inside one tab and therefore
+---keys by conversation id, where per-tab state has no single answer.
+---@param event table Decoded hook payload.
+---@param opts { finished: ClaudeCodeStatusState? }|nil State a finished turn lands
+---       in. The caller decides, because "have you read this yet" depends on where
+---       the answer arrived. Defaults to `done`.
+---@return ClaudeCodeStatusState|nil state nil when the event says nothing about state.
+---@return { tool: string?, message: string?, session_id: string? } info
+function M.classify(event, opts)
+  if type(event) ~= "table" then
+    return nil, {}
+  end
+
+  local finished = (opts and opts.finished) or "done"
+  local ehn = event.hook_event_name
+  local tool = type(event.tool_name) == "string" and event.tool_name or nil
+  local session_id = type(event.session_id) == "string" and event.session_id or nil
+  local info = { tool = tool, session_id = session_id }
+
+  if ehn == "SessionStart" then
+    return "idle", { session_id = session_id }
+  elseif ehn == "SessionEnd" then
+    return "none", {}
+  elseif ehn == "UserPromptSubmit" then
+    return "busy", { session_id = session_id }
+  elseif ehn == "PreToolUse" then
+    if tool == "ExitPlanMode" then
+      -- The plan is on screen and Claude cannot continue until you accept or
+      -- reject it — the same "your move" state as a permission prompt.
+      info.message = "plan review"
+      return "waiting", info
+    end
+    return "busy", info
+  elseif ehn == "PostToolUse" or ehn == "PreCompact" then
+    return "busy", info
+  elseif ehn == "Notification" then
+    local message = type(event.message) == "string" and event.message or ""
+    if message:lower():find(IDLE_NOTIFICATION, 1, true) then
+      -- Not a question: the "you have been idle" nudge Claude sends at the prompt.
+      return finished, { session_id = session_id }
+    end
+    info.message = message ~= "" and message or nil
+    return "waiting", info
+  elseif ehn == "Stop" then
+    return finished, { session_id = session_id }
+  end
+
+  return nil, info
+end
+
 ---Fold one Claude Code hook event into the status of the tab it came from.
 ---@param event table Decoded hook payload.
 ---@param source_tab integer|nil Tabpage the triggering Claude was launched in.
@@ -419,39 +626,13 @@ function M.note(event, source_tab)
     return
   end
 
-  local ehn = event.hook_event_name
-  local tool = type(event.tool_name) == "string" and event.tool_name or nil
-  local session_id = type(event.session_id) == "string" and event.session_id or nil
-
-  if ehn == "SessionStart" then
-    apply(source_tab, "idle", { session_id = session_id })
-  elseif ehn == "SessionEnd" then
-    apply(source_tab, "none", {})
-  elseif ehn == "UserPromptSubmit" then
-    apply(source_tab, "busy", { session_id = session_id })
-  elseif ehn == "PreToolUse" then
-    if tool == "ExitPlanMode" then
-      -- The plan is on screen and Claude cannot continue until you accept or
-      -- reject it — the same "your move" state as a permission prompt.
-      apply(source_tab, "waiting", { tool = tool, message = "plan review", session_id = session_id })
-    else
-      apply(source_tab, "busy", { tool = tool, session_id = session_id })
-    end
-  elseif ehn == "PostToolUse" or ehn == "PreCompact" then
-    apply(source_tab, "busy", { tool = tool, session_id = session_id })
-  elseif ehn == "Notification" then
-    local message = type(event.message) == "string" and event.message or ""
-    if message:lower():find(IDLE_NOTIFICATION, 1, true) then
-      -- Not a question: the "you have been idle" nudge Claude sends at the prompt.
-      apply(source_tab, finished_state(source_tab), { session_id = session_id })
-    else
-      apply(source_tab, "waiting", { tool = tool, message = message ~= "" and message or nil, session_id = session_id })
-    end
-  elseif ehn == "Stop" then
-    apply(source_tab, finished_state(source_tab), { session_id = session_id })
+  local state, info = M.classify(event, { finished = finished_state(source_tab) })
+  if state then
+    apply(source_tab, state, info)
   end
 end
 
+---Publish a state for a tab directly, bypassing the hook rules.
 ---Mark a tab's finished answer as read, which is what turns `done` into `idle`.
 ---Wired to the user arriving at the tab (`TabEnter`) or coming back to Neovim
 ---(`FocusGained`); `waiting` is deliberately untouched, since looking at a
@@ -482,6 +663,41 @@ function M.note_launch(tab)
   apply(resolved, "idle", {})
 end
 
+---Note that the user interrupted a running turn.
+---
+---**There is no hook for this.** Verified against the real CLI (2.1.221) by
+---driving an interactive session through a pty with a hook registered on every
+---event Claude Code defines: submitting a prompt fires `UserPromptSubmit`, and
+---pressing `<Esc>` mid-turn fires **nothing at all** — not `Stop`, not the
+---`StopFailure` the binary also carries. So a tab that was interrupted stayed
+---`busy` for ever, and the spinner kept animating (and kept redrawing every
+---tabline and statusline) until the next prompt. That is the bug this closes.
+---
+---What Claude Code *does* do is write `[Request interrupted by user]` into the
+---conversation as a real `user` entry, so the transcript is the one place the
+---cancel is reported. Two things read it and both call this:
+---`claudecode.interrupt_watch`, which tails a busy tab's transcript for exactly
+---this purpose, and the agents view, which folds transcripts anyway.
+---Reading the keypress instead was tried and rejected: `<Esc>` means
+---a dozen other things in Claude's TUI (dismissing a panel, clearing the input),
+---and during a turn with no tool calls there is no later event to correct a
+---wrong guess with, so a tab could read idle for minutes while Claude worked.
+---Only a `busy` tab can be interrupted; anything else ignores the call.
+---@param tab integer|nil
+---@return boolean noted
+function M.note_interrupt(tab)
+  if not M.is_enabled() then
+    return false
+  end
+  local resolved = normalize_tab(tab)
+  local entry = resolved and entries[resolved]
+  if not entry or entry.state ~= "busy" then
+    return false
+  end
+  apply(resolved, "idle", { session_id = entry.session_id })
+  return true
+end
+
 ---Forget a tab's status (its Claude is gone).
 ---@param tab integer|nil
 function M.clear(tab)
@@ -501,6 +717,9 @@ function M.forget_closed_tabs()
     end
   end
   sync_spinner() -- the last busy tab may have been one of them
+  pcall(function()
+    require("claudecode.interrupt_watch").sync()
+  end)
 end
 
 --------------------------------------------------------------------------------
@@ -564,21 +783,46 @@ end
 
 ---Advance the animation one frame and refresh whatever draws it. Called by the
 ---timer; exposed so a test can step the animation without waiting on real time.
+---
+---`interval_ms` marks a **timer-driven** tick and is what keeps the spinner at
+---its configured speed when more than one timer is running. The frame counter is
+---shared on purpose — a working tab and a running agent must show the same glyph
+---— so with the agents view open alongside an animated tabline, two timers were
+---each advancing it and the spinner ran at double speed (measured: 19 frame
+---changes per 1.2s instead of 10). A tick arriving before its interval is up
+---therefore only redraws. Whichever timer crosses the deadline first advances,
+---so the sequence keeps time even if one of them stops. Called with no interval
+---it always advances, which is what a test stepping the animation by hand wants.
+---@param interval_ms number|nil Frame interval of the calling timer.
 ---@private
-function M._tick()
+function M._tick(interval_ms)
+  if type(interval_ms) == "number" and interval_ms > 0 then
+    local now = now_ms()
+    -- A little early counts as on time: libuv timers fire a few ms late as often
+    -- as not, and rejecting those would drop every other frame down to the
+    -- *other* timer's beat.
+    local due = interval_ms - math.floor(interval_ms / 8)
+    if now > 0 and last_advance_ms and (now - last_advance_ms) < due then
+      -- Nothing changed, so nothing is redrawn: the glyph is the same one that is
+      -- already on screen. Every view repaints below instead, on the tick that
+      -- actually advances, so they cannot drift apart by a timer's phase.
+      return
+    end
+    last_advance_ms = now
+  end
   frame = frame + 1
   if frame > 1e6 then
     frame = 1 -- keep the counter small; the icon is picked modulo the frame count
   end
   redraw()
+  notify_frame()
 end
 
----Highlight group for a tab's state, or nil when there is nothing to draw.
----@param tab integer|nil
+---Highlight group configured for a state, independent of any tab.
+---@param state ClaudeCodeStatusState|nil
 ---@return string|nil
-function M.hl_group(tab)
-  local state = M.get_state(tab)
-  if state == "none" then
+function M.hl_group_for_state(state)
+  if not state or state == "none" then
     return nil
   end
   local groups = (config and config.highlights) or {}
@@ -587,6 +831,46 @@ function M.hl_group(tab)
     group = DEFAULT_HIGHLIGHTS[state]
   end
   return (type(group) == "string" and group ~= "") and group or nil
+end
+
+---Highlight group for a tab's state, or nil when there is nothing to draw.
+---@param tab integer|nil
+---@return string|nil
+function M.hl_group(tab)
+  return M.hl_group_for_state(M.get_state(tab))
+end
+
+---The glyph and highlight for a state, independent of any tab.
+---
+---For consumers that track Claudes by something other than a tabpage — the agents
+---view keys by conversation, since several share one tab — so a running agent
+---animates with the same spinner, on the same frame, as a working tab.
+---@param state ClaudeCodeStatusState|nil
+---@return string icon
+---@return string|nil hl_group
+function M.icon_for_state(state)
+  local spec = icon_spec(state or "none")
+  local glyph
+  if type(spec) == "table" then
+    glyph = #spec > 0 and (spec[((frame - 1) % #spec) + 1] or "") or ""
+  else
+    glyph = spec or ""
+  end
+  return glyph, M.hl_group_for_state(state)
+end
+
+---Whether a state's icon has more than one frame, i.e. whether drawing it needs
+---the animation clock at all.
+---
+---`sync_spinner` asks this of the tabs it knows about. A view keyed by something
+---else — the agents view, whose rows are conversations — has to ask it of the
+---rows it just drew, or it would hold the clock open for a pane where nothing
+---moves.
+---@param state ClaudeCodeStatusState|nil
+---@return boolean
+function M.is_animated(state)
+  local spec = icon_spec(state or "none")
+  return type(spec) == "table" and #spec > 1
 end
 
 return M

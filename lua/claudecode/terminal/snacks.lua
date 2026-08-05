@@ -79,10 +79,7 @@ local function build_opts(config, env_table, focus)
         claude_new_line = {
           "<S-CR>",
           function()
-            vim.api.nvim_feedkeys("\\", "t", true)
-            vim.defer_fn(function()
-              vim.api.nvim_feedkeys("\r", "t", true)
-            end, 10)
+            require("claudecode.terminal").send_newline()
           end,
           mode = "t",
           desc = "New line",

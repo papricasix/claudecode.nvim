@@ -32,24 +32,92 @@ M.state = {
   initialized = false,
 }
 
--- Per-tab instance registry. Key = tabpage handle (integer).
--- Each entry: { server, port, auth_token, mention_queue, mention_timer, connection_timer }
+-- Instance registry. Key = opaque instance id (string), because a tabpage no
+-- longer implies a single Claude: agents mode runs several in one tab, each with
+-- its own server, port, auth token and lock file. `tab_instances` maps a tab back
+-- to the ids living in it, and `M.tab_instance` singles out the tab's *own*
+-- Claude — the one every pre-agents code path means when it says "this tab's".
+--
+-- Each entry: { id, kind, tab, session_id, server, port, auth_token,
+--               mention_queue, mention_timer, connection_timer }
 M.instances = {}
+
+--- [tabpage handle] = instance id of that tab's own Claude.
+M.tab_instance = {}
+
+---@param tab_id integer
+---@return string
+local function tab_instance_id(tab_id)
+  return "tab:" .. tostring(tab_id)
+end
+
+---@param session_id string
+---@return string
+local function agent_instance_id(session_id)
+  return "agent:" .. session_id
+end
 
 ---Return the instance for a specific (or current) tabpage. Returns nil if not started.
 ---@param tab_id number|nil
 ---@return table|nil
 local function get_instance(tab_id)
   tab_id = tab_id or vim.api.nvim_get_current_tabpage()
-  return M.instances[tab_id]
+  local id = M.tab_instance[tab_id]
+  return id and M.instances[id] or nil
 end
 
 ---Public accessor used by other modules (terminal.lua, selection.lua).
 ---@param tab_id number|nil
 ---@return table instance (may have server=nil if not running for this tab)
 function M.get_instance(tab_id)
-  tab_id = tab_id or vim.api.nvim_get_current_tabpage()
-  return M.instances[tab_id] or { server = nil, port = nil, auth_token = nil }
+  return get_instance(tab_id) or { server = nil, port = nil, auth_token = nil }
+end
+
+---Every instance living in a tab: its own Claude plus any agents.
+---@param tab_id number
+---@return table[] instances
+function M.instances_in_tab(tab_id)
+  local found = {}
+  for _, inst in pairs(M.instances) do
+    if inst.tab == tab_id then
+      found[#found + 1] = inst
+    end
+  end
+  return found
+end
+
+---The instance serving a given conversation, if one is running.
+---@param session_id string
+---@return table|nil
+function M.instance_for_session(session_id)
+  return M.instances[agent_instance_id(session_id)]
+end
+
+---Register an already-built instance as a tab's own Claude.
+---
+---The registry is keyed by instance id, so an entry has to be filed under that id
+---*and* pointed at from its tab. Callers that assemble an instance themselves
+---(tests, mostly) should go through here rather than writing both tables.
+---@param tab_id integer
+---@param inst table
+---@return table inst
+function M.register_tab_instance(tab_id, inst)
+  inst.id = inst.id or tab_instance_id(tab_id)
+  inst.tab = inst.tab or tab_id
+  inst.kind = inst.kind or "tab"
+  M.instances[inst.id] = inst
+  M.tab_instance[tab_id] = inst.id
+  return inst
+end
+
+---Forget a tab's own Claude without stopping it (the inverse of registering).
+---@param tab_id integer
+function M.unregister_tab_instance(tab_id)
+  local id = M.tab_instance[tab_id]
+  if id then
+    M.instances[id] = nil
+    M.tab_instance[tab_id] = nil
+  end
 end
 
 ---Check if Claude Code is connected for a specific instance.
@@ -267,7 +335,7 @@ end
 ---@param tab_id number|nil
 ---@param from_new_connection boolean|nil
 function M.process_mention_queue_for_tab(tab_id, from_new_connection)
-  local inst = tab_id and M.instances[tab_id] or get_instance()
+  local inst = tab_id and get_instance(tab_id) or get_instance()
   process_mention_queue_for_inst(inst, from_new_connection)
 end
 
@@ -378,11 +446,15 @@ function M.setup(opts)
   local diff = require("claudecode.diff")
   diff.setup(M.state.config)
 
+  -- Before anything that can open one: `diff_opts.layout = "float"` reaches it
+  -- without agents mode being enabled at all.
+  require("claudecode.float").setup(M.state.config)
   require("claudecode.live_cursor").setup(M.state.config)
   require("claudecode.plan_view").setup(M.state.config)
   require("claudecode.terminal_links").setup(M.state.config)
   require("claudecode.session_state").setup(M.state.config)
   require("claudecode.status").setup(M.state.config)
+  require("claudecode.agents_view").setup(M.state.config)
 
   -- Sweep lock files left behind by editors that died without running their exit
   -- hook. Once per Neovim, before any server of ours claims a port.
@@ -406,9 +478,15 @@ function M.setup(opts)
       -- Marks every TermClose from here on as "Neovim is exiting", not "the user
       -- closed this chat" (see the ClaudeCodeSessionClose autocmd).
       M.state.shutting_down = true
-      for tab_id, inst in pairs(M.instances) do
+      -- Snapshot first: stopping an instance removes it from the registry, and
+      -- mutating a table while iterating it may skip entries.
+      local all = {}
+      for _, inst in pairs(M.instances) do
+        all[#all + 1] = inst
+      end
+      for _, inst in ipairs(all) do
         if inst.server then
-          M._stop_instance(tab_id)
+          M._stop_instance_record(inst)
         else
           clear_mention_queue_for(inst)
         end
@@ -420,7 +498,13 @@ function M.setup(opts)
         require("claudecode.plan_view").cleanup()
       end)
       pcall(function()
+        require("claudecode.interrupt_watch").stop()
+      end)
+      pcall(function()
         require("claudecode.terminal_links").cleanup()
+      end)
+      pcall(function()
+        require("claudecode.agents_view").cleanup()
       end)
     end,
     desc = "Automatically stop Claude Code integration when exiting Neovim",
@@ -450,10 +534,28 @@ function M.setup(opts)
   --
   -- Status tracking rides the same watcher: a Claude that ended has no activity
   -- to report, so its tab goes back to "none".
-  if require("claudecode.session_state").is_enabled() or require("claudecode.status").is_enabled() then
+  if
+    require("claudecode.session_state").is_enabled()
+    or require("claudecode.status").is_enabled()
+    or require("claudecode.agents_view").is_enabled()
+  then
     vim.api.nvim_create_autocmd("TermClose", {
       group = vim.api.nvim_create_augroup("ClaudeCodeSessionClose", { clear = true }),
       callback = function(args)
+        -- An agent's terminal is the agents view's business: its conversations
+        -- are tracked per session, not per tab, so the tab-level bookkeeping
+        -- below would clear the whole tab because one of N agents ended.
+        local agent_session
+        pcall(function()
+          agent_session = vim.b[args.buf].claudecode_agent_session
+        end)
+        if agent_session then
+          pcall(function()
+            require("claudecode.agents_view").note_terminal_closed(args.buf)
+          end)
+          return
+        end
+
         local tab
         pcall(function()
           tab = vim.b[args.buf].claudecode_tab
@@ -485,18 +587,31 @@ function M.setup(opts)
       pcall(function()
         require("claudecode.status").forget_closed_tabs()
       end)
-      for tab_id, inst in pairs(M.instances) do
+      pcall(function()
+        require("claudecode.agents_view").forget_closed_tabs()
+      end)
+      -- Snapshot before stopping: _stop_instance_record mutates the registry.
+      local orphaned = {}
+      for _, inst in pairs(M.instances) do
+        if not inst.tab or not vim.api.nvim_tabpage_is_valid(inst.tab) then
+          orphaned[#orphaned + 1] = inst
+        end
+      end
+      for _, inst in ipairs(orphaned) do
+        if inst.server then
+          M._stop_instance_record(inst)
+        else
+          clear_mention_queue_for(inst)
+          M.instances[inst.id] = nil
+        end
+      end
+      for tab_id in pairs(M.tab_instance) do
         if not vim.api.nvim_tabpage_is_valid(tab_id) then
-          if inst.server then
-            M._stop_instance(tab_id)
-          else
-            clear_mention_queue_for(inst)
-            M.instances[tab_id] = nil
-          end
+          M.tab_instance[tab_id] = nil
         end
       end
     end,
-    desc = "Stop Claude Code instance when its tab is closed",
+    desc = "Stop Claude Code instances when their tab is closed",
   })
 
   -- Auto-start in new tabs if configured.
@@ -521,6 +636,13 @@ function M.setup(opts)
 
   -- Only bound when there are sessions to restore: with session_persistence off
   -- the command has nothing to do, and an inert mapping just occupies the key.
+  if require("claudecode.agents_view").is_enabled() then
+    vim.keymap.set("n", "<leader>aA", "<cmd>ClaudeCodeAgents<cr>", {
+      desc = "Toggle the Claude agents view",
+      silent = true,
+    })
+  end
+
   if require("claudecode.session_state").is_enabled() then
     vim.keymap.set("n", "<leader>aR", "<cmd>ClaudeCodeSessionRestore!<cr>", {
       desc = "Restore Claude sessions in every tab",
@@ -532,10 +654,9 @@ function M.setup(opts)
   return M
 end
 
----Stop the Claude Code integration for a specific tab (internal helper).
----@param tab_id number
-function M._stop_instance(tab_id)
-  local inst = M.instances[tab_id]
+---Stop one instance, whichever tab or agent it belongs to.
+---@param inst table|nil
+function M._stop_instance_record(inst)
   if not inst then
     return
   end
@@ -543,11 +664,11 @@ function M._stop_instance(tab_id)
   local lockfile = require("claudecode.lockfile")
   lockfile.remove(inst.port)
 
-  -- Disable selection tracking only if this is the last running instance
+  -- Disable selection tracking only if this was the last running instance
   if M.state.config.track_selection then
     local any_remaining = false
-    for t, i in pairs(M.instances) do
-      if t ~= tab_id and i.server then
+    for id, other in pairs(M.instances) do
+      if id ~= inst.id and other.server then
         any_remaining = true
         break
       end
@@ -568,8 +689,99 @@ function M._stop_instance(tab_id)
     inst.connection_timer = nil
   end
 
-  M.instances[tab_id] = nil
-  logger.info("init", "Claude Code integration stopped (tab " .. tostring(tab_id) .. ")")
+  M.instances[inst.id] = nil
+  if inst.tab and M.tab_instance[inst.tab] == inst.id then
+    M.tab_instance[inst.tab] = nil
+  end
+  logger.info("init", "Claude Code integration stopped (" .. tostring(inst.id) .. ")")
+end
+
+---Stop the Claude Code integration for a specific tab (internal helper).
+---Stops that tab's own Claude; agents in the tab are stopped separately, since
+---closing a tab's chat is not the same as ending the agents running in it.
+---@param tab_id number
+function M._stop_instance(tab_id)
+  M._stop_instance_record(get_instance(tab_id))
+end
+
+---Bring up one server instance: auth token, WebSocket server, lock file.
+---
+---Shared by a tab's own Claude and by each agents-mode agent, so both get the
+---same isolation — their own port, token and lock file — and a request can always
+---be traced back to the instance that received it.
+---@param opts { id: string, tab: integer, kind: "tab"|"agent", session_id: string? }
+---@return table|nil inst
+---@return string|nil error
+local function start_instance(opts)
+  local server_module = require("claudecode.server.init")
+  local lockfile = require("claudecode.lockfile")
+
+  local auth_success, auth_result = pcall(function()
+    return lockfile.generate_auth_token()
+  end)
+
+  if not auth_success then
+    return nil, "Failed to generate authentication token: " .. (auth_result or "unknown error")
+  end
+
+  local auth_token = auth_result
+  if not auth_token or type(auth_token) ~= "string" or #auth_token < 10 then
+    return nil, "Invalid authentication token generated"
+  end
+
+  local srv = server_module.new_instance(opts.tab, {
+    instance_id = opts.id,
+    session_id = opts.session_id,
+    kind = opts.kind,
+  })
+  local success, result = srv.start(M.state.config, auth_token)
+
+  if not success then
+    local error_msg = "Failed to start Claude Code server: " .. (result or "unknown error")
+    if result and result:find("auth") then
+      error_msg = error_msg .. " (authentication related)"
+    end
+    return nil, error_msg
+  end
+
+  local port = tonumber(result)
+
+  local lock_success, lock_result, returned_auth_token = lockfile.create(port, auth_token)
+
+  if not lock_success then
+    srv.stop()
+    local error_msg = "Failed to create lock file: " .. (lock_result or "unknown error")
+    if lock_result and lock_result:find("auth") then
+      error_msg = error_msg .. " (authentication token issue)"
+    end
+    return nil, error_msg
+  end
+
+  if returned_auth_token ~= auth_token then
+    srv.stop()
+    return nil, "Authentication token mismatch between server and lock file"
+  end
+
+  local inst = {
+    id = opts.id,
+    kind = opts.kind,
+    tab = opts.tab,
+    session_id = opts.session_id,
+    server = srv,
+    port = port,
+    auth_token = auth_token,
+    mention_queue = {},
+    mention_timer = nil,
+    connection_timer = nil,
+  }
+  M.instances[opts.id] = inst
+
+  if M.state.config.track_selection then
+    local selection = require("claudecode.selection")
+    selection.enable(nil, M.state.config.visual_demotion_delay_ms)
+  end
+
+  return inst, nil
 end
 
 ---Start the Claude Code integration for the current tab.
@@ -583,93 +795,65 @@ function M.start(show_startup_notification)
 
   local tab_id = vim.api.nvim_get_current_tabpage()
 
-  local existing = M.instances[tab_id]
+  local existing = get_instance(tab_id)
   if existing and existing.server then
     local msg = "Claude Code integration is already running on port " .. tostring(existing.port)
     logger.warn("init", msg)
     return false, "Already running"
   end
 
-  local server_module = require("claudecode.server.init")
-  local lockfile = require("claudecode.lockfile")
-
-  -- Generate auth token
-  local auth_token
-  local auth_success, auth_result = pcall(function()
-    return lockfile.generate_auth_token()
-  end)
-
-  if not auth_success then
-    local error_msg = "Failed to generate authentication token: " .. (auth_result or "unknown error")
-    logger.error("init", error_msg)
-    return false, error_msg
+  local inst, err = start_instance({ id = tab_instance_id(tab_id), tab = tab_id, kind = "tab" })
+  if not inst then
+    logger.error("init", err)
+    return false, err
   end
 
-  auth_token = auth_result
-
-  if not auth_token or type(auth_token) ~= "string" or #auth_token < 10 then
-    local error_msg = "Invalid authentication token generated"
-    logger.error("init", error_msg)
-    return false, error_msg
-  end
-
-  -- Create a fresh server instance for this tab
-  local srv = server_module.new_instance(tab_id)
-  local success, result = srv.start(M.state.config, auth_token)
-
-  if not success then
-    local error_msg = "Failed to start Claude Code server: " .. (result or "unknown error")
-    if result and result:find("auth") then
-      error_msg = error_msg .. " (authentication related)"
-    end
-    logger.error("init", error_msg)
-    return false, error_msg
-  end
-
-  local port = tonumber(result)
-
-  local lock_success, lock_result, returned_auth_token = lockfile.create(port, auth_token)
-
-  if not lock_success then
-    srv.stop()
-    local error_msg = "Failed to create lock file: " .. (lock_result or "unknown error")
-    if lock_result and lock_result:find("auth") then
-      error_msg = error_msg .. " (authentication token issue)"
-    end
-    logger.error("init", error_msg)
-    return false, error_msg
-  end
-
-  if returned_auth_token ~= auth_token then
-    srv.stop()
-    local error_msg = "Authentication token mismatch between server and lock file"
-    logger.error("init", error_msg)
-    return false, error_msg
-  end
-
-  -- Store the instance for this tab
-  M.instances[tab_id] = {
-    server = srv,
-    port = port,
-    auth_token = auth_token,
-    mention_queue = {},
-    mention_timer = nil,
-    connection_timer = nil,
-  }
-
-  if M.state.config.track_selection then
-    local selection = require("claudecode.selection")
-    selection.enable(nil, M.state.config.visual_demotion_delay_ms)
-  end
+  M.tab_instance[tab_id] = inst.id
 
   if show_startup_notification then
     logger.info(
       "init",
-      "Claude Code integration started on port " .. tostring(port) .. " (tab " .. tostring(tab_id) .. ")"
+      "Claude Code integration started on port " .. tostring(inst.port) .. " (tab " .. tostring(tab_id) .. ")"
     )
   end
 
-  return true, port
+  return true, inst.port
+end
+
+---Start a server dedicated to one agents-mode conversation.
+---
+---Agents share a tabpage but not a server: with one instance each, a diff, an
+---@ mention or a `closeAllDiffTabs` reaches exactly the agent it belongs to,
+---rather than every Claude that happens to sit in the same tab.
+---@param session_id string Conversation id the agent was launched with.
+---@param tab_id integer|nil Tabpage hosting the agents view.
+---@return table|nil inst
+---@return string|nil error
+function M.start_agent_instance(session_id, tab_id)
+  if type(session_id) ~= "string" or session_id == "" then
+    return nil, "session_id is required"
+  end
+  tab_id = tab_id or vim.api.nvim_get_current_tabpage()
+
+  local id = agent_instance_id(session_id)
+  local existing = M.instances[id]
+  if existing and existing.server then
+    return existing, nil
+  end
+
+  local inst, err = start_instance({ id = id, tab = tab_id, kind = "agent", session_id = session_id })
+  if not inst then
+    logger.error("init", "agent instance failed: " .. tostring(err))
+    return nil, err
+  end
+  logger.debug("init", "agent instance started on port", tostring(inst.port), "for session", session_id)
+  return inst, nil
+end
+
+---Stop the server dedicated to one agents-mode conversation.
+---@param session_id string
+function M.stop_agent_instance(session_id)
+  M._stop_instance_record(M.instances[agent_instance_id(session_id)])
 end
 
 ---Stop the Claude Code integration for the current tab.
@@ -677,7 +861,7 @@ end
 ---@return string|nil error
 function M.stop()
   local tab_id = vim.api.nvim_get_current_tabpage()
-  local inst = M.instances[tab_id]
+  local inst = get_instance(tab_id)
 
   if not inst or not inst.server then
     logger.warn("init", "Claude Code integration is not running on current tab")
@@ -748,6 +932,26 @@ function M._create_commands()
       return { "on", "off" }
     end,
     desc = "Toggle showing Claude's plan-mode plan in an editor split (optionally: on | off)",
+  })
+
+  vim.api.nvim_create_user_command("ClaudeCodeAgents", function(opts)
+    require("claudecode.agents_view").toggle(opts.args ~= "" and opts.args or nil)
+  end, {
+    nargs = "?",
+    complete = function()
+      return { "on", "off" }
+    end,
+    desc = "Toggle the Claude agents view: several agents on this project, side by side (optionally: on | off)",
+  })
+
+  vim.api.nvim_create_user_command("ClaudeCodeAgentNew", function()
+    local agents = require("claudecode.agents_view")
+    if not agents.is_open() then
+      agents.open()
+    end
+    agents.new_agent()
+  end, {
+    desc = "Start a new Claude agent in the agents view",
   })
 
   vim.api.nvim_create_user_command("ClaudeCodeStatus", function()

@@ -59,6 +59,13 @@ local CONFLICTING_FLAGS = {
 --- one it had.
 
 --- Live sessions: [tabpage handle] = ClaudeCodeSessionRecord
+--- Tabs whose conversations are managed elsewhere. The agents view owns several
+--- Claudes in one tab and tracks their ids itself, so per-tab bookkeeping has no
+--- single answer there: every hook event would rewrite the tab's record to
+--- whichever agent fired last, and a restored Neovim would resume that one agent
+--- as if it were the tab's own chat.
+local disowned = {}
+
 local records = {}
 
 --- Ids handed back by a restored Neovim session, not yet claimed by a launch:
@@ -134,10 +141,39 @@ function M.forget_closed_tabs()
   end
 end
 
+---Hand a tab's conversation bookkeeping over to another owner (the agents view).
+---
+---A disowned tab is invisible to this module: no id is minted for it, hook events
+---do not rewrite it, and it is left out of the persisted payload. Any record it
+---already had is dropped, since it described a chat that is no longer the tab's.
+---@param tab_id number|nil Defaults to the current tabpage.
+function M.disown_tab(tab_id)
+  tab_id = tab_id or vim.api.nvim_get_current_tabpage()
+  disowned[tab_id] = true
+  records[tab_id] = nil
+  pending[tab_id] = nil
+  M.sync_global()
+end
+
+---Take a tab's conversation bookkeeping back (the agents view closed).
+---@param tab_id number|nil Defaults to the current tabpage.
+function M.reclaim_tab(tab_id)
+  tab_id = tab_id or vim.api.nvim_get_current_tabpage()
+  disowned[tab_id] = nil
+end
+
+---@param tab_id number|nil
+---@return boolean
+function M.is_disowned(tab_id)
+  tab_id = tab_id or vim.api.nvim_get_current_tabpage()
+  return disowned[tab_id] == true
+end
+
 ---Test/reload helper: forget everything.
 function M.reset()
   records = {}
   pending = {}
+  disowned = {}
 end
 
 --------------------------------------------------------------------------------
@@ -165,13 +201,12 @@ local function uuid4()
     .. table.concat(hex, "", 11, 16)
 end
 
----@return string dir The Claude CLI's config directory.
-local function claude_config_dir()
-  local override = os.getenv("CLAUDE_CONFIG_DIR")
-  if override and override ~= "" then
-    return vim.fn.expand(override)
-  end
-  return vim.fn.expand("~/.claude")
+---A fresh conversation id, in the form the CLI expects.
+---Exposed so the agents view can name its own agents the same way a tab's Claude
+---is named, rather than reimplementing the generator.
+---@return string
+function M.new_session_id()
+  return uuid4()
 end
 
 ---Whether the CLI has a transcript for this session id. `--resume` on an id with
@@ -185,7 +220,7 @@ end
 ---@return boolean|nil exists nil when it cannot be determined (assume yes).
 local function transcript_exists(session_id)
   local ok, result = pcall(function()
-    local projects = claude_config_dir() .. "/projects"
+    local projects = require("claudecode.utils").claude_config_dir() .. "/projects"
     if vim.fn.isdirectory(projects) ~= 1 then
       return nil
     end
@@ -254,6 +289,10 @@ function M.launch_args(cmd_string, resolved_cwd)
 
   local ok_tab, tab_id = pcall(vim.api.nvim_get_current_tabpage)
   if not ok_tab then
+    return ""
+  end
+  -- The agents view names its own conversations and passes the flag itself.
+  if disowned[tab_id] then
     return ""
   end
   local cwd = resolved_cwd
@@ -327,6 +366,11 @@ function M.note_session_id(tab_id, session_id, cwd)
   if not tab_id or tab_id == 0 or not vim.api.nvim_tabpage_is_valid(tab_id) then
     return
   end
+  -- Several Claudes share a disowned tab, so "the tab is running session X" has
+  -- no single answer: each agent's events would overwrite the last.
+  if disowned[tab_id] then
+    return
+  end
 
   local record = records[tab_id]
   if record and record.session_id == session_id then
@@ -362,7 +406,9 @@ function M.capture()
   for _, tab_id in ipairs(vim.api.nvim_list_tabpages()) do
     -- Pending entries are included so quitting before ever opening Claude in a
     -- restored tab does not silently drop that tab's conversation.
-    local record = records[tab_id] or pending[tab_id]
+    -- A disowned tab is skipped: the agents view persists its own agents, and a
+    -- single per-tab id could only ever name one of them.
+    local record = not disowned[tab_id] and (records[tab_id] or pending[tab_id]) or nil
     -- Only ids the CLI has a transcript for: see `persistable_id`. A tab whose
     -- Claude never became a conversation is left out entirely, so it opens fresh
     -- next time instead of being armed with an id that cannot be resumed.
@@ -375,10 +421,22 @@ function M.capture()
       any = true
     end
   end
+  -- The agents view keeps its own bookkeeping (its tab holds several
+  -- conversations, which a per-tab id cannot describe), so it hands over a
+  -- record of its own to travel in the same payload.
+  local agents
+  local ok_agents, agents_view = pcall(require, "claudecode.agents_view")
+  if ok_agents and agents_view.capture then
+    agents = agents_view.capture()
+    if agents then
+      any = true
+    end
+  end
+
   if not any then
     return nil
   end
-  return { version = PAYLOAD_VERSION, tabs = tabs }
+  return { version = PAYLOAD_VERSION, tabs = tabs, agents = agents }
 end
 
 ---Apply a snapshot from `capture()` to the tabs that exist right now.
@@ -399,12 +457,19 @@ function M.restore(data, opts)
   if type(data) == "string" then
     data = M.decode(data)
   end
-  if type(data) ~= "table" or type(data.tabs) ~= "table" then
+  if type(data) ~= "table" or (type(data.tabs) ~= "table" and type(data.agents) ~= "table") then
     return false
   end
   if data.version ~= PAYLOAD_VERSION then
     logger.warn("session", "ignoring session data written by a different version: " .. tostring(data.version))
     return false
+  end
+  data.tabs = type(data.tabs) == "table" and data.tabs or {}
+
+  if type(data.agents) == "table" then
+    pcall(function()
+      require("claudecode.agents_view").restore(data.agents, opts)
+    end)
   end
 
   local applied = 0

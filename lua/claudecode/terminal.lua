@@ -228,8 +228,12 @@ local function build_config(opts_override)
         return false
       end,
     }
+    -- The validators table is the whitelist of overridable keys. Gating on
+    -- `effective_config[key] ~= nil` instead would silently drop every override
+    -- whose default is nil -- which is exactly `cwd` and `cwd_provider`, so
+    -- "open this terminal in that directory" quietly did nothing.
     for key, val in pairs(opts_override) do
-      if effective_config[key] ~= nil and validators[key] and validators[key](val) then
+      if validators[key] and validators[key](val) then
         effective_config[key] = val
       end
     end
@@ -289,9 +293,12 @@ end
 ---Gets the claude command string and necessary environment variables
 ---@param cmd_args string? Optional arguments to append to the command
 ---@param effective_config table? The built terminal config (for the spawn cwd)
+---@param instance table? Server instance this launch should talk to. Defaults to
+---       the current tab's; agents mode passes its own so each agent connects to
+---       its own server rather than sharing the tab's.
 ---@return string cmd_string The command string
 ---@return table env_table The environment variables table
-local function get_claude_command_and_env(cmd_args, effective_config)
+local function get_claude_command_and_env(cmd_args, effective_config, instance)
   -- Inline get_claude_command logic
   local cmd_from_config = defaults.terminal_cmd
   local base_cmd
@@ -308,14 +315,16 @@ local function get_claude_command_and_env(cmd_args, effective_config)
     cmd_string = base_cmd
   end
 
-  -- Ensure a server exists for this tab before launching the CLI. Otherwise
+  -- Ensure a server exists for this launch before starting the CLI. Otherwise
   -- CLAUDE_CODE_SSE_PORT is unset and the CLI scans lock files, often
   -- connecting to another tab's server and routing all requests there.
-  local instance = claudecode_main.get_instance()
-  if not instance.server then
-    local started = pcall(claudecode_main.start, false)
-    if started then
-      instance = claudecode_main.get_instance()
+  if not instance then
+    instance = claudecode_main.get_instance()
+    if not instance.server then
+      local started = pcall(claudecode_main.start, false)
+      if started then
+        instance = claudecode_main.get_instance()
+      end
     end
   end
   local sse_port_value = instance.port
@@ -380,6 +389,21 @@ end
 ---
 ---Also the point where this tab first counts as "has a Claude", which is what
 ---status tracking reports until the CLI's own hooks start arriving.
+---What `<S-CR>` does in a Claude terminal: insert a newline rather than submit.
+---
+---Exported because it is applied through two different mechanisms — the snacks
+---provider hands it to `snacks.win`'s `keys` spec, while agents mode binds it on
+---the terminal buffer itself (the providers hold one terminal per tabpage, so
+---agents place their own). The escape sequence and its 10ms gap are the part
+---that must not drift between them: change it in one place and an agent's
+---terminal would quietly behave differently from every other Claude.
+function M.send_newline()
+  vim.api.nvim_feedkeys("\\", "t", true)
+  vim.defer_fn(function()
+    vim.api.nvim_feedkeys("\r", "t", true)
+  end, 10)
+end
+
 local function tag_terminal_tab()
   local ok, bufnr = pcall(function()
     return get_provider().get_active_bufnr()
@@ -634,6 +658,29 @@ end
 function M.toggle(opts_override, cmd_args)
   -- Default to simple toggle for backward compatibility
   M.simple_toggle(opts_override, cmd_args)
+end
+
+---Build the command line and environment a Claude launch needs, without opening
+---anything.
+---
+---This is the same construction the providers get — server ensured, SSE port and
+---IDE-integration vars set, user `env` merged, session-persistence flags and the
+---launch hook appended. Agents mode needs it because it places its own terminals:
+---the providers hold exactly one terminal per tabpage, and agents mode runs
+---several in one tab.
+---@param cmd_args string? Extra arguments (e.g. "--resume <id>").
+---@param opts { overrides: table?, cwd: string?, instance: table? }|nil
+---@return string cmd_string
+---@return table env_table
+---@return table effective_config The resolved terminal config, including the spawn cwd.
+function M.build_launch(cmd_args, opts)
+  opts = opts or {}
+  local effective_config = build_config(opts.overrides)
+  if type(opts.cwd) == "string" and opts.cwd ~= "" then
+    effective_config.cwd = vim.fn.expand(opts.cwd)
+  end
+  local cmd_string, env_table = get_claude_command_and_env(cmd_args, effective_config, opts.instance)
+  return cmd_string, env_table, effective_config
 end
 
 ---Gets the buffer number of the currently active Claude Code terminal.

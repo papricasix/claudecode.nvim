@@ -120,7 +120,7 @@ describe("ClaudeCodeAdd command", function()
     claudecode = require("claudecode")
 
     -- Set up the server instance for the current tab (tabpage 1 in mock)
-    claudecode.instances[1] = { server = mock_server, port = 12345, mention_queue = {} }
+    claudecode.register_tab_instance(1, { server = mock_server, port = 12345, mention_queue = {} })
   end)
 
   after_each(function()
@@ -169,7 +169,7 @@ describe("ClaudeCodeAdd command", function()
 
     describe("validation", function()
       it("should error when server is not running", function()
-        claudecode.instances[1] = nil
+        claudecode.unregister_tab_instance(1)
 
         command_handler({ args = "/existing/file.lua" })
 

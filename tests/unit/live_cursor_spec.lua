@@ -165,6 +165,40 @@ describe("live_cursor", function()
       end
     end)
 
+    after_each(function()
+      package.loaded["claudecode.agents_view"] = nil
+      package.loaded["claudecode.agents.registry"] = nil
+    end)
+
+    it("dismisses a viewed plan file once the plan is answered", function()
+      -- Claude writes a plan to a file, shows it with openFile, and asks in the
+      -- terminal. Answering there is what ends it, so `PostToolUse(ExitPlanMode)`
+      -- takes the float away. Scoped to that conversation *and* to floats opened
+      -- for viewing: a diff float is a question still waiting for an answer.
+      local float = require("claudecode.float")
+      float.reset()
+      float.setup({})
+      float.create({ session_id = "s1", title = "plan.md", purpose = "open" })
+      float.create({ session_id = "s1", title = "a.lua", purpose = "diff" })
+      float.create({ session_id = "s2", title = "other.md", purpose = "open" })
+
+      live_cursor.dispatch({
+        hook_event_name = "PostToolUse",
+        tool_name = "ExitPlanMode",
+        session_id = "s1",
+      })
+
+      local left = {}
+      for _, entry in ipairs(float.list()) do
+        left[#left + 1] = entry.title
+      end
+      table.sort(left)
+      expect(#left).to_be(2)
+      expect(left[1]).to_be("a.lua")
+      expect(left[2]).to_be("other.md")
+      float.reset()
+    end)
+
     it("ignores non-PreToolUse events", function()
       live_cursor.dispatch({ hook_event_name = "PostToolUse", tool_name = "Read", tool_input = { file_path = "/x" } })
       expect(#shown).to_be(0)
@@ -190,6 +224,48 @@ describe("live_cursor", function()
       })
       expect(shown[1].opts.start_line).to_be(1)
       expect(shown[1].opts.end_line).to_be_nil()
+    end)
+
+    it("shows nothing for a Claude that agents mode is hosting", function()
+      -- Every window in the agents tab is one of its panes, so there is no editor
+      -- window to preview into: without this the preview lands in whichever pane
+      -- the cursor is in and dismantles the layout.
+      package.loaded["claudecode.agents_view"] = {
+        note = function() end,
+        is_agents_tab = function(tab)
+          return tab == 7
+        end,
+      }
+      live_cursor.dispatch({
+        hook_event_name = "PreToolUse",
+        tool_name = "Read",
+        tool_input = { file_path = "/x" },
+      }, 7)
+      expect(#shown).to_be(0)
+
+      -- ...and still previews for a Claude that is not one of its agents.
+      live_cursor.dispatch({
+        hook_event_name = "PreToolUse",
+        tool_name = "Read",
+        tool_input = { file_path = "/x" },
+      })
+      expect(#shown).to_be(1)
+    end)
+
+    it("shows nothing for a conversation the agents registry is running", function()
+      -- The tab stamp is where the CLI launched; the registry is the authority.
+      package.loaded["claudecode.agents.registry"] = {
+        is_live = function(id)
+          return id == "agent-1"
+        end,
+      }
+      live_cursor.dispatch({
+        hook_event_name = "PreToolUse",
+        tool_name = "Read",
+        tool_input = { file_path = "/x" },
+        session_id = "agent-1",
+      })
+      expect(#shown).to_be(0)
     end)
 
     it("suppresses an edit when a review diff owns the file", function()
