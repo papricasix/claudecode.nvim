@@ -23,11 +23,12 @@ local function handler(params)
   -- Scope the untracked-window scan to the calling Claude's tab. In the
   -- multi-tab architecture every per-tab server shares this handler, so scanning
   -- all windows would close diff windows belonging to a *different* tab's Claude
-  -- (see diff.close_all_diffs for the matching rationale). When no owning tab is
-  -- known (single-instance / legacy / tests) we fall back to every window.
-  local active_tab = _G._claudecode_active_tab_id
+  -- (see diff.close_all_diffs for the matching rationale). The tab is named by
+  -- the instance that sent this message; when no owner is known (legacy / tests)
+  -- we fall back to every window.
+  local active_tab = require("claudecode.request_context").tab()
   local windows
-  if active_tab and vim.api.nvim_tabpage_is_valid(active_tab) then
+  if active_tab then
     windows = vim.api.nvim_tabpage_list_wins(active_tab)
   else
     windows = vim.api.nvim_list_wins()

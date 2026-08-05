@@ -14,7 +14,12 @@ logger.debug("server", "Server module loaded with instance ID:", module_instance
 
 -- Create a fully independent server instance.
 -- tab_id is the Neovim tabpage handle this instance belongs to (nil for singleton).
-local function create_instance(tab_id)
+-- opts identifies the instance beyond its tab, which matters once a tab holds
+-- more than one Claude (agents mode): { instance_id, session_id, kind }.
+---@param tab_id integer|nil
+---@param opts { instance_id: string?, session_id: string?, kind: string? }|nil
+local function create_instance(tab_id, opts)
+  opts = opts or {}
   local state = {
     server = nil,
     port = nil,
@@ -22,6 +27,9 @@ local function create_instance(tab_id)
     handlers = {},
     ping_timer = nil,
     tab_id = tab_id,
+    instance_id = opts.instance_id,
+    session_id = opts.session_id,
+    kind = opts.kind or "tab",
   }
 
   local inst = { state = state }
@@ -111,7 +119,15 @@ local function create_instance(tab_id)
 
     local callbacks = {
       on_message = function(client, message)
-        _G._claudecode_active_tab_id = state.tab_id
+        -- Name the sender before dispatching: tool handlers resolve where their
+        -- work belongs from this, and with several Claudes in one tab the tab
+        -- alone no longer identifies who asked.
+        require("claudecode.request_context").set({
+          instance_id = state.instance_id,
+          tab = state.tab_id,
+          session_id = state.session_id,
+          kind = state.kind,
+        })
         inst._handle_message(client, message)
       end,
       on_connect = function(client)
@@ -428,9 +444,10 @@ end
 
 ---Create a new independent server instance for a specific tab.
 ---@param tab_id number|nil The Neovim tabpage handle this instance belongs to
+---@param opts { instance_id: string?, session_id: string?, kind: string? }|nil
 ---@return table instance A self-contained server object with start/stop/broadcast/etc.
-function M.new_instance(tab_id)
-  return create_instance(tab_id)
+function M.new_instance(tab_id, opts)
+  return create_instance(tab_id, opts)
 end
 
 return M

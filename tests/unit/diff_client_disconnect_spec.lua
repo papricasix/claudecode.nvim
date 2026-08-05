@@ -95,16 +95,16 @@ describe("issue #248: closing orphaned diffs", function()
     vim._tabs[101] = true
     vim._tabs[102] = true
 
-    _G._claudecode_active_tab_id = 101
+    require("claudecode.request_context").set({ tab = 101, instance_id = "tab:" .. tostring(101), kind = "tab" })
     local a = open_pending(file_a, "tab-101", "client101")
-    _G._claudecode_active_tab_id = 102
+    require("claudecode.request_context").set({ tab = 102, instance_id = "tab:" .. tostring(102), kind = "tab" })
     local b = open_pending(file_b, "tab-102", "client102")
 
     assert.equal(101, diff._get_active_diffs()["tab-101"].original_tab_number)
     assert.equal(102, diff._get_active_diffs()["tab-102"].original_tab_number)
 
     -- closeAllDiffTabs arrives from tab 101's Claude (its server set the active id).
-    _G._claudecode_active_tab_id = 101
+    require("claudecode.request_context").set({ tab = 101, instance_id = "tab:" .. tostring(101), kind = "tab" })
     local closed = diff.close_all_diffs("closeAllDiffTabs from tab 101")
 
     -- The calling tab's diff is closed/rejected...
@@ -117,9 +117,45 @@ describe("issue #248: closing orphaned diffs", function()
     assert.is_table(diff._get_active_diffs()["tab-102"])
     assert.is_nil(b.result)
 
-    _G._claudecode_active_tab_id = nil
+    require("claudecode.request_context").clear()
     vim._tabs[101] = nil
     vim._tabs[102] = nil
+  end)
+
+  -- Agents mode runs several Claudes in ONE tab, so tab scoping is no longer fine
+  -- enough: without instance scoping, one agent's routine closeAllDiffTabs would
+  -- reject a sibling agent's pending diff and that agent would stop, believing the
+  -- user declined its edit -- the same spurious-rejection bug, one level down.
+  it("close_all_diffs only closes diffs owned by the calling agent in a shared tab", function()
+    local ctx = require("claudecode.request_context")
+    vim._tabs[201] = true
+
+    ctx.set({ tab = 201, instance_id = "agent:aaa", session_id = "aaa", kind = "agent" })
+    local a = open_pending(file_a, "agent-a", "clientA")
+    ctx.set({ tab = 201, instance_id = "agent:bbb", session_id = "bbb", kind = "agent" })
+    local b = open_pending(file_b, "agent-b", "clientB")
+
+    local active = diff._get_active_diffs()
+    -- Both diffs live in the same tab; only the instance tells them apart.
+    assert.equal(201, active["agent-a"].original_tab_number)
+    assert.equal(201, active["agent-b"].original_tab_number)
+    assert.equal("agent:aaa", active["agent-a"].owner_instance_id)
+    assert.equal("agent:bbb", active["agent-b"].owner_instance_id)
+
+    ctx.set({ tab = 201, instance_id = "agent:aaa", session_id = "aaa", kind = "agent" })
+    local closed = diff.close_all_diffs("closeAllDiffTabs from agent aaa")
+
+    assert.equal(1, closed)
+    assert.equal("dead", coroutine.status(a.co))
+    assert.equal("DIFF_REJECTED", a.result.content[1].text)
+    assert.is_nil(diff._get_active_diffs()["agent-a"])
+    -- The sibling agent's diff is untouched and still awaiting the user.
+    assert.equal("suspended", coroutine.status(b.co))
+    assert.is_table(diff._get_active_diffs()["agent-b"])
+    assert.is_nil(b.result)
+
+    ctx.clear()
+    vim._tabs[201] = nil
   end)
 
   -- A status="saved" diff still holds the user's :w'd edits only in its proposed

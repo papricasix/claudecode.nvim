@@ -532,8 +532,20 @@ function M._open_in_editor(abspath, line)
   -- finish in the terminal first.
   vim.schedule(function()
     local diff = get_diff()
-    local win = diff and (diff.find_window_closest_to_terminal() or diff._find_main_editor_window()) or nil
+    -- A click is *your* action, not the agent's, so in a tab that owns its layout
+    -- this goes to a real editor window in the tab the view was opened from and
+    -- takes you there — deliberately unlike `openFile`, which floats. Elsewhere
+    -- it is the same window it always was.
+    local win = diff
+        and diff.resolve_target_window({
+          tab = vim.api.nvim_get_current_tabpage(),
+          purpose = "click",
+          file_path = abspath,
+        })
+      or nil
     if win and vim.api.nvim_win_is_valid(win) then
+      -- Also switches tabpage when the window is in another one, which is the
+      -- point: the file opens where you can work in it.
       vim.api.nvim_set_current_win(win)
     else
       vim.cmd("aboveleft vsplit") -- only the terminal (and maybe sidebars) on screen

@@ -81,12 +81,13 @@ local function get_autocmd_group()
 end
 
 ---Resolve the tab that owns the currently active Claude Code WebSocket message.
----The server sets `_G._claudecode_active_tab_id` on every incoming message; we
----fall back to the user's current tab when no owner is known (e.g. tests).
+---Each server instance names itself in `claudecode.request_context` before
+---dispatching; we fall back to the user's current tab when no owner is known
+---(e.g. tests, or work not triggered by a Claude message at all).
 ---@return integer owning_tab Tabpage handle of the owning Claude instance
 local function get_owning_tab()
-  local target = _G._claudecode_active_tab_id
-  if target and vim.api.nvim_tabpage_is_valid(target) then
+  local target = require("claudecode.request_context").tab()
+  if target then
     return target
   end
   return vim.api.nvim_get_current_tabpage()
@@ -99,7 +100,7 @@ end
 ---returns, the user's view is restored.
 ---
 ---This is the canonical entry point for any diff/UI work triggered by a
----Claude tool call. Use it instead of reading `_G._claudecode_active_tab_id`
+---Claude tool call. Use it instead of reading `claudecode.request_context`
 ---directly so future code paths route correctly by default.
 ---@generic T
 ---@param fn fun(owning_tab: integer): T
@@ -123,8 +124,8 @@ end
 ---the legacy `_open_native_diff` path which still needs it.
 ---@return boolean switched
 local function switch_to_owning_tab_if_needed()
-  local target = _G._claudecode_active_tab_id
-  if not target or not vim.api.nvim_tabpage_is_valid(target) then
+  local target = require("claudecode.request_context").tab()
+  if not target then
     return false
   end
   if vim.api.nvim_get_current_tabpage() == target then
@@ -197,6 +198,207 @@ end
 
 -- Exposed for testing the sidebar/explorer exclusion logic.
 M._find_main_editor_window = find_main_editor_window
+
+---A floating window to host this diff, when one is called for.
+---
+---Two cases want a float: `diff_opts.layout = "float"` asks for it outright, and
+---the agents view has no editor window to offer at all — every one of its panes
+---is a terminal or a sidebar, deliberately excluded from being a diff target.
+---The float is titled with the agent that asked, which is the only way to tell
+---several agents' diffs apart on one screen.
+---@param file_path string|nil Shown in the float's title.
+---@return integer|nil win nil when a normal editor window should be used.
+function M._float_window_for_diff(file_path)
+  local wants_float = config and config.diff_opts and config.diff_opts.layout == "float"
+
+  -- A float holds one buffer, which is exactly what the unified provider needs:
+  -- it renders the change inline in the proposed buffer. The native provider
+  -- needs two real windows side by side to run `diffthis`, and a split inside a
+  -- float is a normal window, so there is no float shape for it. Say so once
+  -- rather than letting the setting look like it took effect.
+  if wants_float and M._resolve_provider() ~= "unified" then
+    if not M._float_warning_shown then
+      M._float_warning_shown = true
+      vim.notify(
+        "ClaudeCode: diff_opts.layout = 'float' needs unified.nvim; using a split instead",
+        vim.log.levels.WARN
+      )
+    end
+    return nil
+  end
+
+  local ctx = require("claudecode.request_context")
+  local session_id = ctx.session_id()
+  local owner = M._layout_owner(ctx.tab())
+  local hosts_floats = owner ~= nil and owner.host == "float"
+
+  if not wants_float and not hosts_floats then
+    return nil
+  end
+
+  return M.open_float({
+    session_id = session_id,
+    file_path = file_path,
+    owner = owner,
+    purpose = "diff",
+  })
+end
+
+---Open a float for a file, through whichever module hosts this tab's floats.
+---
+---Two doors onto one stack. A tab that owns its layout names its own host module
+---(`float_module` on the descriptor), which carries that feature's geometry,
+---border highlight and tag; everything else goes straight to the shared module
+---and is configured by the top-level `float` block. Before they were split, a
+---user with agents disabled was sizing their diffs through `agents.float`.
+---@param opts { session_id: string?, file_path: string?, owner: table?, purpose: string?,
+---             title: string? }
+---@return integer|nil win
+function M.open_float(opts)
+  opts = opts or {}
+  local title = opts.title
+  if not title then
+    title = opts.file_path and vim.fn.fnamemodify(opts.file_path, ":t") or "diff"
+    if opts.session_id then
+      title = title .. "  ·  " .. opts.session_id:sub(1, 8)
+    end
+  end
+
+  local module = (opts.owner and opts.owner.float_module) or "claudecode.float"
+  local ok, float = pcall(require, module)
+  if not ok or type(float.create_for) ~= "function" then
+    ok, float = pcall(require, "claudecode.float")
+    if not ok then
+      return nil
+    end
+    -- Parenthesised: `create` also hands back the buffer, and this returns a window.
+    return (float.create({ session_id = opts.session_id, title = title, purpose = opts.purpose }))
+  end
+  return (float.create_for({ session_id = opts.session_id, title = title, purpose = opts.purpose }))
+end
+
+---Where a file should go, for every caller that has to put one somewhere.
+---
+---Three callers ask this and until now only one of them knew any of the rules:
+---the diff provider had them, while `openFile` and a clicked terminal link each
+---had their own ladder ending in a `vsplit`. In a tab that owns its layout those
+---ladders found no suitable window — every pane is deliberately tagged as
+---not-an-editor — so the fallback fired every time and split whichever pane
+---happened to be current, which is exactly what `forbids_split` exists to stop.
+---
+---What `purpose` decides, and why the three differ:
+---
+---* `"diff"` and `"open"` are the agent's idea. In a layout-owning tab they go to
+---  a float: it appears over the arrangement rather than dismantling it, and a
+---  diff is answerable there without ever reaching the editor.
+---* `"click"` is *yours* — you clicked a path because you want to read the file,
+---  so it goes to a real editor window in the tab the view was opened from, and
+---  focusing it takes you there. Deliberately different from `"open"`.
+---
+---With no layout owner every purpose takes the ordinary route: the editor window
+---closest to the terminal, else the main editor window. A nil result means the
+---caller's own fallback (a split) is fine — nothing here forbids it.
+---@param opts { tab: integer?, purpose: "diff"|"open"|"click", file_path: string?,
+---             session_id: string?, candidates: integer[]? }
+---@return integer|nil win
+---@return "float"|"window"|nil kind What was resolved, so a caller can tell a
+---        float (already focused, wants `bind_close`) from an editor window.
+function M.resolve_target_window(opts)
+  opts = opts or {}
+  local purpose = opts.purpose or "open"
+  local owner = M._layout_owner(opts.tab)
+
+  if owner and owner.forbids_split then
+    if purpose == "click" then
+      -- Take the user to their own tab rather than putting the file in a frame
+      -- over the one they are working in.
+      local origin = owner.origin
+      if origin and vim.api.nvim_tabpage_is_valid(origin) then
+        local ok, wins = pcall(vim.api.nvim_tabpage_list_wins, origin)
+        local win = ok and find_main_editor_window(wins) or nil
+        if win then
+          return win, "window"
+        end
+      end
+      -- The tab it was opened from is gone. A float still beats splitting a pane.
+    end
+
+    if owner.host == "float" then
+      local win = M.open_float({
+        session_id = opts.session_id,
+        file_path = opts.file_path,
+        owner = owner,
+        purpose = purpose,
+      })
+      if win then
+        return win, "float"
+      end
+    end
+    return nil, nil
+  end
+
+  -- An explicit candidate list is the caller having already decided what may be
+  -- taken over, and it is scoped to a tab of its own choosing — `openFile` filters
+  -- out `nofile` windows there, which a diff legitimately may reuse. Picking by
+  -- screen geometry would silently widen that to every tab.
+  local win
+  if opts.candidates then
+    win = find_main_editor_window(opts.candidates)
+  else
+    win = M.find_window_closest_to_terminal() or find_main_editor_window()
+  end
+  if win then
+    return win, "window"
+  end
+  return nil, nil
+end
+
+---Where a diff should go when its owning tab owns its layout.
+---
+---The agents view records the tab it was opened from precisely for this: it is a
+---normal tab with normal editor windows, one keystroke away, and using it leaves
+---the agents layout intact.
+---@param tab integer|nil The tab that cannot host the diff.
+---@return integer|nil redirect
+function M._redirect_tab_for_diff(tab)
+  local owner = M._layout_owner(tab)
+  local origin = owner and owner.origin
+  if origin and vim.api.nvim_tabpage_is_valid(origin) then
+    return origin
+  end
+  return nil
+end
+
+---Whether a tab has declared that it owns its own layout and must not be split.
+---Set by views that build a fixed arrangement of windows (the agents view), where
+---an automatic split would carve up the layout rather than find a home for a file.
+---@param tab integer|nil
+---@return boolean
+function M._tab_forbids_split(tab)
+  local owner = M._layout_owner(tab)
+  return owner ~= nil and owner.forbids_split == true
+end
+
+---What a tab has declared about hosting files, if anything.
+---
+---`t:claudecode_layout_owner = { forbids_split, host, float_module, origin }`.
+---A view that builds a fixed arrangement of windows sets it once when it opens,
+---and everything that has to decide where a file goes reads it and needs to know
+---nothing about which feature built the tab. Before this there were five
+---separate checks for "is this the agents view?", three of them inside shared
+---modules reaching *up* into `claudecode.agents_view` by name.
+---@param tab integer|nil
+---@return table|nil
+function M._layout_owner(tab)
+  if not tab then
+    return nil
+  end
+  local ok, value = pcall(vim.api.nvim_tabpage_get_var, tab, "claudecode_layout_owner")
+  if ok and type(value) == "table" then
+    return value
+  end
+  return nil
+end
 
 ---Find the Claude Code terminal window to keep focus there.
 ---Uses the terminal provider to get the active terminal buffer, then finds its window.
@@ -1348,6 +1550,19 @@ function M._cleanup_diff_state(tab_name, reason)
       end
     end
   else
+    -- A float opened for this diff goes with it, whichever way it resolved.
+    -- Forced: on a reject the proposed buffer is still modified, and a plain
+    -- close would refuse and leave the float behind.
+    if diff_data.float_window and vim.api.nvim_win_is_valid(diff_data.float_window) then
+      -- The shared stack, whichever door the float came through.
+      local ok_float, float = pcall(require, "claudecode.float")
+      if ok_float and float.close then
+        float.close(diff_data.float_window)
+      else
+        pcall(vim.api.nvim_win_close, diff_data.float_window, true)
+      end
+    end
+
     -- Close new diff window if still open (only if not in a new tab)
     if diff_data.new_window and vim.api.nvim_win_is_valid(diff_data.new_window) then
       pcall(vim.api.nvim_win_close, diff_data.new_window, true)
@@ -1637,8 +1852,15 @@ function M._setup_blocking_diff_unified(params, resolution_callback)
     -- helpers below all read "current tab" implicitly, so we wrap the work in
     -- `in_owning_tab` which sets the owning tab as current for the duration.
     local target_window, pre_diff_buffer, new_buffer, original_cursor_pos, autocmd_ids
+    -- A float we opened for this diff is ours to close again; a window that was
+    -- already on screen is not.
+    local float_window = nil
     local owning_tab = in_owning_tab(function(tab)
-      target_window = find_window_adjacent_to_terminal()
+      target_window = M._float_window_for_diff(params.old_file_path)
+      float_window = target_window
+      if not target_window then
+        target_window = find_window_adjacent_to_terminal()
+      end
       if not target_window then
         target_window = find_main_editor_window()
       end
@@ -1734,11 +1956,18 @@ function M._setup_blocking_diff_unified(params, resolution_callback)
       new_window = nil, -- no separate diff window; we reused target_window
       target_window = target_window,
       target_window_created_by_plugin = false,
+      -- Closed on resolve. Without this the float outlived the diff: accepting
+      -- restored the displaced buffer into it, so the change vanished and an
+      -- empty float stayed on screen.
+      float_window = float_window,
       pre_diff_buffer = pre_diff_buffer,
       original_buffer = nil,
       original_buffer_created_by_plugin = false,
       original_cursor_pos = original_cursor_pos,
       original_tab_number = owning_tab,
+      -- Captured now, not read back later: this diff blocks on the user, and by
+      -- the time it resolves the context belongs to whoever asked most recently.
+      owner_instance_id = require("claudecode.request_context").get_instance_id(),
       created_new_tab = false,
       new_tab_number = nil,
       had_terminal_in_original = false,
@@ -1788,12 +2017,12 @@ function M._setup_blocking_diff(params, resolution_callback)
 
   -- Determine target tab from the active Claude instance without switching the current tab.
   -- Falls back to current tab when no active-tab hint is available.
-  local raw_active = _G._claudecode_active_tab_id
+  local requester = require("claudecode.request_context").get()
   local target_tab = get_owning_tab()
   logger.debug(
     "diff",
-    "target tab resolution - raw _claudecode_active_tab_id:",
-    tostring(raw_active),
+    "target tab resolution - requesting instance:",
+    tostring(requester and requester.instance_id),
     "resolved target_tab:",
     tostring(target_tab),
     "user_current_tab:",
@@ -1881,6 +2110,29 @@ function M._setup_blocking_diff(params, resolution_callback)
     -- Otherwise, if no editor window is suitable (e.g. the Claude terminal is the only window --
     -- issue #231), create one by splitting the current window instead of erroring out, mirroring
     -- the fallback in lua/claudecode/tools/open_file.lua.
+    if not target_window and not created_new_tab and M._tab_forbids_split(target_tab) then
+      -- A tab can declare that it owns its layout. Splitting there would carve up
+      -- a purpose-built arrangement — the agents view's panes are all deliberately
+      -- excluded from being editor windows, so this fallback would otherwise fire
+      -- every time and split whichever pane happened to be current.
+      --
+      -- The unified provider puts the diff in a float and never reaches here; this
+      -- is the native provider, which needs two real windows side by side. Send it
+      -- to the tab the view was opened from rather than failing the edit.
+      local redirect = M._redirect_tab_for_diff(target_tab)
+      if redirect then
+        target_tab = redirect
+        original_tab_number = redirect
+        target_window = find_main_editor_window(vim.api.nvim_tabpage_list_wins(redirect))
+      end
+      if not target_window then
+        error({
+          code = -32000,
+          message = "No editor window available",
+          data = "The owning tab manages its own layout and no other tab can host a diff",
+        })
+      end
+    end
     if not target_window and not created_new_tab then
       create_split()
       local scratch_buf = vim.api.nvim_create_buf(false, true) -- unlisted, scratch
@@ -2020,6 +2272,8 @@ function M._setup_blocking_diff(params, resolution_callback)
       original_buffer_created_by_plugin = diff_info.original_buffer_created_by_plugin,
       original_cursor_pos = original_cursor_pos,
       original_tab_number = original_tab_number,
+      -- See the unified provider: captured before the diff blocks on the user.
+      owner_instance_id = require("claudecode.request_context").get_instance_id(),
       created_new_tab = created_new_tab,
       new_tab_number = new_tab_handle,
       had_terminal_in_original = had_terminal_in_original,
@@ -2260,14 +2514,27 @@ end
 ---routine closeAllDiffTabs would reject a *different* tab's still-pending diff,
 ---which that background Claude receives as a spurious tool rejection (it then
 ---stops, believing the user declined the edit). We therefore only close diffs
----owned by the tab that issued this call (`_claudecode_active_tab_id`, set by
----the server on the incoming message). When no owning tab is known
----(single-instance / legacy / tests) we fall back to closing everything.
+---owned by the caller. When no owner is known (legacy / tests) we fall back to
+---closing everything.
+---
+---Scoping is by *instance* first and tab second. A tab used to imply a single
+---Claude, so the tab was the finest grain available; agents mode puts several in
+---one tab, where tab scoping would let one agent's routine closeAllDiffTabs
+---reject a sibling's pending diff — the same spurious-rejection bug, one level
+---down. Instances that predate an owner id still fall back to tab scope.
 ---@param reason string Human-readable reason (for logging)
 ---@return number count Number of diffs closed
 function M.close_all_diffs(reason)
-  local active_tab = _G._claudecode_active_tab_id
-  if active_tab and vim.api.nvim_tabpage_is_valid(active_tab) then
+  local ctx = require("claudecode.request_context")
+  local owner = ctx.get_instance_id()
+  if owner then
+    return close_active_diffs(function(diff_data)
+      return diff_data.owner_instance_id == owner
+    end, reason or ("close all diffs for " .. tostring(owner)))
+  end
+
+  local active_tab = ctx.tab()
+  if active_tab then
     return close_active_diffs(function(diff_data)
       return diff_data.original_tab_number == active_tab
     end, reason or ("close all diffs for tab " .. tostring(active_tab)))

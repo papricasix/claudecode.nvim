@@ -229,4 +229,46 @@ describe("Tool: open_file", function()
     expect(result.content[1].type).to_be("text")
     assert_contains(result.content[1].text, "not found")
   end)
+
+  describe("window targeting", function()
+    local ctx
+
+    before_each(function()
+      ctx = require("claudecode.request_context")
+      ctx.clear()
+      _G.vim.api.nvim_tabpage_is_valid = spy.new(function()
+        return true
+      end)
+      _G.vim.api.nvim_get_current_tabpage = spy.new(function()
+        return 1
+      end)
+      -- Two tabs, one editor window each.
+      _G.vim.api.nvim_tabpage_list_wins = spy.new(function(tab)
+        return tab == 2 and { 2000 } or { 1000 }
+      end)
+    end)
+
+    after_each(function()
+      ctx.clear()
+    end)
+
+    it("opens the file in the tab that asked, not the one the user is on", function()
+      -- Regression: this used to scan nvim_list_wins() across every tab and take
+      -- the first suitable window anywhere, so a background Claude could open a
+      -- file into a tab that had nothing to do with it.
+      ctx.set({ tab = 2, instance_id = "tab:2", kind = "tab" })
+
+      local ok = pcall(open_file_handler, { filePath = "test.txt" })
+
+      expect(ok).to_be_true()
+      expect(_G.vim.api.nvim_win_call.calls[1].vals[1]).to_be(2000)
+    end)
+
+    it("falls back to the current tab when no Claude owns the request", function()
+      local ok = pcall(open_file_handler, { filePath = "test.txt" })
+
+      expect(ok).to_be_true()
+      expect(_G.vim.api.nvim_win_call.calls[1].vals[1]).to_be(1000)
+    end)
+  end)
 end)

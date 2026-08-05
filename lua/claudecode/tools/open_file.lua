@@ -48,54 +48,53 @@ local schema = {
 }
 
 ---Finds a suitable main editor window to open files in.
----Excludes terminals, sidebars, and floating windows.
+---
+---Delegates to `diff`'s finder rather than keeping a second copy of the rules.
+---The copy that used to live here drifted in two ways that mattered: it scanned
+---`nvim_list_wins()` across *every* tab, so a file could open in a tab the user
+---was not in and that no Claude owned, and it did not honour the
+---`claudecode_live_preview` tag, so it would take over windows the plugin had
+---explicitly marked as not-an-editor.
+---
+---Scoped to the tab that owns the request, which is where the asking Claude lives.
 ---@return integer? win_id Window ID of the main editor window, or nil if not found
-local function find_main_editor_window()
-  local windows = vim.api.nvim_list_wins()
+local function find_main_editor_window(file_path)
+  local diff = require("claudecode.diff")
+  local target_tab = require("claudecode.request_context").tab()
 
-  for _, win in ipairs(windows) do
-    local buf = vim.api.nvim_win_get_buf(win)
-    local buftype = vim.api.nvim_buf_get_option(buf, "buftype")
-    local filetype = vim.api.nvim_buf_get_option(buf, "filetype")
-    local win_config = vim.api.nvim_win_get_config(win)
+  local windows
+  if target_tab then
+    local ok, tab_wins = pcall(vim.api.nvim_tabpage_list_wins, target_tab)
+    windows = ok and tab_wins or nil
+  end
+  if not windows then
+    local ok, tab_wins = pcall(function()
+      return vim.api.nvim_tabpage_list_wins(vim.api.nvim_get_current_tabpage())
+    end)
+    windows = ok and tab_wins or nil
+  end
 
-    -- Check if this is a suitable window
-    local is_suitable = true
-
-    -- Skip floating windows
-    if win_config.relative and win_config.relative ~= "" then
-      is_suitable = false
-    end
-
-    -- Skip special buffer types
-    if is_suitable and (buftype == "terminal" or buftype == "nofile" or buftype == "prompt") then
-      is_suitable = false
-    end
-
-    -- Skip known sidebar filetypes
-    if
-      is_suitable
-      and (
-        filetype == "neo-tree"
-        or filetype == "neo-tree-popup"
-        or filetype == "NvimTree"
-        or filetype == "oil"
-        or filetype == "minifiles"
-        or filetype == "netrw"
-        or filetype == "aerial"
-        or filetype == "tagbar"
-      )
-    then
-      is_suitable = false
-    end
-
-    -- This looks like a main editor window
-    if is_suitable then
-      return win
+  -- One rule stays here rather than moving into the shared finder: opening a file
+  -- must not take over a scratch window (a start screen, a plugin panel), while a
+  -- diff legitimately may reuse one. Filtering the candidates keeps that
+  -- difference without duplicating the rest of the rules.
+  local candidates = {}
+  for _, win in ipairs(windows or {}) do
+    local ok, buftype = pcall(function()
+      return vim.api.nvim_buf_get_option(vim.api.nvim_win_get_buf(win), "buftype")
+    end)
+    if ok and buftype ~= "nofile" then
+      candidates[#candidates + 1] = win
     end
   end
 
-  return nil
+  return diff.resolve_target_window({
+    tab = target_tab,
+    purpose = "open",
+    file_path = file_path,
+    session_id = require("claudecode.request_context").session_id(),
+    candidates = candidates,
+  })
 end
 
 --- Handles the openFile tool invocation.
@@ -121,8 +120,10 @@ local function handler(params)
 
   local message = "Opened file: " .. file_path
 
-  -- Find the main editor window
-  local target_win = find_main_editor_window()
+  -- Where this file may go, which is not a question this tool answers alone: a
+  -- tab that owns its layout (the agents view) has no window to spare and hosts
+  -- files in a float instead. See `diff.resolve_target_window`.
+  local target_win, kind = find_main_editor_window(file_path)
 
   if target_win then
     -- Open file in the target window
@@ -133,8 +134,15 @@ local function handler(params)
         vim.cmd("edit " .. vim.fn.fnameescape(file_path))
       end
     end)
-    -- Focus the window after opening if makeFrontmost is true
-    if make_frontmost then
+    if kind == "float" then
+      -- A float is answerable on its own terms: `q` closes it, `<Tab>` reaches the
+      -- one behind. `create` already focused it, so `makeFrontmost` has nothing
+      -- left to do — and honouring it literally would mean switching tabpages,
+      -- which for a tool Claude calls several times a minute is not a favour.
+      pcall(function()
+        require("claudecode.float").bind_close(target_win)
+      end)
+    elseif make_frontmost then
       vim.api.nvim_set_current_win(target_win)
     end
   else

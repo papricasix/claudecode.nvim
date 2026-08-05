@@ -52,7 +52,11 @@ describe("Unified diff routes to the owning Claude tab", function()
     vim._next_winid = 4000
 
     -- Signal that the in-flight tool call originated from owner_tab's server.
-    _G._claudecode_active_tab_id = owner_tab
+    require("claudecode.request_context").set({
+      tab = owner_tab,
+      instance_id = "tab:" .. tostring(owner_tab),
+      kind = "tab",
+    })
 
     package.loaded["claudecode.diff"] = nil
     diff = require("claudecode.diff")
@@ -98,7 +102,7 @@ describe("Unified diff routes to the owning Claude tab", function()
   end)
 
   after_each(function()
-    _G._claudecode_active_tab_id = nil
+    require("claudecode.request_context").clear()
     os.remove(test_old_file)
     os.remove(test_new_file)
 
@@ -145,8 +149,40 @@ describe("Unified diff routes to the owning Claude tab", function()
     end)
   end)
 
+  it("closes the float it opened when the diff resolves", function()
+    -- The float is the diff's own window. Leaving it behind put an empty frame
+    -- on screen after an accept: cleanup restored the displaced buffer into it,
+    -- so the change vanished and the border stayed.
+    diff.setup({
+      terminal = { split_side = "right", split_width_percentage = 0.30 },
+      diff_opts = { layout = "float", provider = "unified" },
+      agents = { enabled = true },
+    })
+
+    -- The real float modules, not stubs: the window is opened through the agents
+    -- wrapper (this is the agents tab) and closed through the shared stack they
+    -- both share, so a stub on one side would no longer see the other.
+    local float = require("claudecode.float")
+    float.reset()
+
+    local co = coroutine.create(function()
+      diff.open_diff_blocking(test_old_file, test_new_file, "updated content\n", tab_name)
+    end)
+    assert.is_true((coroutine.resume(co)))
+
+    local active = diff._get_active_diffs()[tab_name]
+    assert.is_not_nil(active)
+    assert.is_not_nil(active.float_window)
+    assert.equal(active.float_window, active.target_window)
+    assert.equal(1, float.count())
+
+    diff._cleanup_diff_state(tab_name, "spec")
+    assert.is_false(vim.api.nvim_win_is_valid(active.float_window))
+    assert.equal(0, float.count())
+  end)
+
   it("falls back to the user's tab when no owning tab is set", function()
-    _G._claudecode_active_tab_id = nil
+    require("claudecode.request_context").clear()
 
     local co = coroutine.create(function()
       diff.open_diff_blocking(test_old_file, test_new_file, "updated content\n", tab_name)
