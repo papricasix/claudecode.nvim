@@ -67,6 +67,8 @@ local vim = {
   _next_winid = 1001,
   _commands = {},
   _autocmds = {},
+  _dirs = {}, -- paths `vim.fn.isdirectory` should report as directories
+  _tab_vars = {}, -- tabpage handle -> { name = value }
   _vars = {},
   _options = {},
   _current_window = 1000,
@@ -89,6 +91,22 @@ local vim = {
       return name
     end,
 
+    nvim_del_augroup_by_id = function(id)
+      vim._autocmds[id] = nil
+    end,
+
+    ---Buffer-local mappings, in the shape the real API returns them: a list of
+    ---`{ lhs, rhs, ... }`. Used to tell a mapping somebody else made from one of
+    ---ours, so a float never overwrites a user's `q`.
+    nvim_buf_get_keymap = function(buf, mode)
+      local out = {}
+      local per_buf = vim._buf_keymaps[buf] and vim._buf_keymaps[buf][mode]
+      for lhs, entry in pairs(per_buf or {}) do
+        out[#out + 1] = { lhs = lhs, rhs = entry.rhs, callback = entry.rhs, buffer = buf }
+      end
+      return out
+    end,
+
     nvim_create_namespace = function(name)
       vim._namespaces = vim._namespaces or {}
       if not vim._namespaces[name] then
@@ -100,6 +118,27 @@ local vim = {
     nvim_set_hl = function(_ns, name, opts)
       vim._highlights = vim._highlights or {}
       vim._highlights[name] = opts
+    end,
+
+    -- Resolves `link` chains when called with `link = false`, which is how the
+    -- real API behaves and the only reason anything asks for it: every group the
+    -- agents panes draw with is a link to a colorscheme group, so a caller that
+    -- wanted colours and got `{ link = "DiffAdd" }` would derive nothing.
+    nvim_get_hl = function(_ns, opts)
+      local groups = vim._highlights or {}
+      local name = opts and opts.name
+      local found = name and groups[name]
+      if not found then
+        return {}
+      end
+      if opts and opts.link == false then
+        local seen = {}
+        while found and found.link and not seen[found.link] do
+          seen[found.link] = true
+          found = groups[found.link]
+        end
+      end
+      return found or {}
     end,
 
     nvim_buf_set_extmark = function(bufnr, ns, row, col, opts)
@@ -193,7 +232,14 @@ local vim = {
         return nil
       end
 
-      return vim._buffers[bufnr].options and vim._buffers[bufnr].options[name] or nil
+      -- Deliberately not `options[name] or nil`: that collapses a stored `false`
+      -- to nil, so an option set to false would read back as unset and any test
+      -- asserting it would pass or fail for the wrong reason.
+      local options = vim._buffers[bufnr].options
+      if options == nil then
+        return nil
+      end
+      return options[name]
     end,
 
     nvim_buf_delete = function(bufnr, opts)
@@ -398,6 +444,7 @@ local vim = {
     end,
 
     nvim_win_close = function(winid, force)
+      local existed = vim._windows[winid] ~= nil
       local old_buf = vim._windows[winid] and vim._windows[winid].buf
       vim._windows[winid] = nil
       -- remove from tab mapping
@@ -428,6 +475,25 @@ local vim = {
           end
         end
       end
+
+      -- Fire WinClosed for handlers that clean up after a window: a buffer-local
+      -- keymap made for a float has to go when the float does, and that is only
+      -- testable if closing a window here behaves like closing one for real.
+      if existed then
+        for _, group in pairs(vim._autocmds) do
+          for _, entry in pairs(group.events or {}) do
+            local events = type(entry.events) == "table" and entry.events or { entry.events }
+            local pattern = entry.opts and entry.opts.pattern
+            for _, event in ipairs(events) do
+              if event == "WinClosed" and (pattern == nil or pattern == tostring(winid)) then
+                if entry.opts.callback then
+                  pcall(entry.opts.callback, { match = tostring(winid) })
+                end
+              end
+            end
+          end
+        end
+      end
     end,
 
     nvim_win_call = function(winid, callback)
@@ -452,6 +518,29 @@ local vim = {
       return result
     end,
 
+    -- Open a floating window. The config is stored verbatim so that layout code
+    -- can be asserted on (position, size, border), which is the whole point of
+    -- testing a cascade.
+    nvim_open_win = function(bufnr, enter, config)
+      local winid = vim._next_winid
+      vim._next_winid = vim._next_winid + 1
+      vim._windows[winid] = {
+        buf = bufnr,
+        cursor = { 1, 0 },
+        width = (config and config.width) or 80,
+        height = (config and config.height) or 24,
+        config = config or {},
+      }
+      local tab = vim._current_tabpage
+      vim._win_tab[winid] = tab
+      vim._tab_windows[tab] = vim._tab_windows[tab] or {}
+      table.insert(vim._tab_windows[tab], winid)
+      if enter then
+        vim._current_window = winid
+      end
+      return winid
+    end,
+
     nvim_win_get_config = function(winid)
       -- Mock implementation - return empty config for non-floating windows
       if vim._windows[winid] then
@@ -468,6 +557,16 @@ local vim = {
 
     nvim_win_get_width = function(winid)
       return (vim._windows[winid] and vim._windows[winid].width) or 80
+    end,
+
+    nvim_win_set_height = function(winid, height)
+      if vim._windows[winid] then
+        vim._windows[winid].height = height
+      end
+    end,
+
+    nvim_win_get_height = function(winid)
+      return (vim._windows[winid] and vim._windows[winid].height) or 24
     end,
 
     nvim_list_tabpages = function()
@@ -497,7 +596,20 @@ local vim = {
     end,
 
     nvim_tabpage_set_var = function(tabpage, name, value)
-      -- Mock tabpage variable setting
+      vim._tab_vars[tabpage] = vim._tab_vars[tabpage] or {}
+      vim._tab_vars[tabpage][name] = value
+    end,
+
+    nvim_tabpage_get_var = function(tabpage, name)
+      local vars = vim._tab_vars[tabpage]
+      local value = vars and vars[name]
+      if value == nil then
+        -- Real Neovim errors on an unset tab variable; code that reads one
+        -- defensively wraps the call, so the mock has to error too or that
+        -- branch is never exercised.
+        error("Key not found: " .. tostring(name))
+      end
+      return value
     end,
 
     nvim_win_get_tabpage = function(winid)
@@ -530,6 +642,58 @@ local vim = {
         return 1
       end
       return 0
+    end,
+
+    ---Buffer for a file name, created if this is the first time it is asked for.
+    ---Real `bufadd` never loads the file; `bufload` is what does, and there is
+    ---nothing here to load, so it is a no-op.
+    bufadd = function(name)
+      for bufnr, buf in pairs(vim._buffers) do
+        if buf.name == name then
+          return bufnr
+        end
+      end
+      local bufnr = #vim._buffers + 1
+      vim._buffers[bufnr] = { name = name, lines = {}, options = {}, listed = true }
+      return bufnr
+    end,
+
+    bufload = function(_bufnr)
+      return true
+    end,
+
+    -- Character-oriented string helpers. Approximations: they count UTF-8
+    -- characters rather than terminal cells, which is enough for layout code
+    -- under test but is NOT a substitute for the real width rules.
+    strchars = function(str)
+      local _, count = tostring(str):gsub("[^\128-\191]", "")
+      return count
+    end,
+
+    strdisplaywidth = function(str)
+      local _, count = tostring(str):gsub("[^\128-\191]", "")
+      return count
+    end,
+
+    strcharpart = function(str, start, len)
+      str = tostring(str)
+      local chars = {}
+      for char in str:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
+        chars[#chars + 1] = char
+      end
+      local out = {}
+      local last = len and (start + len) or #chars
+      for index = start + 1, math.min(last, #chars) do
+        out[#out + 1] = chars[index]
+      end
+      return table.concat(out)
+    end,
+
+    -- Directories a test has declared to exist, via `vim._mock.add_dir(path)`.
+    -- Nothing on the real filesystem is consulted: a spec that models a tree
+    -- should say so explicitly rather than depend on the machine it runs on.
+    isdirectory = function(path)
+      return vim._dirs[path] and 1 or 0
     end,
 
     bufnr = function(name)
@@ -848,6 +1012,31 @@ local vim = {
       vim._keymaps = vim._keymaps or {}
       vim._keymaps[mode] = vim._keymaps[mode] or {}
       vim._keymaps[mode][lhs] = { rhs = rhs, opts = opts }
+      -- Buffer-local maps are also recorded per buffer, because "does this
+      -- mapping outlive the window it was made for" is a real question about
+      -- floats holding real file buffers, and the flat table above cannot
+      -- answer it.
+      local buf = opts and opts.buffer
+      if buf then
+        vim._buf_keymaps[buf] = vim._buf_keymaps[buf] or {}
+        vim._buf_keymaps[buf][mode] = vim._buf_keymaps[buf][mode] or {}
+        vim._buf_keymaps[buf][mode][lhs] = { rhs = rhs, opts = opts }
+      end
+    end,
+    del = function(mode, lhs, opts)
+      local buf = opts and opts.buffer
+      if buf then
+        local per_buf = vim._buf_keymaps[buf] and vim._buf_keymaps[buf][mode]
+        if not per_buf or per_buf[lhs] == nil then
+          error("E31: No such mapping")
+        end
+        per_buf[lhs] = nil
+        return
+      end
+      if not (vim._keymaps[mode] and vim._keymaps[mode][lhs]) then
+        error("E31: No such mapping")
+      end
+      vim._keymaps[mode][lhs] = nil
     end,
   },
 
@@ -1039,6 +1228,42 @@ local vim = {
     callback()
   end,
 
+  -- The real `vim.diff` is a C built-in (xdiff). This stand-in produces a valid
+  -- unified diff rather than a minimal one: everything old removed, everything
+  -- new added. Enough for a caller that only cares whether a diff came back and
+  -- what it did with it — not for asserting hunk shapes.
+  diff = function(a, b, opts)
+    if a == b then
+      return (opts and opts.result_type == "indices") and {} or ""
+    end
+    local function lines_of(text)
+      local out = {}
+      for line in tostring(text):gmatch("([^\n]*)\n?") do
+        out[#out + 1] = line
+      end
+      if out[#out] == "" then
+        table.remove(out)
+      end
+      return out
+    end
+    local old, new = lines_of(a), lines_of(b)
+    local parts = { string.format("@@ -1,%d +1,%d @@", #old, #new) }
+    for _, line in ipairs(old) do
+      parts[#parts + 1] = "-" .. line
+    end
+    for _, line in ipairs(new) do
+      parts[#parts + 1] = "+" .. line
+    end
+    return table.concat(parts, "\n") .. "\n"
+  end,
+
+  -- Like the real one, minus the deferral: the mock runs scheduled work inline.
+  schedule_wrap = function(fn)
+    return function(...)
+      return fn(...)
+    end
+  end,
+
   v = {
     servername = "/tmp/nvim_mock_server.sock",
   },
@@ -1150,14 +1375,38 @@ vim._mock = {
     }
   end,
 
+  ---Declare a path that `vim.fn.isdirectory` should report as a directory.
+  add_dir = function(path)
+    vim._dirs[path] = true
+  end,
+
   reset = function()
     vim._buffers = {}
+    -- Buffer numbers restart here, so extmarks left from an earlier test would be
+    -- counted again by the next one asserting on the same buffer.
+    vim._extmarks = {}
+    -- Same reason as the extmarks above: buffer numbers restart, so a mapping
+    -- from an earlier test would look like one the current test made.
+    vim._buf_keymaps = {}
+    vim._keymaps = {}
+    -- Window ids restart below, so window-local options and vars set by an
+    -- earlier test would be read back by a later one as its own — a float in one
+    -- test setting `winhighlight` on window 1001 made a preview test two files
+    -- away assert against it.
+    for win in pairs(vim.wo) do
+      rawset(vim.wo, win, nil)
+    end
+    for win in pairs(vim.w) do
+      rawset(vim.w, win, nil)
+    end
     vim._windows = {}
     vim._win_tab = {}
     vim._tab_windows = {}
     vim._next_winid = 1000
     vim._commands = {}
     vim._autocmds = {}
+    vim._dirs = {}
+    vim._tab_vars = {}
     vim._fired_autocmds = {}
     vim._vars = {}
     vim._options = {}

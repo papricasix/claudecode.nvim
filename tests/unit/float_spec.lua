@@ -1,0 +1,192 @@
+-- luacheck: globals expect
+require("tests.busted_setup")
+
+describe("float", function()
+  local float
+
+  local function base_config(overrides)
+    return vim.tbl_deep_extend("force", {
+      port_range = { min = 10000, max = 65535 },
+      auto_start = true,
+      log_level = "info",
+      track_selection = true,
+      visual_demotion_delay_ms = 50,
+      connection_wait_delay = 200,
+      connection_timeout = 10000,
+      queue_timeout = 5000,
+      diff_opts = {},
+      env = {},
+      models = { { name = "Test Model", value = "test" } },
+      terminal = { provider = "native" },
+    }, overrides or {})
+  end
+
+  before_each(function()
+    if vim and vim._mock and vim._mock.reset then
+      vim._mock.reset()
+    end
+    package.loaded["claudecode.float"] = nil
+    package.loaded["claudecode.agents.float"] = nil
+    float = require("claudecode.float")
+    float.reset()
+  end)
+
+  describe("geometry", function()
+    it("falls back to its own defaults when nothing is configured", function()
+      float.setup(base_config())
+      local opts = float.opts()
+      expect(opts.width).to_be(0.7)
+      expect(opts.height).to_be(0.7)
+      expect(opts.border).to_be("rounded")
+      expect(opts.cascade_offset).to_be(2)
+    end)
+
+    it("takes the top-level float block", function()
+      float.setup(base_config({ float = { width = 0.4, border = "single" } }))
+      local opts = float.opts()
+      expect(opts.width).to_be(0.4)
+      expect(opts.border).to_be("single")
+      -- Unmentioned keys keep the default rather than vanishing.
+      expect(opts.height).to_be(0.7)
+    end)
+
+    it("lets a feature's own table win over the global one", function()
+      -- This is the whole point of the split: `diff_opts.layout = "float"` used
+      -- to read `agents.float`, so a user with agents disabled was sizing their
+      -- diffs through a feature they had turned off.
+      float.setup(base_config({ float = { width = 0.4, height = 0.4 } }))
+      local opts = float.opts({ width = 0.9 })
+      expect(opts.width).to_be(0.9)
+      expect(opts.height).to_be(0.4)
+    end)
+
+    it("sizes the window from the resolved options", function()
+      vim.o.columns = 200
+      vim.o.lines = 50
+      float.setup(base_config({ float = { width = 0.5, height = 0.5 } }))
+      local win = float.create({ title = "a.lua" })
+      local config = vim.api.nvim_win_get_config(win)
+      expect(config.width).to_be(100)
+      expect(config.height).to_be(25)
+    end)
+  end)
+
+  describe("tagging", function()
+    it("marks every float as not a normal editor window", function()
+      float.setup(base_config())
+      local win = float.create({ title = "a.lua" })
+      expect(vim.w[win].claudecode_live_preview).to_be_true()
+      expect(vim.w[win].claudecode_float).to_be_true()
+    end)
+
+    it("adds a caller's own tags without losing the shared ones", function()
+      float.setup(base_config())
+      local win = float.create({ title = "a.lua", tags = { claudecode_agents_float = true } })
+      expect(vim.w[win].claudecode_live_preview).to_be_true()
+      expect(vim.w[win].claudecode_agents_float).to_be_true()
+    end)
+  end)
+
+  describe("bind_close", function()
+    it("binds q and <Tab> on the float's buffer", function()
+      float.setup(base_config())
+      local win, buf = float.create({ title = "a.lua" })
+      float.bind_close(win)
+      local maps = {}
+      for _, map in ipairs(vim.api.nvim_buf_get_keymap(buf, "n")) do
+        maps[map.lhs] = true
+      end
+      expect(maps["q"]).to_be_true()
+      expect(maps["<Tab>"]).to_be_true()
+    end)
+
+    it("drops its keymaps when the float closes", function()
+      -- A float can hold a *real file buffer* — `open_file` puts one there, and
+      -- with openFile routed to floats that is the common case. A buffer-local
+      -- map outlives the window it was made for, so without this every file
+      -- Claude ever showed you would carry a `q` that closes a window, in every
+      -- window, for the rest of the session.
+      float.setup(base_config())
+      local win, buf = float.create({ title = "a.lua" })
+      float.bind_close(win)
+      expect(#vim.api.nvim_buf_get_keymap(buf, "n")).to_be(2)
+
+      float.close(win)
+      expect(#vim.api.nvim_buf_get_keymap(buf, "n")).to_be(0)
+    end)
+
+    it("drops them however the float went away", function()
+      -- `:q`, `<C-w>c` and a closing tab never reach `M.close`, which is why the
+      -- cleanup hangs off WinClosed rather than off our own close path.
+      float.setup(base_config())
+      local win, buf = float.create({ title = "a.lua" })
+      float.bind_close(win)
+      vim.api.nvim_win_close(win, true)
+      expect(#vim.api.nvim_buf_get_keymap(buf, "n")).to_be(0)
+    end)
+
+    it("leaves a mapping somebody else made alone", function()
+      -- A real file buffer may already carry a buffer-local `q` from an ftplugin
+      -- or the user's config. Overwriting it and then deleting it on close would
+      -- lose theirs.
+      float.setup(base_config())
+      local win, buf = float.create({ title = "a.lua" })
+      local theirs = function() end
+      vim.keymap.set("n", "q", theirs, { buffer = buf })
+
+      float.bind_close(win)
+      local maps = {}
+      for _, map in ipairs(vim.api.nvim_buf_get_keymap(buf, "n")) do
+        maps[map.lhs] = map.rhs
+      end
+      expect(maps["q"]).to_be(theirs)
+      expect(maps["<Tab>"]).not_to_be_nil()
+
+      -- And closing must not take theirs with it.
+      float.close(win)
+      local after = {}
+      for _, map in ipairs(vim.api.nvim_buf_get_keymap(buf, "n")) do
+        after[map.lhs] = map.rhs
+      end
+      expect(after["q"]).to_be(theirs)
+      expect(after["<Tab>"]).to_be_nil()
+    end)
+  end)
+
+  describe("ownership", function()
+    it("knows whether it made the buffer it is showing", function()
+      float.setup(base_config())
+      float.create({ title = "scratch" })
+      expect(float.list()[1].owned_buf).to_be_true()
+
+      local existing = vim.api.nvim_create_buf(false, true)
+      float.create({ title = "given", buf = existing })
+      expect(float.list()[2].owned_buf).to_be(false)
+    end)
+  end)
+
+  describe("config", function()
+    local config
+
+    before_each(function()
+      package.loaded["claudecode.config"] = nil
+      config = require("claudecode.config")
+    end)
+
+    it("ships a top-level float block", function()
+      local applied = config.apply({})
+      expect(applied.float).to_be_table()
+      expect(applied.float.width).to_be(0.7)
+    end)
+
+    it("validates the top-level block the same way as agents.float", function()
+      expect((pcall(config.validate_float, { width = 0.5 }, "float"))).to_be_true()
+      expect((pcall(config.validate_float, { width = 42 }, "float"))).to_be(false)
+      expect((pcall(config.validate_float, { cascade_offset = -1 }, "float"))).to_be(false)
+      expect((pcall(config.validate_float, { border = "single" }, "float"))).to_be_true()
+      expect((pcall(config.validate_float, "nonsense", "float"))).to_be(false)
+      -- Absent is always fine: neither block is required.
+      expect((pcall(config.validate_float, nil, "float"))).to_be_true()
+    end)
+  end)
+end)

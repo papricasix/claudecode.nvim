@@ -22,11 +22,24 @@ M.defaults = {
   queue_timeout = 5000, -- Maximum time to keep @ mentions in queue (milliseconds)
   diff_opts = {
     provider = "auto", -- "auto" (use unified.nvim if installed, else native), "native", or "unified"
+    -- "vertical" / "horizontal" split, or "float" to open the diff in a floating
+    -- window. Agents mode uses a float regardless, since none of its panes is an
+    -- editor window a diff could take over.
     layout = "vertical",
     open_in_new_tab = false, -- Open diff in a new tab (false = use current tab). Ignored by the unified provider.
     keep_terminal_focus = false, -- If true, moves focus back to terminal after diff opens (including floating terminals)
     hide_terminal_in_new_tab = false, -- If true and opening in a new tab, do not show Claude terminal there
     on_new_file_reject = "keep_empty", -- "keep_empty" leaves an empty buffer; "close_window" closes the placeholder split
+  },
+  -- Geometry for every floating window Claude opens for a file or a diff:
+  -- `diff_opts.layout = "float"`, and agents mode, which floats regardless since
+  -- none of its panes is an editor window a diff could take over. `agents.float`
+  -- overrides this for agent-opened floats; nothing else needs to.
+  float = {
+    width = 0.7, -- fraction of the screen
+    height = 0.7,
+    border = "rounded", -- any 'winborder'-style value nvim_open_win accepts
+    cascade_offset = 2, -- rows/columns each stacked float is offset by
   },
   live_cursor = {
     enabled = false, -- master switch (opt-in)
@@ -71,6 +84,103 @@ M.defaults = {
     },
     auto_redraw = true, -- redraw the tabline/statusline whenever a tab's state changes
   },
+  -- Agents mode: a dedicated tabpage running several Claudes side by side, with
+  -- the project's past sessions on the right, the selected agent's activity below
+  -- them, and the files it touched on the left (see claudecode.agents_view).
+  -- Opt-in: it can widen the injected hook set the way `status` does.
+  agents = {
+    enabled = false,
+    -- What drives live updates:
+    --   "hooks" - Claude Code's own lifecycle hooks (sub-second, one headless
+    --             nvim per tool call per running agent)
+    --   "poll"  - watch each transcript's mtime while the view is visible
+    --             (nearly free; status lags by up to poll_ms)
+    --   "auto"  - hooks when `status.enabled` (you already pay for them), else poll
+    source = "auto",
+    poll_ms = 500,
+    layout = {
+      left_width = 0.23, -- Changes pane, as a fraction of the screen
+      right_width = 0.23, -- Sessions/Activity pane, as a fraction of the screen (0.54 left for the terminal)
+      sessions_height = 0.55, -- Sessions share of the right column (it is the pane you steer from)
+    },
+    sessions = {
+      limit = 30, -- most recent transcripts to list
+      include_empty = true, -- list conversations that never changed a file (false hides them once known)
+      -- The order the list opens in: "recent" | "name" | "changes" | "status"
+      -- ("title" and "added" are the old names for "name" and "changes"). The
+      -- list is then **frozen** — rows keep their places instead of shuffling as
+      -- agents work — and `gs` re-sorts it, for as long as the view is open.
+      sort = "recent",
+      foreign = true, -- also list Claudes running in your other tabs
+    },
+    feed_limit = 500, -- activity events kept per session
+    refresh_ms = 150, -- coalescing window for redraws
+    list_refresh_ms = 2000, -- how often the session list is re-enumerated
+    git = true, -- annotate the Changes pane with git status letters
+    git_refresh_ms = 1500,
+    -- Deliberately unset: the animation's pace is `status.spinner_ms`, since it
+    -- is one spinner however many places show it. Set this only to make the
+    -- agents view run at a different rate from the tabline.
+    spinner_ms = nil,
+    -- New Activity rows arrive at full colour and settle; changed +N/-N light up
+    -- and drop back. Sampled by the spinner's frame tick, so `auto_redraw =
+    -- false` or `spinner_ms = 0` means a span reaches its resting colour on the
+    -- next redraw rather than travelling there.
+    -- `fade` is deliberately **absent here**, with its defaults owned by
+    -- `agents/fade.lua` alone. Spelling them out in both places is not
+    -- redundancy, it is a silent override: `fade.opts()` merges the applied
+    -- config over its own table, so every key present here wins and the module's
+    -- own defaults become dead code. That is exactly what happened — two rounds
+    -- of retuning the timings changed nothing the user could see, because these
+    -- copies kept overriding them. See the README for the shape and the
+    -- validator below for the accepted ranges.
+    fold_batch = 2, -- transcripts folded per tick while filling the list
+    follow_cursor = false, -- selecting follows the cursor in the sessions pane
+    restore_panes = true, -- rebuild a sidebar the user closed
+    kill_on_close = false, -- stop running agents when the view closes
+    focus = "center", -- "center" | "sessions": where the cursor lands on open
+    resume_mode = "resume", -- "resume" | "fork" (--fork-session) for an existing conversation
+    float = {
+      width = 0.7,
+      height = 0.7,
+      border = "rounded",
+      cascade_offset = 2, -- rows/columns each stacked float is offset by
+    },
+    keymaps = {
+      select = "<CR>",
+      new = "a",
+      stop = "x", -- stop the running agent (keeps the conversation)
+      delete = "dd", -- delete the conversation from disk, after a confirmation
+      refresh = "r", -- re-read the sessions, and re-sort the list
+      sort = "gs", -- choose what the list is ordered by (it does not re-sort itself)
+      close = "q",
+      open = "<CR>", -- open the file under the cursor (Activity / Changes panes)
+      git_diff = ".", -- diff that file against git HEAD instead of against the session
+      goto_file = "gf", -- open the file itself, on disk, in a new tab
+      help = "?", -- show the keys that reach the pane you are in
+      next_pane = "<Tab>",
+      focus_term = "i",
+      -- Cycle the selected session from anywhere in the tab, the agent's terminal
+      -- included (bound there in terminal mode too). Set to false to leave the
+      -- keys to Claude.
+      next_session = "<C-n>",
+      prev_session = "<C-p>",
+    },
+    highlights = {
+      title = "ClaudeCodeAgentsTitle", -- defaults to a link to Normal
+      time = "ClaudeCodeAgentsTime", -- defaults to a link to Comment
+      added = "ClaudeCodeAgentsAdded", -- defaults to a link to DiffAdd
+      removed = "ClaudeCodeAgentsRemoved", -- defaults to a link to DiffDelete
+      selected = "ClaudeCodeAgentsSelected", -- defaults to a link to CursorLine
+      path = "ClaudeCodeAgentsPath", -- defaults to a link to Directory
+      float = "ClaudeCodeAgentsFloat", -- defaults to a link to FloatBorder
+      -- Terminal pane background: follows SnacksNormal when snacks is loaded,
+      -- else NormalFloat. The sidebars keep the editor's own Normal.
+      normal = "ClaudeCodeAgentsNormal",
+      normal_nc = "ClaudeCodeAgentsNormalNC",
+    },
+    auto_redraw = true,
+  },
   -- Per-tab Claude conversations survive a Neovim restart, riding whatever
   -- already persists your Neovim session (see claudecode.session_state):
   --   "off"      - do not track session ids (default)
@@ -99,6 +209,37 @@ M.defaults = {
   },
   terminal = nil, -- Will be lazy-loaded to avoid circular dependency
 }
+
+---Validate a float geometry table.
+---
+---Shared, because there are two of them and they must accept exactly the same
+---shape: the top-level `float` block, and `agents.float`, which overrides it for
+---agent-opened floats. Two hand-written copies of one key list is how the
+---`agents.highlights` lists drifted from their defaults.
+---@param float table|nil nil skips every check.
+---@param label string Prefix for the error message.
+function M.validate_float(float, label)
+  if float == nil then
+    return
+  end
+  assert(type(float) == "table", label .. " must be a table")
+  local function check(field, ok, msg)
+    if float[field] ~= nil then
+      assert(ok(float[field]), label .. "." .. field .. " " .. msg)
+    end
+  end
+  local function is_fraction(v)
+    return type(v) == "number" and v > 0 and v < 1
+  end
+  check("width", is_fraction, "must be a number between 0 and 1")
+  check("height", is_fraction, "must be a number between 0 and 1")
+  check("border", function(v)
+    return type(v) == "string" or type(v) == "table"
+  end, "must be a string or a table")
+  check("cascade_offset", function(v)
+    return type(v) == "number" and v >= 0
+  end, "must be a non-negative number")
+end
 
 ---Validates the provided configuration table.
 ---Throws an error if any validation fails.
@@ -187,8 +328,10 @@ function M.validate(config)
   -- New diff options (optional validation to allow backward compatibility)
   if config.diff_opts.layout ~= nil then
     assert(
-      config.diff_opts.layout == "vertical" or config.diff_opts.layout == "horizontal",
-      "diff_opts.layout must be 'vertical' or 'horizontal'"
+      config.diff_opts.layout == "vertical"
+        or config.diff_opts.layout == "horizontal"
+        or config.diff_opts.layout == "float",
+      "diff_opts.layout must be 'vertical', 'horizontal' or 'float'"
     )
   end
   if config.diff_opts.open_in_new_tab ~= nil then
@@ -212,6 +355,8 @@ function M.validate(config)
       "diff_opts.on_new_file_reject must be 'keep_empty' or 'close_window'"
     )
   end
+
+  M.validate_float(config.float, "float")
 
   -- Legacy diff options (accept if present to avoid breaking old configs)
   if config.diff_opts.auto_close_on_accept ~= nil then
@@ -338,6 +483,154 @@ function M.validate(config)
     check("mouse_motion", function(v)
       return type(v) == "boolean"
     end, "must be a boolean")
+  end
+
+  -- Validate agents (optional; apply() supplies defaults)
+  if config.agents ~= nil then
+    local ag = config.agents
+    assert(type(ag) == "table", "agents must be a table")
+
+    local function is_boolean(v)
+      return type(v) == "boolean"
+    end
+    local function is_fraction(v)
+      return type(v) == "number" and v > 0 and v < 1
+    end
+    local function is_positive(v)
+      return type(v) == "number" and v > 0
+    end
+    ---A keymap is a string, or false to leave the key unbound.
+    local function is_keymap(v)
+      return type(v) == "string" or v == false
+    end
+    ---@param allowed string[]
+    local function one_of(allowed)
+      return function(v)
+        if type(v) ~= "string" then
+          return false
+        end
+        for _, candidate in ipairs(allowed) do
+          if v == candidate then
+            return true
+          end
+        end
+        return false
+      end
+    end
+
+    ---@param tbl table|nil Subtable being checked (nil skips every field).
+    ---@param label string Prefix for the error message.
+    local function checker(tbl, label)
+      return function(field, ok, msg)
+        if tbl ~= nil and tbl[field] ~= nil then
+          assert(ok(tbl[field]), label .. "." .. field .. " " .. msg)
+        end
+      end
+    end
+
+    local check = checker(ag, "agents")
+    check("enabled", is_boolean, "must be a boolean")
+    check("source", one_of({ "hooks", "poll", "auto" }), 'must be "hooks", "poll" or "auto"')
+    check("poll_ms", is_positive, "must be a positive number")
+    check("feed_limit", is_positive, "must be a positive number")
+    check("refresh_ms", is_positive, "must be a positive number")
+    check("list_refresh_ms", is_positive, "must be a positive number")
+    check("git", is_boolean, "must be a boolean")
+    check("git_refresh_ms", is_positive, "must be a positive number")
+    check("spinner_ms", function(v)
+      return type(v) == "number" and v >= 0
+    end, "must be a non-negative number")
+    check("fold_batch", is_positive, "must be a positive number")
+    check("follow_cursor", is_boolean, "must be a boolean")
+    check("restore_panes", is_boolean, "must be a boolean")
+    check("kill_on_close", is_boolean, "must be a boolean")
+    check("focus", one_of({ "center", "sessions" }), 'must be "center" or "sessions"')
+    check("resume_mode", one_of({ "resume", "fork" }), 'must be "resume" or "fork"')
+    check("auto_redraw", is_boolean, "must be a boolean")
+
+    if ag.layout ~= nil then
+      assert(type(ag.layout) == "table", "agents.layout must be a table")
+      local check_layout = checker(ag.layout, "agents.layout")
+      check_layout("left_width", is_fraction, "must be a number between 0 and 1")
+      check_layout("right_width", is_fraction, "must be a number between 0 and 1")
+      check_layout("sessions_height", is_fraction, "must be a number between 0 and 1")
+    end
+
+    if ag.fade ~= nil and ag.fade ~= false then
+      assert(type(ag.fade) == "table", "agents.fade must be a table, or false to disable it")
+      local check_fade = checker(ag.fade, "agents.fade")
+      check_fade("enabled", is_boolean, "must be a boolean")
+      for _, field in ipairs({ "hold_ms", "step_ms", "flash_ms" }) do
+        check_fade(field, function(v)
+          return type(v) == "number" and v >= 0
+        end, "must be a non-negative number")
+      end
+      check_fade("steps", function(v)
+        return type(v) == "number" and v >= 0
+      end, "must be a non-negative number")
+      -- Inclusive, unlike the layout fractions: 0 is "do not dim / do not
+      -- brighten", which is a meaningful setting here rather than a degenerate
+      -- pane width.
+      local function is_unit(v)
+        return type(v) == "number" and v >= 0 and v <= 1
+      end
+      check_fade("boost", is_unit, "must be a number from 0 to 1")
+      check_fade("dim", is_unit, "must be a number from 0 to 1")
+      check_fade("flash_level", is_unit, "must be a number from 0 to 1")
+    end
+
+    if ag.sessions ~= nil then
+      assert(type(ag.sessions) == "table", "agents.sessions must be a table")
+      local check_sessions = checker(ag.sessions, "agents.sessions")
+      check_sessions("limit", is_positive, "must be a positive number")
+      check_sessions("include_empty", is_boolean, "must be a boolean")
+      -- "added" and "title" are what "changes" and "name" were called before the
+      -- sort menu existed, and still accepted: a config that names one is not
+      -- wrong, only older.
+      check_sessions(
+        "sort",
+        one_of({ "recent", "name", "changes", "status", "added", "title" }),
+        'must be "recent", "name", "changes" or "status"'
+      )
+      check_sessions("foreign", is_boolean, "must be a boolean")
+    end
+
+    M.validate_float(ag.float, "agents.float")
+
+    if ag.keymaps ~= nil then
+      assert(type(ag.keymaps) == "table", "agents.keymaps must be a table")
+      local fields = {
+        "select",
+        "new",
+        "stop",
+        "delete",
+        "refresh",
+        "sort",
+        "close",
+        "open",
+        "git_diff",
+        "goto_file",
+        "help",
+        "next_pane",
+        "focus_term",
+        "next_session",
+        "prev_session",
+      }
+      for _, field in ipairs(fields) do
+        checker(ag.keymaps, "agents.keymaps")(field, is_keymap, "must be a string or false")
+      end
+    end
+
+    if ag.highlights ~= nil then
+      assert(type(ag.highlights) == "table", "agents.highlights must be a table")
+      local highlight_fields =
+        { "title", "time", "added", "removed", "selected", "path", "float", "normal", "normal_nc", "header", "key" }
+      for _, field in ipairs(highlight_fields) do
+        checker(ag.highlights, "agents.highlights")(field, function(v)
+          return type(v) == "string"
+        end, "must be a string")
+      end
+    end
   end
 
   -- Validate status (optional; apply() supplies defaults)
