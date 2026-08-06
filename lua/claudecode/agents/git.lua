@@ -178,11 +178,24 @@ local function letter_for(xy)
   return " "
 end
 
+---Whether a path is already absolute: rooted, or on a Windows drive.
+---@param path string
+---@return boolean
+local function is_absolute(path)
+  return path:sub(1, 1) == "/" or path:sub(1, 1) == "\\" or path:match("^%a:[/\\]") ~= nil
+end
+
 ---Parse `git status --porcelain=v1` output into path -> letter.
+---
+---Keyed by `utils.path_key`, because the caller looks these up with the paths the
+---CLI recorded and the two spellings need not match: git always answers with `/`
+---separators, while a transcript written on Windows carries `D:\Git\proj\x.lua`.
+---On POSIX the key is the path unchanged.
 ---@param lines string[]|nil
 ---@param root string|nil Prefix to make paths absolute again.
 ---@return table<string, string>
 function M.parse_status(lines, root)
+  local utils = require("claudecode.utils")
   local out = {}
   for _, line in ipairs(lines or {}) do
     -- "XY <path>", or "XY <old> -> <new>" for a rename.
@@ -193,10 +206,10 @@ function M.parse_status(lines, root)
       -- A rename is reported as old -> new; the file that exists now is the new
       -- one, and that is the path the caller is showing.
       local path = unquote(new_path or rest)
-      if root and root ~= "" and path:sub(1, 1) ~= "/" then
-        path = root:gsub("/$", "") .. "/" .. path
+      if root and root ~= "" and not is_absolute(path) then
+        path = utils.normalize_path(root) .. "/" .. path
       end
-      out[path] = letter
+      out[utils.path_key(path)] = letter
     end
   end
   return out

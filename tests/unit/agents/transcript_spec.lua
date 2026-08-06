@@ -38,6 +38,10 @@ describe("agents.transcript", function()
         reads[#reads + 1] = { offset = offset, len = len }
         cb(f.data:sub(offset + 1, offset + len), nil)
       end,
+      read_sync = function(path, len)
+        local f = fs[path]
+        return f and f.data:sub(1, len) or nil
+      end,
     }
   end
 
@@ -635,6 +639,74 @@ describe("agents.transcript", function()
     it("slugifies a path the way the CLI names its directories", function()
       expect(transcript.slugify("/Users/m/Dev/claudecode.nvim")).to_be("-Users-m-Dev-claudecode-nvim")
       expect(transcript.slugify("/Users/m/.dotfiles")).to_be("-Users-m--dotfiles")
+      expect(transcript.slugify("D:\\proj")).to_be("D--proj")
+    end)
+
+    -- Every expectation here was produced by running the CLI's own rule (read out
+    -- of the 2.1.222 binary) in node, not by reading this implementation.
+    it("cuts a slug past 200 characters and appends the CLI's hash", function()
+      local long = "D:\\Git\\" .. string.rep("verylongdirectoryname", 12) .. "\\proj"
+      local slug = transcript.slugify(long)
+      expect(#slug).to_be(200 + 1 + 6)
+      expect(slug:sub(1, 12)).to_be("D--Git-veryl")
+      expect(slug:sub(201)).to_be("-qnqb13")
+    end)
+
+    it("counts a non-ASCII character the way JavaScript does", function()
+      -- The CLI substitutes one dash per UTF-16 code unit, so a two-byte `ö` is
+      -- one dash and an astral emoji is two. Counting Lua's bytes would name a
+      -- directory that does not exist.
+      expect(transcript.slugify("/Users/m/Gr\195\182\195\159e/pro\240\159\152\128j")).to_be("-Users-m-Gr--e-pro--j")
+    end)
+
+    it("strips a trailing separator without eating a root", function()
+      expect(transcript._trim_separator("D:\\proj\\")).to_be("D:\\proj")
+      expect(transcript._trim_separator("/a/b/")).to_be("/a/b")
+      expect(transcript._trim_separator("D:\\")).to_be("D:\\")
+      expect(transcript._trim_separator("/")).to_be("/")
+    end)
+
+    it("finds a Windows project directory", function()
+      -- `fnamemodify(cwd, ":p")` appends a separator and the CLI slugifies a path
+      -- that has none, so a trailing backslash used to make every Windows lookup
+      -- miss: `D--proj-` against the CLI's `D--proj`.
+      vim._mock.add_dir("/home/user/.claude/projects")
+      vim._mock.add_dir("/home/user/.claude/projects/D--proj")
+      dirs["/home/user/.claude/projects/D--proj"] = { "a.jsonl" }
+      put("/home/user/.claude/projects/D--proj/a.jsonl", { edit_line("D:\\proj\\x.lua", 1, 0) })
+
+      expect(transcript.project_dir("D:\\proj\\")).to_be("/home/user/.claude/projects/D--proj")
+      expect(#transcript.list("D:\\proj\\")).to_be(1)
+    end)
+
+    it("falls back to the transcript's own cwd when the slug misses", function()
+      -- The fallback used to ask the asynchronous reader and treat "no answer
+      -- yet" as "no match", so it could never fire at all.
+      vim._mock.add_dir("/home/user/.claude/projects")
+      vim._mock.add_dir("/home/user/.claude/projects/renamed-by-a-future-cli")
+      dirs["/home/user/.claude/projects"] = { "renamed-by-a-future-cli" }
+      dirs["/home/user/.claude/projects/renamed-by-a-future-cli"] = { "a.jsonl" }
+      fs["/home/user/.claude/projects/renamed-by-a-future-cli/a.jsonl"] = {
+        data = '{"type":"user","cwd":"/proj","timestamp":"2026-01-01T00:00:00.000Z"}\n',
+        mtime = 1,
+        ino = 1,
+      }
+
+      expect(transcript.project_dir("/proj")).to_be("/home/user/.claude/projects/renamed-by-a-future-cli")
+    end)
+
+    it("matches a Windows cwd through JSON's escaping of its separators", function()
+      vim._mock.add_dir("/home/user/.claude/projects")
+      vim._mock.add_dir("/home/user/.claude/projects/opaque")
+      dirs["/home/user/.claude/projects"] = { "opaque" }
+      dirs["/home/user/.claude/projects/opaque"] = { "a.jsonl" }
+      fs["/home/user/.claude/projects/opaque/a.jsonl"] = {
+        data = '{"type":"user","cwd":"D:\\\\proj"}\n',
+        mtime = 1,
+        ino = 1,
+      }
+
+      expect(transcript.project_dir("D:\\proj\\")).to_be("/home/user/.claude/projects/opaque")
     end)
   end)
 

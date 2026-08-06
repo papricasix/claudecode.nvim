@@ -193,6 +193,29 @@ M._io = {
       end)
     end)
   end,
+
+  ---Read the first `len` bytes of a file, blocking.
+  ---
+  ---The one place that needs this is `_dir_matches_cwd`, which runs only when the
+  ---slug did not name a directory — a rare path where a bounded synchronous read
+  ---is cheaper than making the whole lookup asynchronous. It has to be
+  ---synchronous: the probe answers `project_dir`, whose callers use the result in
+  ---the same tick.
+  ---@param path string
+  ---@param len integer
+  ---@return string|nil
+  read_sync = function(path, len)
+    if not uv then
+      return nil
+    end
+    local fd = uv.fs_open(path, "r", 438)
+    if not fd then
+      return nil
+    end
+    local data = uv.fs_read(fd, len, 0)
+    uv.fs_close(fd)
+    return data
+  end,
 }
 
 --------------------------------------------------------------------------------
@@ -204,22 +227,129 @@ function M.config_dir()
   return require("claudecode.utils").claude_config_dir()
 end
 
----The CLI's directory name for a project: the absolute path with every
----non-alphanumeric run replaced by a dash (`/a/b.c` -> `-a-b-c`).
+--- Where the CLI cuts a slug and appends a hash instead. Read out of the shipped
+--- binary (2.1.222) rather than guessed: `if (t.length <= 200) return t; return
+--- t.slice(0, 200) + "-" + hash`.
+local SLUG_MAX = 200
+
+---Call `fn` with each UTF-16 code unit of a UTF-8 string.
 ---
----The rule is undocumented and inferred, which is why `project_dir` verifies the
----result rather than trusting it.
+---Both halves of the slug rule are JavaScript operating on a JS string, and a JS
+---string is a sequence of UTF-16 code units: `replace(/[^a-zA-Z0-9]/g, "-")`
+---without the `u` flag substitutes one dash *per unit*, and `charCodeAt` in the
+---hash reads one unit at a time. Iterating Lua's bytes instead would give a
+---two-byte `ö` two dashes where the CLI gives it one — so a project path with a
+---non-ASCII character would resolve to a directory that does not exist.
+---@param str string
+---@param fn fun(unit: integer)
+local function each_utf16_unit(str, fn)
+  local i, n = 1, #str
+  while i <= n do
+    local byte = str:byte(i)
+    local cp, len
+    if byte < 0x80 then
+      cp, len = byte, 1
+    elseif byte < 0xC0 then
+      cp, len = byte, 1 -- stray continuation byte: pass it through as itself
+    elseif byte < 0xE0 then
+      cp, len = byte - 0xC0, 2
+    elseif byte < 0xF0 then
+      cp, len = byte - 0xE0, 3
+    else
+      cp, len = byte - 0xF0, 4
+    end
+
+    for k = 1, len - 1 do
+      local cont = str:byte(i + k)
+      if not cont or cont < 0x80 or cont > 0xBF then
+        cp, len = byte, 1 -- malformed sequence: treat the lead byte as the value
+        break
+      end
+      cp = cp * 64 + (cont - 0x80)
+    end
+
+    if cp > 0xFFFF then
+      -- Outside the BMP, JS sees a surrogate pair: two units, two dashes.
+      local rest = cp - 0x10000
+      fn(0xD800 + math.floor(rest / 0x400))
+      fn(0xDC00 + rest % 0x400)
+    else
+      fn(cp)
+    end
+    i = i + len
+  end
+end
+
+---@param n integer
+---@return string
+local function to_base36(n)
+  if n == 0 then
+    return "0"
+  end
+  local digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+  local out = {}
+  while n > 0 do
+    local rest = n % 36
+    out[#out + 1] = digits:sub(rest + 1, rest + 1)
+    n = math.floor(n / 36)
+  end
+  return string.reverse(table.concat(out))
+end
+
+---The CLI's directory name for a project: the absolute path with every
+---non-alphanumeric character replaced by a dash (`/a/b.c` -> `-a-b-c`), and, when
+---that runs past 200 characters, cut there with a hash of the whole path appended
+---so two long paths sharing a prefix stay apart.
+---
+---The rule is undocumented. Both halves are the CLI's own, transcribed from the
+---binary: the hash is `h = h * 31 + unit` over the path's UTF-16 code units, kept
+---to a signed 32-bit int, then `Math.abs(h).toString(36)`. `project_dir` verifies
+---the result rather than trusting it, so a change to the rule costs a slower
+---lookup rather than an empty session list.
 ---@param abs_path string
 ---@return string
 function M.slugify(abs_path)
-  return (abs_path:gsub("[^%w]", "-"))
+  local chars, hash = {}, 0
+  each_utf16_unit(abs_path, function(unit)
+    local alnum = (unit >= 48 and unit <= 57) or (unit >= 65 and unit <= 90) or (unit >= 97 and unit <= 122)
+    chars[#chars + 1] = alnum and string.char(unit) or "-"
+    -- Wrapping at 2^32 each step is the same arithmetic as JS's `|0` per step,
+    -- and keeps the running value inside a double's exact integer range.
+    hash = (hash * 31 + unit) % 0x100000000
+  end)
+
+  local slug = table.concat(chars)
+  if #slug <= SLUG_MAX then
+    return slug
+  end
+  if hash >= 0x80000000 then
+    hash = hash - 0x100000000
+  end
+  return slug:sub(1, SLUG_MAX) .. "-" .. to_base36(math.abs(hash))
+end
+
+---Strip a trailing separator, without eating a path that is only a root.
+---
+---`fnamemodify(cwd, ":p")` appends one, and the CLI slugifies a path that has
+---none: on Windows that difference is the whole feature, since `D:\Git\proj\`
+---slugifies to `D--Git-proj-` and the CLI's directory is `D--Git-proj`.
+---@param path string
+---@return string
+function M._trim_separator(path)
+  local trimmed = path:gsub("[/\\]+$", "")
+  if trimmed == "" or trimmed:match("^%a:$") then
+    return path
+  end
+  return trimmed
 end
 
 ---Locate the transcript directory for a project.
 ---
----Tries the slug first, and falls back to scanning every project directory for a
----transcript whose entries name this cwd — so a change to the CLI's naming rule
----costs a slower lookup rather than an empty session list.
+---Tries the slug first — for the path as given and, if that misses, for its
+---realpath, since the CLI resolves symlinks before slugifying and Neovim's cwd
+---does not — and falls back to scanning every project directory for a transcript
+---whose entries name this cwd, so a change to the CLI's naming rule costs a
+---slower lookup rather than an empty session list.
 ---@param cwd string
 ---@return string|nil dir
 function M.project_dir(cwd)
@@ -228,10 +358,21 @@ function M.project_dir(cwd)
     return nil
   end
 
-  local target = vim.fn.fnamemodify(cwd, ":p"):gsub("/$", "")
-  local guess = root .. "/" .. M.slugify(target)
-  if vim.fn.isdirectory(guess) == 1 then
-    return guess
+  local target = M._trim_separator(vim.fn.fnamemodify(cwd, ":p"))
+  local targets = { target }
+  local real = uv and uv.fs_realpath and uv.fs_realpath(target)
+  if type(real) == "string" then
+    real = M._trim_separator(real)
+    if real ~= target then
+      targets[#targets + 1] = real
+    end
+  end
+
+  for _, candidate in ipairs(targets) do
+    local guess = root .. "/" .. M.slugify(candidate)
+    if vim.fn.isdirectory(guess) == 1 then
+      return guess
+    end
   end
 
   local names = M._io.scandir(root)
@@ -240,8 +381,12 @@ function M.project_dir(cwd)
   end
   for _, name in ipairs(names) do
     local dir = root .. "/" .. name
-    if vim.fn.isdirectory(dir) == 1 and M._dir_matches_cwd(dir, target) then
-      return dir
+    if vim.fn.isdirectory(dir) == 1 then
+      for _, candidate in ipairs(targets) do
+        if M._dir_matches_cwd(dir, candidate) then
+          return dir
+        end
+      end
     end
   end
   return nil
@@ -249,30 +394,53 @@ end
 
 ---Whether any transcript in `dir` reports `target` as its cwd. Reads only the
 ---head of one file, since every message entry carries the same cwd.
+---
+---Blocking, through `read_sync`: this is the answer `project_dir` returns, and an
+---earlier version asked the asynchronous reader and treated "has not answered
+---yet" as "no match" — which the real reader never does answer in time, so the
+---fallback could not fire at all and a slug miss was always an empty session
+---list.
 ---@param dir string
 ---@param target string
 ---@return boolean
 function M._dir_matches_cwd(dir, target)
+  -- The transcript is JSON, so a Windows path is written with its separators
+  -- escaped (`D:\\Git\\proj`); the cwd we are matching has them raw.
+  local needles = { '"cwd":"' .. target .. '"' }
+  local escaped = target:gsub("\\", "\\\\")
+  if escaped ~= target then
+    needles[#needles + 1] = '"cwd":"' .. escaped .. '"'
+  end
+
+  -- Windows spells one directory more than one way (`D:\Git` / `d:\git`), and the
+  -- CLI recorded whichever its own shell handed it.
+  local fold = require("claudecode.utils").is_windows()
+  if fold then
+    for index, needle in ipairs(needles) do
+      needles[index] = needle:lower()
+    end
+  end
+
+  local read_sync = M._io.read_sync
+  if type(read_sync) ~= "function" then
+    return false
+  end
+
   local names = M._io.scandir(dir) or {}
   for _, name in ipairs(names) do
     if name:sub(-6) == ".jsonl" then
-      local found = false
-      local done = false
-      M._io.read(dir .. "/" .. name, 0, 64 * 1024, function(data)
-        done = true
-        if not data then
-          return
+      -- Match the raw bytes rather than decoding: this runs once per candidate
+      -- directory and only needs a yes/no.
+      local data = read_sync(dir .. "/" .. name, 64 * 1024)
+      if type(data) == "string" then
+        if fold then
+          data = data:lower()
         end
-        -- Match the raw bytes rather than decoding: this runs once per candidate
-        -- directory and only needs a yes/no.
-        local encoded = target:gsub("[%^%$%(%)%%%.%[%]%*%+%-%?]", "%%%0")
-        found = data:find('"cwd":"' .. encoded .. '"') ~= nil
-      end)
-      -- The default reader is async, but this probe only runs on the slug-miss
-      -- path; a reader that has not answered synchronously is treated as no match
-      -- so a rare fallback never stalls the caller.
-      if done and found then
-        return true
+        for _, needle in ipairs(needles) do
+          if data:find(needle, 1, true) then
+            return true
+          end
+        end
       end
     end
   end

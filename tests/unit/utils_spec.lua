@@ -91,3 +91,23 @@ describe("claudecode.utils.parse_command", function()
     assert.are.same({ "claude", "--model", "opus[1m]" }, utils.parse_command("claude --model opus[1m]"))
   end)
 end)
+
+describe("claudecode.utils path comparison", function()
+  local utils = require("claudecode.utils")
+
+  it("spells a path one way so two of them can be compared", function()
+    assert.are.equal("D:/Git/proj", utils.normalize_path("D:\\Git\\proj\\"))
+    assert.are.equal("D:/Git/proj", utils.normalize_path("D:/Git//proj"))
+    assert.are.equal("/proj/lua/a.lua", utils.normalize_path("/proj/lua/a.lua"))
+  end)
+
+  it("keeps a root, which is a directory where a bare drive is not", function()
+    assert.are.equal("/", utils.normalize_path("/"))
+    assert.are.equal("D:/", utils.normalize_path("D:\\"))
+  end)
+
+  it("leaves a POSIX path untouched as a key", function()
+    -- Case folding is a Windows rule; on POSIX `/Proj` and `/proj` are two files.
+    assert.are.equal("/proj/lua/a.lua", utils.path_key("/proj/lua/a.lua"))
+  end)
+end)

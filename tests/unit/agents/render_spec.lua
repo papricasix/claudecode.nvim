@@ -81,6 +81,14 @@ describe("agents.render", function()
       expect(render.relative_path("/proj/a.lua", nil)).to_be("/proj/a.lua")
     end)
 
+    it("strips the session's directory however either path spells it", function()
+      -- On Windows the session's cwd is `D:\Git\proj` while the same directory
+      -- can reach us as `D:/Git/proj`; neither spelling should show the row a
+      -- full absolute path.
+      expect(render.relative_path("D:\\Git\\proj\\lua\\a.lua", "D:\\Git\\proj")).to_be("lua\\a.lua")
+      expect(render.relative_path("D:\\Git\\proj\\lua\\a.lua", "D:/Git/proj/")).to_be("lua\\a.lua")
+    end)
+
     describe("fitting a path into a narrow pane", function()
       -- A tail cut throws away the one part the row is read for: it turned
       -- `lua/claudecode/agents/render.lua` into `lua/claudecod…`, so every file
@@ -132,6 +140,22 @@ describe("agents.render", function()
       it("says nothing when there is no room to say it", function()
         expect(render.shorten_path("a/b.lua", 0)).to_be("")
         expect(render.shorten_path(nil, 20)).to_be("")
+      end)
+
+      it("shortens a Windows path from the inside too", function()
+        -- Splitting on `/` alone left one segment, so a Windows path fell
+        -- through to the tail cut this exists to avoid — and every file in a
+        -- directory looked alike again.
+        expect(render.shorten_path("lua\\claudecode\\agents\\render.lua", 28)).to_be("lua\\…\\agents\\render.lua")
+        expect(render.shorten_path("lua\\claudecode\\agents\\render.lua", 14)).to_be("…\\render.lua")
+      end)
+
+      it("keeps a drive with the folder it names", function()
+        -- `D:` alone is not the coarse "where in the project" answer a first
+        -- segment is picked for.
+        expect(render.shorten_path("D:\\proj\\lua\\claudecode\\agents\\a.lua", 22)).to_be(
+          "D:\\proj\\…\\agents\\a.lua"
+        )
       end)
     end)
   end)

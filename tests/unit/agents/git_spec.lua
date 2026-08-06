@@ -64,6 +64,22 @@ describe("agents.git", function()
       expect(status["/elsewhere/a.lua"]).to_be("M")
     end)
 
+    it("keys a Windows root the way the caller looks it up", function()
+      -- Git answers with `/` separators on every platform, while the paths the
+      -- caller holds are the CLI's own — `D:\Git\proj\lua\a.lua`. Joining the two
+      -- verbatim produced a key nothing could ever match, so no file in the
+      -- Changes pane got a status letter.
+      local status = git.parse_status({ " M lua/a.lua", "?? notes.md" }, "D:\\Git\\proj")
+      local utils = require("claudecode.utils")
+      expect(status[utils.path_key("D:\\Git\\proj\\lua\\a.lua")]).to_be("M")
+      expect(status[utils.path_key("D:\\Git\\proj\\notes.md")]).to_be("?")
+    end)
+
+    it("leaves an absolute Windows path alone", function()
+      local status = git.parse_status({ " M D:/elsewhere/a.lua" }, "D:\\Git\\proj")
+      expect(status[require("claudecode.utils").path_key("D:\\elsewhere\\a.lua")]).to_be("M")
+    end)
+
     it("survives empty and malformed output", function()
       expect(next(git.parse_status(nil, "/proj"))).to_be(nil)
       expect(next(git.parse_status({}, "/proj"))).to_be(nil)

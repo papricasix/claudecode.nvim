@@ -370,18 +370,31 @@ local function fit_name(name, width)
   return M.truncate(name, width)
 end
 
----Split a path into segments, keeping a leading `/` on the first one.
+---Split a path into segments, keeping a leading `/` on the first one, and report
+---the separator it was written with.
+---
+---Both separators are split on, and a Windows drive is kept with the segment that
+---follows it (`D:\Git\proj` -> `D:\Git`, `proj`): `D:` on its own is not the
+---coarse "where in the project" answer `shorten_path` picks a first segment for.
+---A path split on `/` alone left a Windows path as one segment, which sent it to
+---the tail cut this whole function exists to avoid.
 ---@param path string
----@return string[]
+---@return string[] segments, string separator
 local function path_segments(path)
   local segments = {}
-  for segment in path:gmatch("[^/]+") do
+  for segment in path:gmatch("[^/\\]+") do
     segments[#segments + 1] = segment
   end
-  if segments[1] and path:sub(1, 1) == "/" then
-    segments[1] = "/" .. segments[1]
+  local separator = path:find("\\", 1, true) and not path:find("/", 1, true) and "\\" or "/"
+  if segments[1] then
+    if path:sub(1, 1) == "/" or path:sub(1, 1) == "\\" then
+      segments[1] = path:sub(1, 1) .. segments[1]
+    elseif segments[1]:match("^%a:$") and segments[2] then
+      segments[1] = segments[1] .. separator .. segments[2]
+      table.remove(segments, 2)
+    end
   end
-  return segments
+  return segments, separator
 end
 
 ---Fit a path into a width from the inside out, so the filename always survives.
@@ -413,7 +426,7 @@ function M.shorten_path(path, width)
     return path
   end
 
-  local segments = path_segments(path)
+  local segments, sep = path_segments(path)
   local count = #segments
   if count <= 1 then
     return fit_name(path, width)
@@ -426,12 +439,12 @@ function M.shorten_path(path, width)
   -- Only when the ellipsis actually stands for something: with three segments
   -- `first/…/parent/name` would spell the whole path with a cut mark in it.
   if count >= 4 then
-    candidates[#candidates + 1] = first .. "/…/" .. parent .. "/" .. name
+    candidates[#candidates + 1] = first .. sep .. "…" .. sep .. parent .. sep .. name
   end
   if count >= 3 then
-    candidates[#candidates + 1] = first .. "/…/" .. name
+    candidates[#candidates + 1] = first .. sep .. "…" .. sep .. name
   end
-  candidates[#candidates + 1] = "…/" .. name
+  candidates[#candidates + 1] = "…" .. sep .. name
   candidates[#candidates + 1] = name
 
   for _, candidate in ipairs(candidates) do
@@ -443,6 +456,11 @@ function M.shorten_path(path, width)
 end
 
 ---A path shown relative to the directory the session ran in.
+---
+---Compared in normalized form, since the two spellings need not match: on Windows
+---the session's cwd is `D:\Git\proj` while the same directory can reach us as
+---`D:/Git/proj`. What is returned is a slice of the original, so the path keeps
+---the separators it was written with.
 ---@param path string
 ---@param root string|nil
 ---@return string
@@ -451,9 +469,14 @@ function M.relative_path(path, root)
     return ""
   end
   if type(root) == "string" and root ~= "" then
-    local prefix = root:gsub("/$", "") .. "/"
-    if path:sub(1, #prefix) == prefix then
-      return path:sub(#prefix + 1)
+    local utils = require("claudecode.utils")
+    local prefix = utils.path_key(root) .. "/"
+    local key = utils.path_key(path)
+    if key:sub(1, #prefix) == prefix then
+      -- Normalizing rewrites separators and case in place, so an offset into the
+      -- key is the same offset into the path — unless it also collapsed a
+      -- doubled separator, in which case the key's own remainder is the answer.
+      return #key == #path and path:sub(#prefix + 1) or key:sub(#prefix + 1)
     end
   end
   return path

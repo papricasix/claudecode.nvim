@@ -148,6 +148,51 @@ function M.parse_command(cmd)
   return argv
 end
 
+---Whether this Neovim runs on native Windows (not WSL, which is Linux).
+---@return boolean
+function M.is_windows()
+  if vim and vim.fn and vim.fn.has then
+    return vim.fn.has("win32") == 1
+  end
+  -- Outside Neovim (a spec loading this module bare), the interpreter's own
+  -- directory separator is the answer.
+  return package.config:sub(1, 1) == "\\"
+end
+
+---A path in one comparable form: `/` separators, no trailing separator.
+---
+---Windows hands the same directory back in more than one shape — `vim.fn.getcwd()`
+---gives `D:\Git\proj`, git reports `lua/x.lua`, and the CLI writes whichever its
+---own runtime produced — so any code that compares two paths, or uses one as a
+---table key, has to agree on a spelling first. Comparison only: the result is not
+---a path to hand to the filesystem, since it drops the separator the platform
+---actually uses.
+---@param path string
+---@return string
+function M.normalize_path(path)
+  if type(path) ~= "string" then
+    return ""
+  end
+  local out = path:gsub("\\", "/"):gsub("/+", "/")
+  -- Keep a root: `/` and `D:/` are directories, `` and `D:` are not.
+  if #out > 1 and out:sub(-1) == "/" and not out:match("^%a:/$") then
+    out = out:sub(1, -2)
+  end
+  return out
+end
+
+---A path as a table key. `normalize_path`, case-folded on Windows, where the two
+---spellings of a drive letter name one file.
+---@param path string
+---@return string
+function M.path_key(path)
+  local out = M.normalize_path(path)
+  if M.is_windows() then
+    out = out:lower()
+  end
+  return out
+end
+
 ---Where the Claude CLI keeps its state.
 ---
 ---One rule, because three features read it — the lock files it discovers editors

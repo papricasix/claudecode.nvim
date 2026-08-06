@@ -937,7 +937,9 @@ function M.changes()
         added_age_ms = added_age,
         removed_age_ms = removed_age,
         kind = file.kind,
-        status = state.git[path] or (file.kind == "add" and "A" or "M"),
+        -- Keyed the way `git.parse_status` keys it: git answers with `/`
+        -- separators whatever the platform, and this path is the CLI's own.
+        status = state.git[require("claudecode.utils").path_key(path)] or (file.kind == "add" and "A" or "M"),
       }
     end
   end
