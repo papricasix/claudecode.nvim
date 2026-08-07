@@ -337,6 +337,19 @@ describe("agents.model", function()
       expect(ok).to_be(false)
       expect(#deleted).to_be(0)
     end)
+
+    it("deletes a batch, and reports what it could not", function()
+      -- A running agent in the batch is reported rather than aborting the rest:
+      -- the caller pointed at a stretch of the list, not at one row.
+      live.bbb = true
+      local gone, failed = model.delete_sessions({ "aaa", "bbb", "nope" })
+      expect(#gone).to_be(1)
+      expect(gone[1]).to_be("aaa")
+      expect(#failed).to_be(2)
+      expect(failed[1].session_id).to_be("bbb")
+      expect(model.row("aaa")).to_be(nil)
+      expect(model.row("bbb")).to_be_table()
+    end)
   end)
 
   describe("selection", function()

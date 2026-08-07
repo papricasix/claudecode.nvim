@@ -1018,17 +1018,20 @@ describe("agents_view", function()
   end)
 
   describe("deleting a session", function()
-    local asked, deleted, live
+    local asked, deleted, live, rows
 
     before_each(function()
       asked, deleted, live = {}, {}, {}
+      -- One session per line, so a count or a visual range covers a known set.
+      rows = { "aaa", "bbb", "ccc", "ddd" }
 
-      -- The action reads the row under the cursor and asks before doing anything,
+      -- The action reads the rows the range covers and asks before doing anything,
       -- so both are stubbed: the question is what it decides, not how it draws.
       package.loaded["claudecode.agents.render"] = {
         setup = function() end,
-        payload_at = function()
-          return { session_id = "aaa" }
+        payload_at = function(_, lnum)
+          local id = rows[lnum]
+          return id and { session_id = id } or nil
         end,
       }
       package.loaded["claudecode.agents.registry"] = {
@@ -1040,12 +1043,14 @@ describe("agents_view", function()
         setup = function() end,
         on_change = function() end,
         row = function(id)
-          return { session_id = id, title = "Some session", added = 3, removed = 1 }
+          return { session_id = id, title = "Session " .. id, added = 3, removed = 1 }
         end,
         foreign_state = function() end,
-        delete_session = function(id)
-          deleted[#deleted + 1] = id
-          return true, nil
+        delete_sessions = function(ids)
+          for _, id in ipairs(ids) do
+            deleted[#deleted + 1] = id
+          end
+          return ids, {}
         end,
       }
       package.loaded["claudecode.agents.confirm"] = {
@@ -1072,6 +1077,7 @@ describe("agents_view", function()
       expect(#asked).to_be(1)
       expect(asked[1].message).to_be_table()
       expect(deleted[1]).to_be("aaa")
+      expect(#deleted).to_be(1)
     end)
 
     it("deletes nothing when the answer is no", function()
@@ -1086,6 +1092,64 @@ describe("agents_view", function()
       agents_view.delete_under_cursor()
       expect(#asked).to_be(0)
       expect(#deleted).to_be(0)
+    end)
+
+    it("takes a count, and asks once for the batch", function()
+      agents_view.delete_under_cursor(3)
+      expect(#asked).to_be(1)
+      expect(asked[1].title).to_be("Delete 3 sessions")
+      expect(table.concat(deleted, ",")).to_be("aaa,bbb,ccc")
+    end)
+
+    it("deletes every session a range covers", function()
+      agents_view.delete_range(2, 4)
+      expect(table.concat(deleted, ",")).to_be("bbb,ccc,ddd")
+    end)
+
+    it("stops at the end of the list rather than erroring", function()
+      -- A count or a selection dragged past the last row is a normal gesture.
+      agents_view.delete_range(3, 40)
+      expect(table.concat(deleted, ",")).to_be("ccc,ddd")
+    end)
+
+    it("leaves a running agent in the middle of a range alone", function()
+      -- One busy agent must not veto the whole gesture — the dialog says how many
+      -- were skipped, and by which key they can be stopped.
+      live.ccc = true
+      agents_view.delete_range(1, 4)
+      expect(table.concat(deleted, ",")).to_be("aaa,bbb,ddd")
+      expect(#asked).to_be(1)
+      local said_so = false
+      for _, line in ipairs(asked[1].message) do
+        if line:match("1 still running") then
+          said_so = true
+        end
+      end
+      expect(said_so).to_be_true()
+    end)
+
+    it("names only the first few, then counts the rest", function()
+      rows = {}
+      for index = 1, 12 do
+        rows[index] = ("id%02d"):format(index)
+      end
+      agents_view.delete_range(1, 12)
+      expect(#deleted).to_be(12)
+      local more = false
+      for _, line in ipairs(asked[1].message) do
+        if line:match("and 4 more") then
+          more = true
+        end
+      end
+      expect(more).to_be_true()
+    end)
+
+    it("binds a doubled key under its single form in visual mode", function()
+      -- `dd` is the linewise form of `d`; over a selection the range *is* the
+      -- selection, so a second press would only extend it.
+      expect(agents_view._visual_lhs("dd")).to_be("d")
+      expect(agents_view._visual_lhs("X")).to_be("X")
+      expect(agents_view._visual_lhs("<C-d>")).to_be("<C-d>")
     end)
   end)
 

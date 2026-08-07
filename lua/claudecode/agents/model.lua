@@ -833,37 +833,65 @@ function M.row(session_id)
   return state.by_id[session_id]
 end
 
----Delete a conversation and drop it from the list.
+---Delete several conversations, and drop them from the list.
 ---
 ---The caller confirms; this only refuses what it can see is unsafe. A running
 ---agent is left alone because its CLI still has the file open — the view offers
 ---stopping it first.
+---
+---One re-enumeration for the whole batch, not one per transcript: the list is
+---derived from a directory listing, so deleting a visual range of thirty rows
+---would otherwise stat the store thirty times to arrive at the same answer.
+---@param session_ids string[]
+---@return string[] deleted The ids that are now gone.
+---@return { session_id: string, err: string }[] failed
+function M.delete_sessions(session_ids)
+  local deleted, failed = {}, {}
+
+  for _, session_id in ipairs(session_ids or {}) do
+    local row = state.by_id[session_id]
+    local err = nil
+    if not row then
+      err = "no such session"
+    elseif is_live(row) then
+      err = "the agent is still running"
+    else
+      local ok, delete_err = transcript.delete(row.path)
+      if not ok then
+        err = delete_err or "could not delete the transcript"
+      end
+    end
+
+    if err then
+      failed[#failed + 1] = { session_id = session_id, err = err }
+    else
+      deleted[#deleted + 1] = session_id
+      if state.selected == session_id then
+        state.selected = nil
+        state.dirty.transcript = true
+        state.dirty.git = true
+      end
+    end
+  end
+
+  if #deleted > 0 then
+    -- Re-enumerating is what actually removes the rows: the list is derived from
+    -- what is on disk, so dropping them here as well would only risk disagreeing.
+    M.refresh_list()
+  end
+  return deleted, failed
+end
+
+---Delete one conversation.
 ---@param session_id string
 ---@return boolean ok
 ---@return string|nil err
 function M.delete_session(session_id)
-  local row = state.by_id[session_id]
-  if not row then
-    return false, "no such session"
+  local deleted, failed = M.delete_sessions({ session_id })
+  if #deleted == 1 then
+    return true, nil
   end
-  if is_live(row) then
-    return false, "the agent is still running"
-  end
-
-  local ok, err = transcript.delete(row.path)
-  if not ok then
-    return false, err
-  end
-
-  if state.selected == session_id then
-    state.selected = nil
-    state.dirty.transcript = true
-    state.dirty.git = true
-  end
-  -- Re-enumerating is what actually removes the row: the list is derived from
-  -- what is on disk, so dropping it here as well would only risk disagreeing.
-  M.refresh_list()
-  return true, nil
+  return false, failed[1] and failed[1].err or "could not delete the session"
 end
 
 ---Where a conversation's transcript lives — the only place its history exists.

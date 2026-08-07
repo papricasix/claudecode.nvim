@@ -504,6 +504,7 @@ end
 ---@field desc string
 ---@field run fun(pane: string)
 ---@field bind boolean|nil `false` when something else binds it (see `map_cycle`).
+---@field visual fun(pane: string)|nil Also bound in visual mode, under `visual_lhs`.
 
 ---@type ClaudeCodeAgentsKeySpec[]
 local KEY_SPECS = {
@@ -538,9 +539,14 @@ local KEY_SPECS = {
     field = "delete",
     panes = { "sessions" },
     group = "Sessions",
-    desc = "Delete this conversation from disk (asks first)",
+    desc = "Delete this conversation from disk — takes a count, or a visual range (asks first)",
     run = function()
-      M.delete_under_cursor()
+      -- The count typed in front of the mapping, so `3dd` reaches three rows the
+      -- way it reaches three lines anywhere else.
+      M.delete_under_cursor(vim.v.count1)
+    end,
+    visual = function()
+      M.delete_visual()
     end,
   },
   {
@@ -705,6 +711,19 @@ function M.show_sort_menu()
   end)
 end
 
+---What a doubled normal-mode key is called in visual mode.
+---
+---`dd` is the linewise form of `d`, and Vim has no doubled key in visual mode:
+---the range is the selection, so the second press would only extend it. So a key
+---the user spelled as a repeated character is bound over a selection under its
+---single form, and anything else (`<C-x>`, `gx`, a rebinding to `X`) is bound as
+---it stands.
+---@param lhs string
+---@return string
+function M._visual_lhs(lhs)
+  return lhs:match("^(%a)%1$") or lhs:match("^(%p)%1$") or lhs
+end
+
 ---@param buf integer
 ---@param pane string
 function bind_keys(buf, pane)
@@ -713,9 +732,15 @@ function bind_keys(buf, pane)
   map_cycle(buf, false)
   for _, spec in ipairs(KEY_SPECS) do
     if spec.bind ~= false and spec_applies(spec, pane) then
-      map(buf, keys[spec.field], function()
+      local lhs = keys[spec.field]
+      map(buf, lhs, function()
         spec.run(pane)
       end, "Claude agents: " .. spec.desc)
+      if spec.visual and type(lhs) == "string" and lhs ~= "" then
+        pcall(vim.keymap.set, "x", M._visual_lhs(lhs), function()
+          spec.visual(pane)
+        end, { buffer = buf, nowait = true, silent = true, desc = "Claude agents: " .. spec.desc })
+      end
     end
   end
 end
@@ -1854,55 +1879,177 @@ function M.stop_under_cursor()
   M.redraw()
 end
 
----Delete the conversation under the cursor, transcript and all.
+--- How many rows a delete dialog names one by one before it starts counting. A
+--- confirmation you have to scroll is one nobody reads.
+local DELETE_LIST_MAX = 8
+
+---The session ids on a range of lines, in order and without repeats.
 ---
----Refuses while its agent runs: the CLI still has the transcript open, and the
----row would come back the next time it writes a line. Stopping it first is one
----keypress away, and the message says so.
-function M.delete_under_cursor()
-  local payload = payload_under_cursor()
-  if not payload or not payload.session_id then
-    return
+---A line with no session on it is skipped rather than refused: a visual range is
+---drawn by eye, and the "no sessions for this project" placeholder — or a range
+---dragged past the last row — must not turn the whole gesture into an error.
+---@param buf integer
+---@param first integer
+---@param last integer
+---@return string[]
+local function sessions_in_range(buf, first, last)
+  local ids, seen = {}, {}
+  if not buf then
+    return ids
   end
-  local session_id = payload.session_id
+  -- Only to bound the walk: a count is whatever the user typed, and `999dd` on a
+  -- four-row list must not be 999 lookups. The lookups themselves already answer
+  -- nil past the end, so a buffer that cannot report a length costs nothing.
+  local ok_count, count = pcall(vim.api.nvim_buf_line_count, buf)
+  if ok_count and type(count) == "number" and count > 0 and last > count then
+    last = count
+  end
+  for lnum = math.max(1, first), last do
+    local payload = render.payload_at(buf, lnum)
+    local session_id = payload and payload.session_id
+    if session_id and not seen[session_id] then
+      seen[session_id] = true
+      ids[#ids + 1] = session_id
+    end
+  end
+  return ids
+end
+
+---How a session reads in the confirmation: its title, and what it changed.
+---@param session_id string
+---@return string
+local function delete_label(session_id)
   local row = model.row(session_id)
-  if not row then
+  local label = (row and row.title) or session_id:sub(1, 8)
+  if row and (row.added or row.removed) then
+    return label .. ("  +%d  -%d"):format(row.added or 0, row.removed or 0)
+  end
+  return label
+end
+
+---Ask about a batch of conversations, then delete the ones the user agreed to.
+---
+---Running agents are set aside rather than refusing the whole gesture: with a
+---count or a visual range the user is pointing at a stretch of the list, not at
+---one row, and one busy agent in the middle of it should not mean nothing
+---happens. The dialog says how many were left alone, and by which key they can be
+---stopped. When *every* row is busy there is nothing to ask about, so that is the
+---one case that only warns.
+---@param session_ids string[]
+local function confirm_and_delete(session_ids)
+  local deletable, blocked = {}, 0
+  for _, session_id in ipairs(session_ids) do
+    -- No row means the list has already moved on from it — nothing to delete and
+    -- nothing worth reporting.
+    if model.row(session_id) then
+      if registry.is_live(session_id) or model.foreign_state(session_id) then
+        blocked = blocked + 1
+      else
+        deletable[#deletable + 1] = session_id
+      end
+    end
+  end
+
+  local stop_key = keymaps().stop
+  local how = type(stop_key) == "string" and stop_key ~= "" and (" (" .. stop_key .. ")") or ""
+
+  if #deletable == 0 then
+    if blocked > 0 then
+      local message = blocked == 1 and "stop this agent before deleting its session"
+        or ("stop these %d agents before deleting their sessions"):format(blocked)
+      vim.notify("ClaudeCode: " .. message .. how, vim.log.levels.WARN)
+    end
     return
   end
 
-  if registry.is_live(session_id) or model.foreign_state(session_id) then
-    local stop_key = keymaps().stop
-    local how = type(stop_key) == "string" and stop_key ~= "" and (" (" .. stop_key .. ")") or ""
-    vim.notify("ClaudeCode: stop this agent before deleting its session" .. how, vim.log.levels.WARN)
-    return
+  local message = {}
+  for index, session_id in ipairs(deletable) do
+    if index > DELETE_LIST_MAX then
+      message[#message + 1] = ("… and %d more"):format(#deletable - DELETE_LIST_MAX)
+      break
+    end
+    message[#message + 1] = delete_label(session_id)
   end
-
-  local label = row.title or session_id:sub(1, 8)
-  local counts = ""
-  if row.added or row.removed then
-    counts = ("  +%d  -%d"):format(row.added or 0, row.removed or 0)
+  message[#message + 1] = ""
+  if #deletable == 1 then
+    message[#message + 1] = "Removes the conversation from disk. It cannot be resumed."
+  else
+    message[#message + 1] = "Removes the conversations from disk. They cannot be resumed."
+  end
+  if blocked > 0 then
+    message[#message + 1] = blocked == 1 and ("1 still running, left alone" .. how)
+      or ("%d still running, left alone%s"):format(blocked, how)
   end
 
   local confirm = require("claudecode.agents.confirm")
   confirm.ask({
-    title = "Delete session",
+    title = #deletable == 1 and "Delete session" or ("Delete %d sessions"):format(#deletable),
     confirm = "delete",
-    message = {
-      label .. counts,
-      "",
-      "Removes the conversation from disk. It cannot be resumed.",
-    },
+    message = message,
   }, function(ok)
     if not ok then
       return
     end
-    local deleted, err = model.delete_session(session_id)
-    if not deleted then
-      vim.notify("ClaudeCode: could not delete the session: " .. tostring(err), vim.log.levels.ERROR)
-      return
+    local deleted, failed = model.delete_sessions(deletable)
+    if #failed > 0 then
+      local first = failed[1]
+      local detail = tostring(first.err)
+      if #failed > 1 then
+        detail = detail .. (" (and %d more)"):format(#failed - 1)
+      end
+      local what = #deleted > 0 and ("could not delete %d of %d sessions: "):format(#failed, #deletable)
+        or "could not delete the session: "
+      vim.notify("ClaudeCode: " .. what .. detail, vim.log.levels.ERROR)
     end
     M.redraw()
   end)
+end
+
+---Delete every conversation on a range of the sessions pane, transcript and all.
+---
+---The range comes from a visual selection; `delete_under_cursor` supplies a
+---cursor-relative one for a count.
+---@param first integer
+---@param last integer
+function M.delete_range(first, last)
+  local buf = vim.api.nvim_win_get_buf(vim.api.nvim_get_current_win())
+  confirm_and_delete(sessions_in_range(buf, first, last))
+end
+
+---Delete the conversation under the cursor, transcript and all.
+---
+---Takes a count, so `3dd` deletes three rows the way it would delete three lines
+---anywhere else — one dialog for the batch, not three in a row.
+---
+---Refuses while an agent runs: the CLI still has the transcript open, and the row
+---would come back the next time it writes a line. Stopping it first is one
+---keypress away, and the message says so.
+---@param count integer|nil Rows from the cursor down. Defaults to one.
+function M.delete_under_cursor(count)
+  local win = vim.api.nvim_get_current_win()
+  local buf = vim.api.nvim_win_get_buf(win)
+  local pos = vim.api.nvim_win_get_cursor(win)
+  local lnum = (pos and pos[1]) or 1
+  local rows = math.max(1, tonumber(count) or 1)
+  confirm_and_delete(sessions_in_range(buf, lnum, lnum + rows - 1))
+end
+
+---`d` over a visual selection of the sessions pane.
+---
+---The range is read from `v` and `.` **before** leaving visual mode: `'<` and `'>`
+---are only written when the mode ends, so reading those here would act on the
+---previous selection. Visual mode is then left at once, since the confirmation
+---opens a window over the pane and answering it from visual mode would extend the
+---selection into whatever came next.
+function M.delete_visual()
+  local first = vim.fn.line("v")
+  local last = vim.fn.line(".")
+  local esc = vim.api.nvim_replace_termcodes("<Esc>", true, false, true)
+  vim.api.nvim_feedkeys(esc, "nx", false)
+  if first > last then
+    first, last = last, first
+  end
+  M.delete_range(first, last)
 end
 
 --------------------------------------------------------------------------------
