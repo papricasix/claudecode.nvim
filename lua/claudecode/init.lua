@@ -693,7 +693,12 @@ function M._stop_instance_record(inst)
   if inst.tab and M.tab_instance[inst.tab] == inst.id then
     M.tab_instance[inst.tab] = nil
   end
-  logger.info("init", "Claude Code integration stopped (" .. tostring(inst.id) .. ")")
+  -- Debug, not info: with auto_start every tab gets an instance, so closing any
+  -- tab retires one. That is routine bookkeeping, and the matching start is
+  -- silent too (TabNew starts without the startup notification), so announcing
+  -- only the stop made every tab the user opened and closed print a message.
+  -- A user-invoked :ClaudeCodeStop still says so, from M.stop.
+  logger.debug("init", "Claude Code integration stopped (" .. tostring(inst.id) .. ")")
 end
 
 ---Stop the Claude Code integration for a specific tab (internal helper).
