@@ -392,6 +392,30 @@ function M.project_dir(cwd)
   return nil
 end
 
+---Where a conversation's transcript will live, whether or not it exists yet.
+---
+---`project_dir` answers only for a directory that is already there, and the one
+---conversation that has to be named before it exists is the new one — in a
+---project the CLI may never have run in at all, where that directory is created
+---by the very session being named. So the slug rule is applied directly when the
+---lookup comes up empty. A guess that turns out wrong costs one `stat` that
+---fails, and the next enumeration replaces it with the path on disk.
+---@param cwd string
+---@param session_id string
+---@return string path
+function M.session_path(cwd, session_id)
+  local dir = M.project_dir(cwd)
+  if not dir then
+    local target = M._trim_separator(vim.fn.fnamemodify(cwd, ":p"))
+    local real = uv and uv.fs_realpath and uv.fs_realpath(target)
+    if type(real) == "string" then
+      target = M._trim_separator(real)
+    end
+    dir = M.config_dir() .. "/projects/" .. M.slugify(target)
+  end
+  return dir .. "/" .. session_id .. ".jsonl"
+end
+
 ---Whether any transcript in `dir` reports `target` as its cwd. Reads only the
 ---head of one file, since every message entry carries the same cwd.
 ---

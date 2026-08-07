@@ -708,6 +708,20 @@ describe("agents.transcript", function()
 
       expect(transcript.project_dir("D:\\proj\\")).to_be("/home/user/.claude/projects/opaque")
     end)
+
+    it("names a transcript inside the directory it found", function()
+      vim._mock.add_dir("/home/user/.claude/projects")
+      vim._mock.add_dir("/home/user/.claude/projects/-proj")
+
+      expect(transcript.session_path("/proj", "abc")).to_be("/home/user/.claude/projects/-proj/abc.jsonl")
+    end)
+
+    it("names one in a project the CLI has never run in", function()
+      -- The directory is created by the very session being named, so there is
+      -- nothing to look up — and that is exactly the project where the first
+      -- agent needs a row before it has written anything.
+      expect(transcript.session_path("/proj", "abc")).to_be("/home/user/.claude/projects/-proj/abc.jsonl")
+    end)
   end)
 
   describe("cancellation", function()

@@ -1945,7 +1945,12 @@ function M.select(session_id)
     win = center,
     tab = state.tab,
     cwd = (row and row.cwd) or model.cwd(),
-    resume = true,
+    -- `--resume` needs a transcript to read, and a conversation that was started
+    -- and then stopped before its first message has none — it is a name, not yet
+    -- a conversation, and it is off the list because nothing enumerates it. Such
+    -- an id is claimed rather than resumed, which is what starting it meant the
+    -- first time too.
+    resume = row ~= nil,
     focus = false,
   })
   if not term then
@@ -1986,9 +1991,10 @@ function M.new_agent()
   clear_start_prompt()
   M.bind_terminal_keys(term.bufnr)
   model.select(session_id)
-  -- The transcript does not exist until the first message, so the list only
-  -- learns about this conversation once the user talks to it.
-  model.request_refresh()
+  -- Straight away rather than on the next poll: the CLI writes no transcript
+  -- until the first message, so this conversation is listed from the registry
+  -- until then — and a row is the only way back to it once the selection moves.
+  model.refresh_list()
   M.redraw()
 end
 

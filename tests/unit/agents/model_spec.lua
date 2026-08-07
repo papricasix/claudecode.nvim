@@ -78,11 +78,27 @@ describe("agents.model", function()
         end
         return {}
       end,
+      session_path = function(_, id)
+        return "/p/" .. id .. ".jsonl"
+      end,
     }
 
     package.loaded["claudecode.agents.registry"] = {
       is_live = function(id)
         return live[id] == true
+      end,
+      live_ids = function()
+        local ids = {}
+        for id, running in pairs(live) do
+          if running then
+            ids[#ids + 1] = id
+          end
+        end
+        table.sort(ids)
+        return ids
+      end,
+      get = function(id)
+        return live[id] and { session_id = id, cwd = "/proj" } or nil
       end,
     }
 
@@ -204,6 +220,78 @@ describe("agents.model", function()
       model.setup({ agents = { enabled = true, sessions = { include_empty = false } } })
       model.attach(1, "/proj")
       expect(ids_now().ccc).to_be(nil) -- and hidden on request
+    end)
+
+    it("lists an agent we are running that has written no transcript yet", function()
+      -- The CLI creates the transcript on the first message, so a brand new agent
+      -- is in no enumeration until the user talks to it — and a row is the only
+      -- way back to a conversation, so without this one it becomes unreachable
+      -- the moment the selection moves off it.
+      live.ccc = true
+      model.refresh_list()
+
+      local by_id = {}
+      for _, row in ipairs(model.rows()) do
+        by_id[row.session_id] = row
+      end
+      expect(by_id.ccc).not_to_be_nil()
+      expect(by_id.ccc.live).to_be_true()
+      expect(by_id.ccc.title).to_be("New session")
+      -- It has changed nothing yet, which is a fact rather than an unread count.
+      expect(by_id.ccc.added).to_be(0)
+      expect(by_id.ccc.removed).to_be(0)
+    end)
+
+    it("keeps such an agent selectable across a rebuild", function()
+      live.ccc = true
+      model.refresh_list()
+      model.select("ccc")
+      model.refresh_list()
+      expect(model.selected()).to_be("ccc")
+    end)
+
+    it("hands it over to the enumeration once its transcript appears", function()
+      live.ccc = true
+      model.refresh_list()
+
+      summaries.ccc = summary_for("ccc", { added = 3, removed = 1 })
+      model.refresh_list()
+
+      local seen = 0
+      for _, row in ipairs(model.rows()) do
+        if row.session_id == "ccc" then
+          seen = seen + 1
+          expect(row.added).to_be(3)
+          expect(row.title).to_be("Title ccc")
+        end
+      end
+      expect(seen).to_be(1)
+    end)
+
+    it("keeps the title it had while its transcript is being folded", function()
+      -- The row is listed as soon as the file exists and folded moments later.
+      -- Falling back to the id prefix in between is a flicker on the one row the
+      -- user is watching.
+      live.ccc = true
+      model.refresh_list()
+      -- Listed, but nothing has read it yet.
+      package.loaded["claudecode.agents.transcript"].list = function()
+        return { { id = "ccc", path = "/p/ccc.jsonl", size = 1, mtime = 1, summary = nil } }
+      end
+      model.refresh_list()
+      expect(model.rows()[1].title).to_be("New session")
+    end)
+
+    it("drops the row when the agent stops before saying anything", function()
+      live.ccc = true
+      model.refresh_list()
+      live.ccc = nil
+      model.refresh_list()
+      local found = false
+      for _, row in ipairs(model.rows()) do
+        found = found or row.session_id == "ccc"
+      end
+      expect(found).to_be_false()
     end)
 
     it("sorts by additions when asked", function()

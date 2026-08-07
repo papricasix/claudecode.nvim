@@ -348,6 +348,11 @@ end
 -- Rows
 --------------------------------------------------------------------------------
 
+--- What a conversation is called before it has said anything. Every other title
+--- comes out of the transcript, and this is the row that has none yet; the id
+--- prefix `rows()` otherwise falls back to names nothing a user would recognise.
+local NEW_SESSION_TITLE = "New session"
+
 ---What to call a session in the list. A name the user gave it beats the CLI's
 ---generated title — renaming is the user saying the generated one was wrong —
 ---and the first prompt stands in until either exists.
@@ -447,10 +452,15 @@ function M.refresh_list()
       break
     end
     local summary = entry.summary
+    -- Kept across the rebuild so a title never goes backwards: a transcript that
+    -- has just appeared is listed before it is folded, and dropping to the id
+    -- prefix in between is a visible flicker on the row the user is watching —
+    -- the one they just started. `apply_summary` keeps it the same way.
+    local previous = state.by_id[entry.id]
     local row = {
       session_id = entry.id,
       path = entry.path,
-      title = display_title(summary),
+      title = display_title(summary) or (previous and previous.title) or nil,
       cwd = summary and summary.cwd or state.cwd,
       -- Kept even for a partial summary: `rows()` gates on `folded`, so a count
       -- from a half-read transcript is carried but not shown.
@@ -463,15 +473,43 @@ function M.refresh_list()
     by_id[row.session_id] = row
   end
 
+  -- A conversation we are running that the enumeration cannot see yet.
+  --
+  -- The CLI writes the transcript on the first message, so a brand new agent is
+  -- in no listing for as long as the user takes to type into it — and a list is
+  -- the only way back to a conversation, so moving the selection off it once lost
+  -- it entirely: still running, still holding a port and a terminal buffer, and
+  -- unreachable. The registry knows everything a row needs about it (its id, the
+  -- directory it runs in, and that it is running), so it is listed from there
+  -- until the enumeration takes over.
+  local registry = require("claudecode.agents.registry")
+  for _, session_id in ipairs(registry.live_ids()) do
+    if not by_id[session_id] then
+      local term = registry.get(session_id)
+      local row = {
+        session_id = session_id,
+        -- Where the CLI is about to write it. Nothing depends on the file being
+        -- there — a fold simply finds nothing — but naming it now is what lets
+        -- the panes fill in the moment it appears, rather than on the next scan.
+        path = transcript.session_path((term and term.cwd) or state.cwd, session_id),
+        title = NEW_SESSION_TITLE,
+        cwd = (term and term.cwd) or state.cwd,
+        -- It has changed nothing yet, and that is a fact rather than a gap: the
+        -- unknown-count placeholder would claim its counts are still being read.
+        added = 0,
+        removed = 0,
+        last_ts = os.time(),
+        folded = true,
+      }
+      rows[#rows + 1] = row
+      by_id[session_id] = row
+    end
+  end
+
   state.rows = rows
   state.by_id = by_id
 
-  -- A conversation that is running but has no row yet keeps the selection. The
-  -- CLI creates the transcript on the first message, so a brand new agent is
-  -- selected for as long as the user takes to type into it and is in no
-  -- enumeration until then — dropping the selection here is what left the row
-  -- unmarked when it finally appeared, until the list was cycled off and back on.
-  if state.selected and not by_id[state.selected] and not is_live({ session_id = state.selected }) then
+  if state.selected and not by_id[state.selected] then
     state.selected = nil
   end
   M.fold_pending()
