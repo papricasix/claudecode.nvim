@@ -294,6 +294,21 @@ describe("agents.model", function()
       expect(found).to_be_false()
     end)
 
+    it("dims the bullet of a session that is not running, not the one that is", function()
+      -- `status` dims `idle`, which is right in a tabline (a tab with no Claude
+      -- draws nothing at all there) and backwards here: the stopped sessions are
+      -- rows on screen too, and they were the ones at full strength.
+      live.aaa = true
+      model.attach(1, "/proj")
+
+      local by_id = {}
+      for _, row in ipairs(model.rows()) do
+        by_id[row.session_id] = row
+      end
+      expect(by_id.aaa.hl).to_be_nil()
+      expect(by_id.bbb.hl).to_be("ClaudeCodeAgentsStopped")
+    end)
+
     it("sorts by additions when asked", function()
       model.setup({ agents = { enabled = true, sessions = { sort = "added" } } })
       model.attach(1, "/proj")

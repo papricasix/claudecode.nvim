@@ -173,6 +173,9 @@ M.defaults = {
       removed = "ClaudeCodeAgentsRemoved", -- defaults to a link to DiffDelete
       selected = "ClaudeCodeAgentsSelected", -- defaults to a link to CursorLine
       path = "ClaudeCodeAgentsPath", -- defaults to a link to Directory
+      -- The bullet of a session that is not running; defaults to a link to
+      -- Comment. A running one keeps the pane's own colour instead.
+      stopped = "ClaudeCodeAgentsStopped",
       float = "ClaudeCodeAgentsFloat", -- defaults to a link to FloatBorder
       -- Terminal pane background: follows SnacksNormal when snacks is loaded,
       -- else NormalFloat. The sidebars keep the editor's own Normal.
@@ -640,8 +643,21 @@ function M.validate(config)
 
     if ag.highlights ~= nil then
       assert(type(ag.highlights) == "table", "agents.highlights must be a table")
-      local highlight_fields =
-        { "title", "time", "added", "removed", "selected", "path", "float", "normal", "normal_nc", "header", "key" }
+      local highlight_fields = {
+        "title",
+        "time",
+        "added",
+        "removed",
+        "selected",
+        "path",
+        "kind",
+        "stopped",
+        "float",
+        "normal",
+        "normal_nc",
+        "header",
+        "key",
+      }
       for _, field in ipairs(highlight_fields) do
         checker(ag.highlights, "agents.highlights")(field, function(v)
           return type(v) == "string"

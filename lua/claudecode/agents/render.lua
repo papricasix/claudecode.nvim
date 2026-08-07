@@ -59,6 +59,7 @@ local DEFAULT_HIGHLIGHTS = {
   selected = "ClaudeCodeAgentsSelected",
   path = "ClaudeCodeAgentsPath",
   kind = "ClaudeCodeAgentsKind",
+  stopped = "ClaudeCodeAgentsStopped",
   float = "ClaudeCodeAgentsFloat",
   normal = "ClaudeCodeAgentsNormal",
   normal_nc = "ClaudeCodeAgentsNormalNC",
@@ -78,6 +79,10 @@ local HIGHLIGHT_LINKS = {
   -- `Normal` — the brightest thing in the pane, and the one span the fade could
   -- not reach, so a settled row still had a white label on it.
   ClaudeCodeAgentsKind = "Comment",
+  -- The bullet of a session that is not running. `status` has no group for it —
+  -- a tabline draws nothing at all for a tab with no Claude — but here those
+  -- sessions are rows on screen, and they are the ones that should read quietest.
+  ClaudeCodeAgentsStopped = "Comment",
   ClaudeCodeAgentsFloat = "FloatBorder",
   ClaudeCodeAgentsHelpHeader = "Title",
   ClaudeCodeAgentsKey = "Special",

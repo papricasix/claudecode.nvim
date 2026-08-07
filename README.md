@@ -423,6 +423,9 @@ opts = {
     --     time  = "ClaudeCodeAgentsTime",        -- Comment
     --     kind  = "ClaudeCodeAgentsKind",        -- Comment (Activity's read/edit column)
     --     path  = "ClaudeCodeAgentsPath",        -- Directory
+    --     stopped = "ClaudeCodeAgentsStopped",   -- Comment (the bullet of a session
+    --                                            -- that is not running; a running
+    --                                            -- one keeps the pane's own colour)
     --     added = "ClaudeCodeAgentsAdded",       -- DiffAdd
     --     removed = "ClaudeCodeAgentsRemoved",   -- DiffDelete
     -- Only the *hue* is taken from these two groups: the +N/-N number and the

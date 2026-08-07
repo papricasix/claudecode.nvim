@@ -809,6 +809,18 @@ function M.rows()
         icon = nil
       end
 
+      -- Two different things wear the same hollow bullet here, and `status`'s dim
+      -- was on the wrong one. Dimming `idle` is right in a tabline, where a tab
+      -- with no Claude draws nothing at all; in this list the stopped
+      -- conversations are rows on screen too, and they came out at full strength
+      -- while a live agent waiting for work was the faint one. So the dim marks
+      -- "not running" and a running agent keeps the pane's own colour.
+      if not live and (session_state == "none" or session_state == "idle") then
+        group = require("claudecode.agents.render").highlight("stopped")
+      elseif live and session_state == "idle" then
+        group = nil
+      end
+
       local added = row.folded and row.added or nil
       local removed = row.folded and row.removed or nil
       local added_age, removed_age = stamp_counts("session\0" .. row.session_id, added, removed)
