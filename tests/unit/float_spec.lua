@@ -153,6 +153,74 @@ describe("float", function()
     end)
   end)
 
+  describe("terminal mode", function()
+    local saved_mode
+
+    ---A terminal window the user is typing in, made current.
+    ---@return integer win
+    ---@return integer buf
+    local function terminal_window()
+      local buf = vim.api.nvim_create_buf(false, true)
+      vim.bo[buf].buftype = "terminal"
+      local win = vim.api.nvim_open_win(buf, true, { relative = "editor", width = 10, height = 5, row = 0, col = 0 })
+      return win, buf
+    end
+
+    before_each(function()
+      saved_mode = vim.fn.mode
+      vim._last_command = nil
+    end)
+
+    after_each(function()
+      vim.fn.mode = saved_mode
+    end)
+
+    it("puts the terminal back in insert mode when the float closes", function()
+      -- The float opens over a terminal the user is typing into, so answering a
+      -- diff and dismissing it must not cost them an `i` to carry on.
+      float.setup(base_config())
+      local term_win = terminal_window()
+      vim.fn.mode = function()
+        return "t"
+      end
+
+      local win = float.create({ title = "a.lua" })
+      -- Closing a float hands focus back to the window under it.
+      vim.api.nvim_set_current_win(term_win)
+      float.close(win)
+
+      expect(vim._last_command).to_be("startinsert")
+    end)
+
+    it("leaves normal mode alone", function()
+      float.setup(base_config())
+      local term_win = terminal_window()
+
+      local win = float.create({ title = "a.lua" })
+      vim.api.nvim_set_current_win(term_win)
+      float.close(win)
+
+      expect(vim._last_command).to_be_nil()
+    end)
+
+    it("does nothing when focus did not go back to that terminal", function()
+      -- Floats stack: closing the top one often lands on another float, which
+      -- will restore the mode itself when *it* closes.
+      float.setup(base_config())
+      terminal_window()
+      vim.fn.mode = function()
+        return "t"
+      end
+
+      local first = float.create({ title = "a.lua" })
+      local second = float.create({ title = "b.lua" })
+      vim.api.nvim_set_current_win(second)
+      float.close(first)
+
+      expect(vim._last_command).to_be_nil()
+    end)
+  end)
+
   describe("ownership", function()
     it("knows whether it made the buffer it is showing", function()
       float.setup(base_config())

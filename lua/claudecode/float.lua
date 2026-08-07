@@ -136,6 +136,46 @@ local function reuse_window(win, entry, buf, title, owned_buf)
   return win, buf
 end
 
+---Put the terminal a float interrupted back into insert mode when it closes.
+---
+---Answering a diff and dismissing it hands focus back to the Claude terminal the
+---float opened over — in normal mode, so carrying on the conversation took a `i`
+---the user never asked to press. Armed on `WinClosed` rather than in `M.close`,
+---since a float also goes away by `:w`-acceptance, `:q` and the tab closing.
+---@param win integer The float.
+---@param term_win integer|nil The window that was in terminal-mode when it opened.
+local function restore_terminal_mode(win, term_win)
+  if not term_win then
+    return
+  end
+  local ok_group, group = pcall(vim.api.nvim_create_augroup, "ClaudeCodeFloatMode" .. win, { clear = true })
+  if not ok_group then
+    return
+  end
+  pcall(vim.api.nvim_create_autocmd, "WinClosed", {
+    group = group,
+    pattern = tostring(win),
+    once = true,
+    callback = function()
+      pcall(vim.api.nvim_del_augroup_by_id, group)
+      -- Focus has not moved yet inside `WinClosed`, and with floats stacked it
+      -- may well land on another one; both questions are only answerable after.
+      vim.schedule(function()
+        if not vim.api.nvim_win_is_valid(term_win) or vim.api.nvim_get_current_win() ~= term_win then
+          return
+        end
+        local ok_buf, buf = pcall(vim.api.nvim_win_get_buf, term_win)
+        if ok_buf and vim.bo[buf].buftype == "terminal" then
+          pcall(function()
+            vim.cmd("startinsert")
+          end)
+        end
+      end)
+    end,
+    desc = "Return to terminal insert mode when the Claude float closes",
+  })
+end
+
 ---Open a float, ready for a buffer to be placed in it.
 ---
 ---`opts.reuse` swaps the content of a float that is already open instead of
@@ -152,6 +192,9 @@ end
 ---@return integer|nil buf
 function M.create(opts)
   opts = opts or {}
+  -- Read before the float opens: entering it leaves terminal-mode, so by the
+  -- time the window exists there is nothing left to notice.
+  local term_win = vim.fn.mode() == "t" and vim.api.nvim_get_current_win() or nil
   local buf = opts.buf
   -- Whether the buffer is ours to put keymaps on; see `bind_close`.
   local owned_buf = false
@@ -212,6 +255,7 @@ function M.create(opts)
     -- float is a question waiting for an answer, and closing it is not answering.
     purpose = opts.purpose or "view",
   }
+  restore_terminal_mode(win, term_win)
   return win, buf
 end
 
