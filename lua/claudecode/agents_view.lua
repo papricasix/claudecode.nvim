@@ -70,6 +70,10 @@ local state = {
   --- The scratch buffer the centre pane holds when it is showing something other
   --- than an agent: the "press i to start" screen, or a dead agent's notice.
   notice_buf = nil, ---@type integer|nil
+  --- Which screen that buffer is currently showing: "loading" | "offer" | "empty".
+  --- The buffer is reused, so the keys that belong to one screen have to be taken
+  --- off again when it becomes another (see `apply_notice_keys`).
+  notice_kind = nil, ---@type string|nil
   --- The conversation the centre is *offering* to start. Set by cycling onto a
   --- stopped session, cleared the moment a terminal takes the centre back.
   pending_start = nil, ---@type string|nil
@@ -139,6 +143,10 @@ local reveal_session
 --- Same reason: `setup` registers a change listener that repaints the offer.
 ---@type fun()
 local refresh_start_prompt
+--- Same reason: that listener also has to notice a project with no conversations
+--- in it, and this body belongs with the other centre-pane notices.
+---@type fun(): boolean
+local sync_empty_notice
 
 --------------------------------------------------------------------------------
 -- Setup
@@ -155,6 +163,8 @@ function M.setup(full_config)
     -- After the paint, so the sessions pane exists for the cursor to be put on
     -- the offered row; only repaint again when something actually changed.
     if offer_initial_session() then
+      M.redraw()
+    elseif sync_empty_notice() then
       M.redraw()
     else
       refresh_start_prompt()
@@ -776,19 +786,79 @@ local function notice_buf()
   return buf
 end
 
+---Keys that belong to one notice screen only.
+---
+---`new` is a sessions-pane key everywhere else. The empty screen is the one place
+---where the centre has nothing to resume, so it carries the key it advertises —
+---and gives it back when the screen becomes an offer to resume a conversation,
+---since the buffer is reused and a stale mapping there would start a *second*
+---conversation from a screen about a particular one.
+---The key bound to an action, or nothing when the user turned it off.
+---
+---An unset field is the default rather than "off": `keymaps()` is the applied
+---config, which always carries every key, so a missing one means the config was
+---never applied — as in a test that hands the view a bare `agents` table.
+---@param field string
+---@param default string
+---@return string|nil
+local function keymap_for(field, default)
+  local lhs = keymaps()[field]
+  if lhs == nil then
+    return default
+  end
+  if type(lhs) ~= "string" or lhs == "" then
+    return nil
+  end
+  return lhs
+end
+
+---@param buf integer
+---@param kind string
+local function apply_notice_keys(buf, kind)
+  local lhs = keymap_for("new", "a")
+  if not lhs then
+    return
+  end
+  if kind == "empty" then
+    map(buf, lhs, function()
+      M.new_agent()
+    end, "Claude agents: start a new agent")
+  else
+    -- Errors when there is nothing to delete, which is the usual case: every
+    -- other screen reaches here having never bound it.
+    pcall(vim.keymap.del, "n", lhs, { buffer = buf })
+  end
+end
+
 ---Put lines in the centre pane's notice buffer and show it.
 ---@param lines string[]
 ---@param marks { row: integer, col: integer, end_col: integer, hl: string }[]|nil
+---@param kind string Which screen this is: "loading" | "offer" | "empty".
 ---@return boolean
-local function show_notice(lines, marks)
+local function show_notice(lines, marks, kind)
   local center = ensure_center()
   local buf = center and notice_buf()
   if not center or not buf then
     return false
   end
+  apply_notice_keys(buf, kind)
   render.paint(buf, lines, marks)
   pcall(vim.api.nvim_win_set_buf, center, buf)
+  state.notice_kind = kind
   return true
+end
+
+---Append `key  what it does` lines, highlighting the keys.
+---@param lines string[]
+---@param marks table[]
+---@param hints { [1]: string, [2]: string }[]
+local function append_hints(lines, marks, hints)
+  lines[#lines + 1] = ""
+  for _, hint in ipairs(hints) do
+    local key = "  " .. hint[1]
+    lines[#lines + 1] = key .. "  " .. hint[2]
+    marks[#marks + 1] = { row = #lines - 1, col = 2, end_col = #key, hl = "ClaudeCodeAgentsKey" }
+  end
 end
 
 ---Offer to start a conversation, without starting it.
@@ -824,14 +894,9 @@ local function show_start_prompt(session_id)
     tostring(keymaps().next_session or "<C-n>") .. "/" .. tostring(keymaps().prev_session or "<C-p>"),
     "another session",
   }
-  lines[#lines + 1] = ""
-  for _, hint in ipairs(hints) do
-    local key = "  " .. hint[1]
-    lines[#lines + 1] = key .. "  " .. hint[2]
-    marks[#marks + 1] = { row = #lines - 1, col = 2, end_col = #key, hl = "ClaudeCodeAgentsKey" }
-  end
+  append_hints(lines, marks, hints)
 
-  if show_notice(lines, marks) then
+  if show_notice(lines, marks, "offer") then
     state.pending_start = session_id
   end
 end
@@ -906,7 +971,70 @@ local function show_opening_notice()
   show_notice({
     "",
     "  Reading this project's sessions…",
-  }, {})
+  }, {}, "loading")
+end
+
+---What the centre says in a project Claude has never run in.
+---
+---Enumeration is synchronous (`transcript.list` is stat-only), so "this project
+---has no conversations" is known the moment the view opens — but the code that
+---offers a session bails on an empty list and waits for one to arrive, which in
+---such a project never happens. The opening notice was then simply never
+---replaced, and the pane read as loading for ever. There is nothing to resume
+---here, so the screen offers the one thing that does apply, and carries the key
+---for it: `new` is otherwise a sessions-pane key.
+---@return boolean
+local function show_empty_notice()
+  local lines = {
+    "",
+    "  No conversations in this project yet",
+  }
+  local marks = {
+    { row = 1, col = 0, end_col = -1, hl = (opts().highlights and opts().highlights.title) or "ClaudeCodeAgentsTitle" },
+  }
+  local hints = {}
+  local new_key, help_key = keymap_for("new", "a"), keymap_for("help", "?")
+  if new_key then
+    hints[#hints + 1] = { new_key, "start a new agent" }
+  end
+  if help_key then
+    hints[#hints + 1] = { help_key, "keys" }
+  end
+  append_hints(lines, marks, hints)
+  return show_notice(lines, marks, "empty")
+end
+
+---Show that screen whenever the project is empty and nothing else owns the centre.
+---
+---Also covers a project that *becomes* empty: deleting the last conversation with
+---`dd` would otherwise leave the centre offering to resume one that no longer
+---exists. The offer is dropped and the view goes back to awaiting a first
+---session, so one that turns up later is offered as it would have been on open.
+---@return boolean acted Whether the centre changed.
+function sync_empty_notice()
+  if not M.is_open() then
+    return false
+  end
+  if #model.rows() > 0 then
+    return false
+  end
+  -- An agent started here owns the centre until its first message writes the
+  -- transcript that puts it in the list, so an empty list is not an empty pane.
+  if center_has_terminal() then
+    return false
+  end
+  if state.notice_kind == "empty" and pane_win("center") then
+    local ok, buf = pcall(vim.api.nvim_win_get_buf, pane_win("center"))
+    if ok and buf == state.notice_buf then
+      return false
+    end
+  end
+  clear_start_prompt()
+  if not show_empty_notice() then
+    return false
+  end
+  state.await_initial = true
+  return true
 end
 
 --------------------------------------------------------------------------------
@@ -998,8 +1126,10 @@ function M.open()
   M.sync_timers()
   M.redraw()
   -- A warm cache can have the list ready in frame one; otherwise the model's
-  -- change callback picks this up when the transcripts have been folded.
-  if offer_initial_session() then
+  -- change callback picks this up when the transcripts have been folded. A
+  -- project with no conversations at all is answered here and now: nothing will
+  -- ever arrive for the offer to act on.
+  if offer_initial_session() or sync_empty_notice() then
     M.redraw()
   end
 
@@ -2361,6 +2491,13 @@ function M.focus_terminal()
     -- into insert mode in an empty pane.
     offer_initial_session()
     pending = state.pending_start
+    if not pending and #model.rows() == 0 then
+      -- Nothing to resume and nothing to read: Claude has never run in this
+      -- project, so "put me in a session" can only mean starting one. `new_agent`
+      -- focuses the centre and enters insert mode itself.
+      M.new_agent()
+      return
+    end
   end
   if pending then
     M.select(pending)
@@ -2516,6 +2653,7 @@ function M.forget()
   -- The notice buffer goes with the tab that showed it; the next `open` makes a
   -- fresh one, with its keys bound from whatever config is in force then.
   state.notice_buf = nil
+  state.notice_kind = nil
   state.pending_start = nil
   state.float_nav = {}
   state.await_initial = false

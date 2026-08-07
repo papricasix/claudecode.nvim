@@ -592,12 +592,59 @@ describe("agents_view", function()
       expect(center_lines():find("First", 1, true) ~= nil).to_be_true()
     end)
 
-    it("says nothing to start when the project has no sessions", function()
+    it("offers to start the first one when the project has no sessions", function()
+      -- The offer bails on an empty list and waits for one to arrive, which in a
+      -- project Claude has never run in never happens: the centre kept the "Reading
+      -- this project's sessions…" notice for ever.
       rows = {}
       open_view()
       expect(agents_view._state().pending_start).to_be(nil)
-      agents_view.focus_terminal()
+      expect(agents_view._state().notice_kind).to_be("empty")
+      local text = center_lines()
+      expect(text:find("No conversations", 1, true) ~= nil).to_be_true()
+      expect(text:find("start a new agent", 1, true) ~= nil).to_be_true()
       expect(#launched).to_be(0)
+    end)
+
+    it("binds the new-agent key on that screen, and nowhere else", function()
+      -- `new` is a sessions-pane key otherwise, and the notice buffer is reused:
+      -- left bound, it would start a *second* conversation from a screen offering
+      -- to resume a particular one.
+      local function has_new_key()
+        for _, keymap in ipairs(vim.api.nvim_buf_get_keymap(agents_view._state().notice_buf, "n")) do
+          if keymap.lhs == "a" then
+            return true
+          end
+        end
+        return false
+      end
+
+      rows = {}
+      open_view()
+      expect(has_new_key()).to_be_true()
+
+      rows = { { session_id = "aaa", title = "First" } }
+      notify_change()
+      expect(agents_view._state().notice_kind).to_be("offer")
+      expect(has_new_key()).to_be_false()
+    end)
+
+    it("starts a new agent when the terminal is focused in an empty project", function()
+      -- Nothing to resume and nothing to read, so "put me in a session" can only
+      -- mean starting one.
+      rows = {}
+      open_view()
+      agents_view.focus_terminal()
+      expect(#launched).to_be(1)
+    end)
+
+    it("goes back to that screen when the last conversation is deleted", function()
+      open_view()
+      expect(agents_view._state().pending_start).to_be("aaa")
+      rows = {}
+      notify_change()
+      expect(agents_view._state().pending_start).to_be(nil)
+      expect(center_lines():find("No conversations", 1, true) ~= nil).to_be_true()
     end)
 
     it("puts the cursor on a new agent's row the moment it appears", function()
