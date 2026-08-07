@@ -575,10 +575,25 @@ function M.validate(config)
       local function is_unit(v)
         return type(v) == "number" and v >= 0 and v <= 1
       end
-      check_fade("boost", is_unit, "must be a number from 0 to 1")
-      check_fade("dim", is_unit, "must be a number from 0 to 1")
-      check_fade("flash_level", is_unit, "must be a number from 0 to 1")
-      check_fade("flash_text_lift", is_unit, "must be a number from 0 to 1")
+      for _, field in ipairs({
+        "boost",
+        "dim",
+        -- The count block's six: each a fraction of the theme's own diff colour,
+        -- or a lightness offset from the pane. See `agents/fade.lua`.
+        "count_sat",
+        "count_dim",
+        "count_bg_sat",
+        "count_bg_lift",
+        "flash_level",
+        "flash_lift",
+      }) do
+        check_fade(field, is_unit, "must be a number from 0 to 1")
+      end
+      check_fade("count_contrast", function(v)
+        -- 1 is "no requirement" (a contrast ratio bottoms out there); 21 is black
+        -- on white, the most any pair can reach.
+        return type(v) == "number" and v >= 1 and v <= 21
+      end, "must be a contrast ratio from 1 to 21")
     end
 
     if ag.sessions ~= nil then

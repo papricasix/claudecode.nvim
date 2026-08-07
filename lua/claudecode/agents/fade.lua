@@ -1,15 +1,19 @@
 ---@brief [[
---- Time-varying highlight groups for the agents panes.
+--- The agents panes' derived colours.
 ---
 --- Two effects in the view want the same thing: a span that is *briefly*
---- different and then settles back. A new Activity row arrives at full
---- brightness, holds, then fades to something quieter; a changed `+N`/`-N`
---- lights up and drops back. Both are "pick a group by how old this thing is",
---- so both live here.
+--- different and then settles back. A new Activity row arrives lifted, holds,
+--- then fades to something quieter; a changed `+N`/`-N` lights up and drops
+--- back. Both are "pick a group by how old this thing is", so both live here.
+---
+--- The count blocks' *resting* colours are here too, which is not a time effect
+--- at all — they are the other end of the same ramp, derived from the same hue
+--- by the same arithmetic, and splitting them across two modules would mean two
+--- copies of it. `count_group` answers for both ends and everything between.
 ---
 --- The ramp is a set of pre-computed groups, not a per-frame `nvim_set_hl`:
 --- redefining a group is global and would repaint every other use of it, and the
---- panes redraw from three separate call sites. So `dim_group`/`flash_group`
+--- panes redraw from three separate call sites. So `dim_group`/`count_group`
 --- return the name of a group for the step the caller's age lands on, and the
 --- groups themselves are defined once and cached until the colorscheme changes.
 ---
@@ -34,6 +38,10 @@ local config = nil
 --- base". Cleared on `ColorScheme`, since every colour in it was derived from
 --- one.
 local groups = {}
+
+--- [base\0kind] = a count block's four colours, or `false` for "no hue anywhere,
+--- leave the group alone". Cleared with `groups`, and for the same reason.
+local palettes = {}
 
 --- Set once; the watcher outlives individual `setup` calls.
 local watcher = nil
@@ -71,21 +79,37 @@ local DEFAULTS = {
   -- all of its time fading — no flat hold, unlike an Activity row, which holds
   -- before it starts to go.
   flash_ms = 3000,
-  -- How far a changed count is pushed towards its own hue at full strength:
-  -- saturation towards 1 and lightness towards the point of maximum chroma. Not
-  -- a brightness — the lit block is *more green* / *more red*, not whiter. Well
-  -- short of the full push, which reads as garish rather than as emphatic: a
-  -- block is a small span of colour and it only has to be seen changing.
-  flash_level = 0.55,
-  -- How much lighter the lit text is than the block it sits on, in HSL
-  -- lightness. Same hue, same saturation, some way up — the pair reads as one
-  -- colour rather than as text pasted onto a block, while the number stays as
-  -- readable lit as it is at rest. Note that the two settings trade against
-  -- each other: the more saturated the block, the less room the text has left
-  -- to climb, so a *lower* `flash_level` buys a more legible number, not a
-  -- quieter one (measured, on a `#005523` DiffAdd: 0.8/0.1 gives 1.36:1,
-  -- 0.55/0.25 gives 2.09:1).
-  flash_text_lift = 0.25,
+
+  -- The count blocks. All six are fractions of *one* colour — the theme's own
+  -- added/removed hue at the saturation it ships — so a `+N` and the block
+  -- behind it are always the same colour at different strengths. See
+  -- `M.count_group`.
+  --
+  -- The resting number: a quarter of that saturation, dimmed three fifths of
+  -- the way towards its own block. Both moves are needed. At equal lightness a
+  -- desaturated green and a full one read as the same green, so saturation
+  -- alone left rest and peak indistinguishable — and the dim alone would only
+  -- darken the same colour. What a count says at rest is "this file, this
+  -- much"; the peak is for the moment it changes.
+  count_sat = 0.25,
+  count_dim = 0.60,
+  -- The block: fainter still, and a notch away from the pane in lightness — up
+  -- on a dark background, down on a light one — so it reads as a block rather
+  -- than as the pane.
+  count_bg_sat = 0.22,
+  count_bg_lift = 0.10,
+  -- The block a count wears for `flash_ms` after it moves. The number itself
+  -- goes to the theme's colour undiluted, so this is the whole of the extra
+  -- push: well short of full saturation, since a block is a small span of
+  -- colour and only has to be seen changing.
+  flash_level = 0.50,
+  flash_lift = 0.05,
+  -- What every one of those has to reach against whatever it sits on. WCAG's
+  -- threshold for body text; a `+12` is small and often the only thing being
+  -- read on its row. This is also the limit on how quiet `count_dim` can make a
+  -- resting number: past a point the legibility walk gives back exactly what
+  -- the dim took, and only saturation still separates rest from peak.
+  count_contrast = 4.5,
 }
 
 --- The merged config, built once per `setup`. `render` asks for it several times
@@ -132,6 +156,7 @@ function M.setup(full_config)
   config = (type(full_config) == "table" and type(full_config.agents) == "table") and full_config.agents or nil
   merged = nil
   groups = {}
+  palettes = {}
 
   if not watcher then
     local ok, id = pcall(vim.api.nvim_create_augroup, "ClaudeCodeAgentsFade", { clear = true })
@@ -143,6 +168,7 @@ function M.setup(full_config)
           -- Every colour here was read out of the old scheme. Keeping them would
           -- fade a row towards a background that is no longer there.
           groups = {}
+          palettes = {}
         end,
         desc = "Rebuild the Claude agents fade colours for the new colorscheme",
       })
@@ -309,33 +335,6 @@ local function has_hue(n)
   return (math.max(r, g, b) - math.min(r, g, b)) / 255 >= HUE_CHROMA
 end
 
---- The lightness at which a hue carries the most colour. Both a dark block and a
---- pale one are pushed *towards* it, in opposite directions: that is what
---- "way more green" means for `#005523` and for `#ffc0b9` alike.
-local VIVID_L = 0.5
-
----Push a colour towards its own hue at full strength: saturation up towards 1,
----lightness towards the point of maximum chroma.
----
----This is deliberately not `brighten`. Lifting a block's brightness answers
----"something moved" with a paler version of the same colour, and past a point
----with white — the loudest a `+N` could get was the least green it had been.
----Saturating instead makes a changed count *more* of what it already is, which
----is the thing the colour was chosen to say.
----
----A grey has no hue to push, and pushing one anyway would invent red out of
----`h = 0`, so a near-grey falls back to `brighten` — the only direction left.
----@param n integer 24-bit RGB.
----@param t number 0 = unchanged, 1 = as saturated as this hue goes.
----@return integer
-local function vivify(n, t)
-  local h, s, l = to_hsl(n)
-  if s <= GREY_S then
-    return brighten(n, t)
-  end
-  return from_hsl(h, s + (1 - s) * t, l + (VIVID_L - l) * t)
-end
-
 --- Where a lifted colour's lightness is allowed to sit. Short of the pale end,
 --- because past it a colour stops being itself: that is the difference between
 --- "more blue" and "whiter".
@@ -438,22 +437,6 @@ local function intensify(n, t, bg)
     out = from_hsl(h, s, l)
   end
   return out
-end
-
----The same colour, one notch lighter — the lit text over the lit block.
----
----Up, unless the colour is already too light to go up by the full step, in
----which case down: a lift that clips is no lift at all, and the number has to
----separate from its block in *some* direction.
----@param n integer 24-bit RGB.
----@param delta number HSL lightness, 0-1.
----@return integer
-local function lift(n, delta)
-  local h, s, l = to_hsl(n)
-  if l + delta > 1 then
-    return from_hsl(h, s, l - delta)
-  end
-  return from_hsl(h, s, l + delta)
 end
 
 ---A highlight group's resolved gui colours.
@@ -607,92 +590,12 @@ function M.dim_group(base, age_ms)
   return define(key, { fg = colour, bold = bold }) or base
 end
 
----A count's group: lit right after it changed, back to the base once it rests.
----
----**Both halves of a block light up, and both walk back.** The block goes to a
----far more *saturated* version of its own colour — a `+N` turns emphatically
----green, a `-N` emphatically red — and the text follows it one notch of
----lightness up, same hue and same saturation. So the pair reads as one colour
----turned up rather than as a highlight laid over a number, and then the text
----settles onto the group's own foreground and the block onto its own background.
----
----Intensity, not brightness, is what carries the change. The earlier version
----lifted both halves towards white, unequally, and the loudest a count could get
----was the *least* coloured it had been — with a block already near peak, the
----only place left to go was pale. Saturating goes the other way: `#005523`
----becomes more green than the scheme itself ever paints, which is unmistakable
----without leaving the colour's own meaning behind.
----
----The two halves still differ, because they have to: giving them the same colour
----once painted `#04de5d` on `#005523`, green on green, so a count that had just
----changed was **less** legible than one at rest. `flash_text_lift` is that gap,
----and it is deliberately small — big enough to read, small enough that the block
----and its number stay one thing.
----
----A group with no background is not a block but text, so there the text is what
----saturates, and no background is invented for it.
----@param base string
----@param age_ms number|nil Milliseconds since the count changed; nil = never.
----@return string group
-function M.flash_group(base, age_ms)
-  if not M.enabled() or type(age_ms) ~= "number" then
-    return base
-  end
-  local o = M.opts()
-  -- `flash_ms` is the whole effect, ramp included, so a count is back to normal
-  -- one second after it moved rather than a second *plus* the ramp. The resting
-  -- step begins one `step_ms` before the ramp's nominal end — step `steps` is
-  -- the base group, not a position in the ramp — so the hold is shortened by
-  -- `steps - 1`, not `steps`.
-  local ramp = math.max(0, o.steps - 1) * o.step_ms
-  local hold = math.max(0, o.flash_ms - ramp)
-  local step = M.step_at(age_ms, hold, o.steps, o.step_ms)
-  if step >= o.steps then
-    return base
-  end
-  if not truecolor() then
-    return base
-  end
-
-  local key = string.format("Flash_%s_%d", base, step)
-  local cached = groups[key]
-  if cached ~= nil then
-    return cached or base
-  end
-
-  local base_fg, base_bg = attrs(base)
-
-  if base_bg then
-    local at = step > 0 and (step / o.steps) or 0
-    local bg_lit = vivify(base_bg, o.flash_level)
-    local fg_lit = lift(bg_lit, o.flash_text_lift)
-    local bg = at > 0 and blend(bg_lit, base_bg, at) or bg_lit
-    -- Where the text lands: the group's own foreground, or the editor's when it
-    -- has none — which is what a background-only group shows at rest anyway.
-    local rest = base_fg or select(1, attrs("Normal"))
-    if not rest then
-      return define(key, { bg = bg }) or base
-    end
-    local fg = at > 0 and blend(fg_lit, rest, at) or fg_lit
-    return define(key, { fg = fg, bg = bg }) or base
-  end
-
-  if not base_fg then
-    return base
-  end
-  local lit = vivify(base_fg, o.flash_level)
-  local fg = step > 0 and blend(lit, base_fg, step / o.steps) or lit
-  -- No background is added: the scheme never asked for a block here, and one
-  -- appearing and disappearing per change would be worse than the flash is good.
-  return define(key, { fg = fg }) or base
-end
-
 --------------------------------------------------------------------------------
--- The resting colour of a count block
+-- Count blocks
 --------------------------------------------------------------------------------
 
---- Where a count's number takes its hue from when its own group does not give it
---- one. `Added`/`Removed` first: Neovim ships them, so every colorscheme has an
+--- Where a count takes its hue from when its own group does not give it one.
+--- `Added`/`Removed` first: Neovim ships them, so every colorscheme has an
 --- answer, and a theme that styles diffs at all styles these. The `diff*` syntax
 --- groups and the gitsigns ones are the same idea spelled by an older convention.
 local TEXT_SOURCES = {
@@ -700,11 +603,7 @@ local TEXT_SOURCES = {
   removed = { "Removed", "diffRemoved", "GitSignsDelete" },
 }
 
---- What a number on a block has to reach to count as legible. WCAG's threshold
---- for body text; a `+12` is small and often the only thing being read on its row.
-local COUNT_CONTRAST = 4.5
-
---- How far the walk towards that may push lightness. Short of both ends, because
+--- How far the legibility walk may push lightness. Short of both ends, because
 --- pure white and pure black are the two colours with no hue left in them — the
 --- point is a *green* number, and an unreachable target must not cost the green.
 local TEXT_L_MAX, TEXT_L_MIN = 0.92, 0.10
@@ -724,8 +623,8 @@ end
 
 ---Move a colour away from the one behind it, at its own hue, until it is legible.
 ---
----Lightness only: hue and saturation are the theme's answer to "what colour is
----an addition", and this is only answering "can it be read here".
+---Lightness only: hue and saturation are the theme's answer to "what colour is an
+---addition", and this is only answering "can it be read here".
 ---@param fg integer 24-bit RGB.
 ---@param bg integer 24-bit RGB.
 ---@param target number Contrast ratio to reach.
@@ -749,76 +648,152 @@ local function readable_on(fg, bg, target)
   return out
 end
 
----A count block's resting colours: the number drawn *in the block's own colour*,
----the way a diff draws one.
+---The four colours a count block is drawn from, derived once per (group, kind).
 ---
----The blocks come from `DiffAdd`/`DiffDelete`, and most colorschemes give those a
----background and no foreground — so the number fell through to `Normal` and a
----`+12` was white on green, which says "highlighted text" rather than "twelve
----lines were added". A diff never looks like that: added text is green *on* its
----green, and that is the shape this restores, without hard-coding a green,
----because a hard-coded one is wrong in every theme that did not pick it.
+---Everything is one hue at four strengths, so see `M.count_group` for why. The
+---resting number is dimmed *towards its own block* as well as desaturated: at
+---equal lightness a 0.6-saturation green and a full one are the same green to the
+---eye, and the peak has to be visibly a step up from rest or the flash says
+---nothing.
+---@param base string
+---@param kind "added"|"removed"
+---@return table|nil `{ rest_fg, rest_bg, peak_fg, peak_bg }`
+local function count_palette(base, kind)
+  local key = base .. "\0" .. kind
+  local cached = palettes[key]
+  if cached ~= nil then
+    return cached or nil
+  end
+
+  local pane = pane_bg()
+  local fg, block = attrs(base)
+  if not pane then
+    palettes[key] = false
+    return nil
+  end
+
+  local source = (fg and has_hue(fg)) and fg or theme_diff_colour(kind)
+  if not source and block and has_hue(block) then
+    source = block
+  end
+  if not source then
+    palettes[key] = false
+    return nil
+  end
+
+  local o = M.opts()
+  -- The peak: the theme's colour, made legible on the pane it is read on. Every
+  -- other colour here is a held-back version of this one.
+  local peak = readable_on(source, pane, o.count_contrast)
+  local hue, peak_s, peak_l = to_hsl(peak)
+  local _, _, pane_l = to_hsl(pane)
+  local dark = pane_l < 0.5
+  local bg_l = dark and (pane_l + o.count_bg_lift) or (pane_l - o.count_bg_lift)
+
+  local rest_bg = from_hsl(hue, peak_s * o.count_bg_sat, bg_l)
+  local rest_fg = from_hsl(hue, peak_s * o.count_sat, peak_l + (bg_l - peak_l) * o.count_dim)
+  local peak_bg = from_hsl(hue, peak_s * o.flash_level, dark and (bg_l + o.flash_lift) or (bg_l - o.flash_lift))
+
+  local palette = {
+    rest_bg = rest_bg,
+    rest_fg = readable_on(rest_fg, rest_bg, o.count_contrast),
+    peak_bg = peak_bg,
+    peak_fg = readable_on(peak, peak_bg, o.count_contrast),
+  }
+  palettes[key] = palette
+  return palette
+end
+
+---A count block's colours, for how long ago it changed.
 ---
----Three sources, in the order of how much the theme meant them:
+---**One hue, three saturations.** The theme owns exactly one answer to "what
+---colour is an addition", and everything here is that colour held back by
+---different amounts: the number at rest is it at `count_sat`, the block behind it
+---at `count_bg_sat`, and a count that has just moved goes to the colour itself on
+---a block at `flash_level`. So the pair always reads as one colour rather than as
+---a number pasted onto a highlight, and "it changed" is the same colour turned up
+---rather than a different one.
+---
+---The hue is taken in the order of how much the theme meant it:
 ---
 ---*The group's own foreground*, whenever it is an actual colour. A theme that
----paints `DiffAdd` red-on-salmon (kanagawa's `DiffDelete`) has said something
----and is not second-guessed — only made legible, below.
+---paints `DiffDelete` red on salmon (kanagawa) has said something and is not
+---second-guessed — only made legible, below.
 ---
 ---*The theme's diff text colour* — `Added` / `Removed`, which Neovim ships, so
----this is not a guess about what the theme has. Used when the group's own
----foreground is missing or neutral, which is the default case and the one this
----exists for.
+---this is not a guess about what a scheme defines. This is the default path: most
+---schemes give `DiffAdd` a background and no foreground at all, which is why the
+---number used to fall through to `Normal` and a `+12` came out white on green —
+---"highlighted text", not twelve added lines.
 ---
----*The block's own hue*, saturated, when even that is neutral. Literally "more
----green than its background", with nothing invented: if the block has no hue
----either, the base group is left exactly as it is.
+---*The block's own hue*, when even that is neutral. Nothing is invented past
+---that: with no hue anywhere, the base group is left exactly as it is.
 ---
----Whichever it lands on is then walked away from the block until it reaches
----`COUNT_CONTRAST` — a colour picked for a pane's background is not automatically
----legible on a block, and kanagawa's own red-on-salmon measures 1.9:1.
+---**The block follows the number, not the theme's own `DiffAdd` background.**
+---That background is frequently a different hue from the diff text the same
+---scheme ships — tokyonight-moon pairs a green `Added` with a *blue* `#2a4556`
+---block — so deriving both from one hue is what keeps green on green. It also
+---means the flash intensifies the count's colour rather than the block's, which
+---the older version got backwards: on that theme a `+N` flashed blue.
+---
+---**Nothing here is allowed to be illegible.** Every colour is walked in
+---lightness, at its own hue, until it clears `count_contrast` on whatever it sits
+---on. That floor is why `count_dim` cannot make a resting number arbitrarily
+---quiet: past a point the walk gives back exactly what the dim took, and the
+---remaining separation from the peak is saturation. Measured across eight schemes
+---— on tokyonight-moon the resting `+N` lands on `#a9c5ae` at 4.61:1 against a
+---peak of `#b3f6c0`, a grey-green against the scheme's green.
 ---@param base string The group the block is drawn in.
 ---@param kind "added"|"removed"
+---@param age_ms number|nil Milliseconds since the count changed; nil = never.
 ---@return string group
-function M.count_group(base, kind)
+function M.count_group(base, kind, age_ms)
   if not truecolor() then
     return base
   end
-  local key = string.format("Count_%s_%s", base, kind)
+  local palette = count_palette(base, kind)
+  if not palette then
+    return base
+  end
+
+  local o = M.opts()
+  local step = o.steps
+  if M.enabled() and type(age_ms) == "number" then
+    -- `flash_ms` is the whole effect, ramp included, so a count is back to its
+    -- resting colours three seconds after it moved rather than three seconds
+    -- *plus* the ramp. The resting step begins one `step_ms` before the ramp's
+    -- nominal end — step `steps` is the resting group, not a position in the ramp
+    -- — so the hold is shortened by `steps - 1`, not `steps`.
+    local ramp = math.max(0, o.steps - 1) * o.step_ms
+    local hold = math.max(0, o.flash_ms - ramp)
+    step = M.step_at(age_ms, hold, o.steps, o.step_ms)
+  end
+
+  if step >= o.steps then
+    local key = string.format("Count_%s_%s", base, kind)
+    local cached = groups[key]
+    if cached ~= nil then
+      return cached or base
+    end
+    return define(key, { fg = palette.rest_fg, bg = palette.rest_bg }) or base
+  end
+
+  local key = string.format("CountF_%s_%s_%d", base, kind, step)
   local cached = groups[key]
   if cached ~= nil then
     return cached or base
   end
-
-  local fg, bg = attrs(base)
-  if not bg then
-    -- No block, so nothing to sit on: the count is text, and text is already
-    -- drawn in whatever colour the theme gave the group.
-    groups[key] = false
-    return base
-  end
-
-  local text = (fg and has_hue(fg)) and fg or nil
-  if not text then
-    text = theme_diff_colour(kind)
-  end
-  if not text and has_hue(bg) then
-    -- The block's own hue, turned up: the number is more of what the block is.
-    local h, s, l = to_hsl(bg)
-    text = from_hsl(h, math.max(s, 0.55), l)
-  end
-  if not text then
-    groups[key] = false
-    return base
-  end
-
-  return define(key, { fg = readable_on(text, bg, COUNT_CONTRAST), bg = bg }) or base
+  local at = step > 0 and (step / o.steps) or 0
+  local fg = at > 0 and blend(palette.peak_fg, palette.rest_fg, at) or palette.peak_fg
+  local bg = at > 0 and blend(palette.peak_bg, palette.rest_bg, at) or palette.peak_bg
+  return define(key, { fg = fg, bg = bg }) or base
 end
 
 ---Test/reload helper.
 function M.reset()
   merged = nil
   groups = {}
+  palettes = {}
 end
 
 return M

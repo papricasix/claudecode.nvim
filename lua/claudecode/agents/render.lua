@@ -496,10 +496,12 @@ end
 
 ---`+N -M`, right-aligned into a fixed field, with the marks to colour each half.
 ---
----A count that has just moved is drawn lit and ramps back to its resting colour
----(`fade.flash_group`), so a number changing while you are looking somewhere
----else still announces itself. `*_age_ms` is nil for a count that has never
----changed under our eyes, which is every count on the first draw.
+---A count that has just moved is drawn at full strength and ramps back to its
+---resting colour (`fade.count_group`, which derives both from the theme's own
+---diff hue), so a number changing while you are looking somewhere else still
+---announces itself. `ages.*` is nil for a count that has never changed under our
+---eyes, which is every count on the first draw — and that is the resting look,
+---not the absence of one.
 ---@param added integer|nil
 ---@param removed integer|nil
 ---@param ages { added: number?, removed: number? }|nil
@@ -522,16 +524,15 @@ local function counts_text(added, removed, ages)
   end
   local plus_at = text:find("+", 1, true)
   local minus_at = text:find("-", plus_at or 1, true)
-  -- `count_group` is the resting look — the number in the block's own colour, the
-  -- way a diff draws one — and the flash ramps back to *that* rather than to the
-  -- raw group, so a count that has just moved settles onto the colour it had.
+  -- One call for both states: `count_group` derives the block's colours from the
+  -- theme's own added/removed hue and returns the group for how long ago the
+  -- count moved — the peak right after, its resting colours once the ramp is done.
   if plus_at then
-    local group = fade.count_group(hl("added"), "added")
-    spans[#spans + 1] = { offset = plus_at - 1, len = #plus, hl = fade.flash_group(group, ages.added) }
+    spans[#spans + 1] = { offset = plus_at - 1, len = #plus, hl = fade.count_group(hl("added"), "added", ages.added) }
   end
   if minus_at then
-    local group = fade.count_group(hl("removed"), "removed")
-    spans[#spans + 1] = { offset = minus_at - 1, len = #minus, hl = fade.flash_group(group, ages.removed) }
+    spans[#spans + 1] =
+      { offset = minus_at - 1, len = #minus, hl = fade.count_group(hl("removed"), "removed", ages.removed) }
   end
   return text, spans
 end

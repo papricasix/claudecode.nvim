@@ -234,6 +234,13 @@ describe("agents.fade", function()
   end)
 
   describe("count_group", function()
+    ---How much colour a value carries, so "the block is the fainter half" and
+    ---"the peak is louder than rest" are assertable.
+    local function chroma(n)
+      local r, g, b = math.floor(n / 65536) % 256, math.floor(n / 256) % 256, n % 256
+      return math.max(r, g, b) - math.min(r, g, b)
+    end
+
     ---Which channel a colour is mostly made of, so "is green" is assertable.
     local function dominant(n)
       local r, g, b = math.floor(n / 65536) % 256, math.floor(n / 256) % 256, n % 256
@@ -260,18 +267,34 @@ describe("agents.fade", function()
       return (la + 0.05) / (lb + 0.05)
     end
 
-    it("draws the number in the theme's own added colour, not in Normal's white", function()
+    it("draws the number and its block from the theme's own added colour", function()
       -- The shape most colorschemes ship: a block with no foreground, so the
       -- number fell through to `Normal` and a `+12` came out white on green —
       -- "highlighted text", not "twelve lines were added". A diff never looks
       -- like that.
       define({ Added = { fg = 0xb3f6c0 }, AgentsAdd = { bg = GREEN_BLOCK } })
-      local group = fade.count_group("AgentsAdd", "added")
+      local group = fade.count_group("AgentsAdd", "added", nil)
       expect(group ~= "AgentsAdd").to_be_true()
       local spec = hl(group)
-      expect(spec.bg).to_be(GREEN_BLOCK)
+      -- Both halves are one hue at two strengths, so both read green...
       expect(dominant(spec.fg)).to_be("g")
-      expect(contrast(spec.fg, GREEN_BLOCK)).to_be_at_least(4.5)
+      expect(dominant(spec.bg)).to_be("g")
+      -- ...the block being the fainter of them...
+      expect(chroma(spec.bg) < chroma(spec.fg)).to_be_true()
+      -- ...and the number legible on it.
+      expect(contrast(spec.fg, spec.bg)).to_be_at_least(4.5)
+    end)
+
+    it("derives the block from the number rather than from the theme's own", function()
+      -- The theme's `DiffAdd` background is often a different hue from the diff
+      -- text the same theme ships — tokyonight-moon pairs a green `Added` with a
+      -- blue `#2a4556` block — so the block is rebuilt from the number's hue.
+      -- Keeping it was what made a `+N` flash blue on that theme.
+      local BLUE_BLOCK = 0x2a4556
+      define({ Added = { fg = 0xb3f6c0 }, AgentsAdd = { bg = BLUE_BLOCK } })
+      local spec = hl(fade.count_group("AgentsAdd", "added", nil))
+      expect(spec.bg ~= BLUE_BLOCK).to_be_true()
+      expect(dominant(spec.bg)).to_be("g")
     end)
 
     it("replaces a foreground that is really a white or a grey", function()
@@ -279,152 +302,97 @@ describe("agents.fade", function()
       -- 0.42 — saturation runs away at the light end — so the test is the spread
       -- between the channels, which is four percent. No colour was chosen there.
       define({ Added = { fg = 0xb3f6c0 }, AgentsAdd = { fg = 0xeef1f8, bg = GREEN_BLOCK } })
-      local spec = hl(fade.count_group("AgentsAdd", "added"))
+      local spec = hl(fade.count_group("AgentsAdd", "added", nil))
       expect(spec.fg ~= 0xeef1f8).to_be_true()
       expect(dominant(spec.fg)).to_be("g")
     end)
 
-    it("keeps a foreground the theme actually chose, and makes it legible", function()
+    it("keeps a hue the theme actually chose, and makes it legible", function()
       -- kanagawa paints `DiffDelete` red on salmon: it means that, and it is not
       -- second-guessed — but it measures 1.99:1, which no number can be read at.
       local SALMON, RED = 0xd9a594, 0xd7474b
       define({ AgentsDel = { fg = RED, bg = SALMON } })
-      local spec = hl(fade.count_group("AgentsDel", "removed"))
+      local spec = hl(fade.count_group("AgentsDel", "removed", nil))
       expect(dominant(spec.fg)).to_be("r")
-      expect(contrast(spec.fg, SALMON)).to_be_at_least(4.5)
-      -- Darker, because the block is the light half of the pair.
-      expect(spec.fg < RED).to_be_true()
+      expect(dominant(spec.bg)).to_be("r")
+      expect(contrast(spec.fg, spec.bg)).to_be_at_least(4.5)
     end)
 
     it("falls back to the block's own hue when the theme names no colour", function()
-      -- Literally "more green than its background", and nothing invented: this is
-      -- the last resort, after the group's own foreground and `Added`/`Removed`.
+      -- Last resort, after the group's own foreground and `Added`/`Removed`.
       vim._highlights.Added = nil
       define({ AgentsAdd = { bg = GREEN_BLOCK } })
-      local spec = hl(fade.count_group("AgentsAdd", "added"))
+      local spec = hl(fade.count_group("AgentsAdd", "added", nil))
       expect(dominant(spec.fg)).to_be("g")
-      expect(contrast(spec.fg, GREEN_BLOCK)).to_be_at_least(4.5)
+      expect(contrast(spec.fg, spec.bg)).to_be_at_least(4.5)
     end)
 
-    it("leaves a group with no block alone", function()
-      -- No background is invented for it: the count is text there, and text is
-      -- already drawn in whatever colour the theme gave the group.
-      expect(fade.count_group("DiffDelete", "removed")).to_be("DiffDelete")
+    it("builds a block for a group that has none, so + and - match", function()
+      -- Some schemes give `DiffDelete` a foreground and no background at all. The
+      -- block follows the number now, so there is one to build it from, and a
+      -- `-3` is a block like the `+12` beside it rather than bare text.
+      define({ Removed = { fg = 0xffc0b9 }, AgentsBare = { fg = 0xffc0b9 } })
+      local spec = hl(fade.count_group("AgentsBare", "removed", nil))
+      expect(spec.bg).to_be_truthy()
+      expect(dominant(spec.bg)).to_be("r")
     end)
 
-    it("stands down without truecolour", function()
-      vim.o.termguicolors = false
-      expect(fade.count_group("DiffAdd", "added")).to_be("DiffAdd")
-    end)
-  end)
-
-  describe("flash_group", function()
-    it("ignores a count that has never changed", function()
-      expect(fade.flash_group("DiffAdd", nil)).to_be("DiffAdd")
-    end)
-
-    ---Rough brightness, for asserting *which way* a colour moved. Packed RGB
-    ---compares as an integer, which says nothing about how light a colour looks.
-    local function lum(n)
-      return math.floor(n / 65536) % 256 + math.floor(n / 256) % 256 + n % 256
-    end
-
-    ---How much colour a value carries: the spread between its channels. A grey
-    ---is 0 however bright it is, and a colour going *paler* loses chroma even
-    ---as its brightness climbs — which is the difference this effect turns on.
-    local function chroma(n)
-      local r = math.floor(n / 65536) % 256
-      local g = math.floor(n / 256) % 256
-      local b = n % 256
-      return math.max(r, g, b) - math.min(r, g, b)
-    end
-
-    ---Which channel a colour is mostly made of, so "still green" is assertable.
-    local function dominant(n)
-      local r = math.floor(n / 65536) % 256
-      local g = math.floor(n / 256) % 256
-      local b = n % 256
-      if r >= g and r >= b then
-        return "r"
-      end
-      return g >= b and "g" or "b"
-    end
-
-    it("turns a changed count's block more green, not whiter", function()
-      -- The point of the effect: `+N` announces itself by being *more* of the
-      -- colour it already is. A brightened block would carry less colour, not
-      -- more, and a block already near peak could only go pale.
-      local spec = hl(fade.flash_group("DiffAdd", 0))
-      expect(chroma(spec.bg) > chroma(GREEN_BLOCK)).to_be_true()
-      expect(dominant(spec.bg)).to_be("g")
-    end)
-
-    it("lights the text in the block's own hue, one notch up", function()
-      -- Same colour, lighter — the pair reads as one thing. Giving them the
-      -- same colour once painted #04de5d on #005523, green on green, so a count
-      -- that had just changed was less legible than one at rest.
-      local spec = hl(fade.flash_group("DiffAdd", 0))
-      expect(spec.fg ~= spec.bg).to_be_true()
-      expect(lum(spec.fg) > lum(spec.bg)).to_be_true()
-      expect(dominant(spec.fg)).to_be(dominant(spec.bg))
-    end)
-
-    it("walks both halves back to the group's own colours", function()
-      -- A separate base group, because the derived ones are cached per
-      -- (base, step). This is the shape most colorschemes ship: white on green.
-      local WHITE = 0xeef1f8
-      define({ DiffAddText = { fg = WHITE, bg = GREEN_BLOCK } })
-      local lit = hl(fade.flash_group("DiffAddText", 0))
-      local mid = hl(fade.flash_group("DiffAddText", 2000))
-
-      -- The block saturates, then sinks back towards its own colour.
-      expect(chroma(lit.bg) > chroma(GREEN_BLOCK)).to_be_true()
-      expect(chroma(mid.bg) < chroma(lit.bg)).to_be_true()
-      expect(chroma(mid.bg) > chroma(GREEN_BLOCK)).to_be_true()
-
-      -- The text starts as a lighter version of the *block*, not as the group's
-      -- own foreground, and is on its way there by the middle of the ramp.
-      expect(lit.fg ~= WHITE).to_be_true()
-      expect(mid.fg ~= lit.fg).to_be_true()
-      expect(chroma(mid.fg) < chroma(lit.fg)).to_be_true() -- draining towards white
-
-      -- And the end of the ramp is the base group itself, both halves included.
-      expect(fade.flash_group("DiffAddText", 3000)).to_be("DiffAddText")
-    end)
-
-    it("is back to the base group exactly at flash_ms", function()
-      expect(fade.flash_group("DiffAdd", 2999) ~= "DiffAdd").to_be_true()
-      expect(fade.flash_group("DiffAdd", 3000)).to_be("DiffAdd")
-      expect(fade.flash_group("DiffAdd", 20000)).to_be("DiffAdd")
-    end)
-
-    it("saturates a foreground-only count instead of blocking it out", function()
-      -- A scheme whose DiffDelete is a foreground and nothing else: using that
-      -- foreground as a background too paints the number in its own colour and
-      -- it vanishes. It must stay a foreground, and it must actually change —
-      -- a pale pink already at peak brightness cannot be scaled up, but it has
-      -- plenty of room to become red.
-      local lit = fade.flash_group("DiffDelete", 0)
-      expect(lit ~= "DiffDelete").to_be_true()
-      local spec = hl(lit)
-      expect(spec.bg).to_be_nil()
-      expect(chroma(spec.fg) > chroma(PINK_TEXT)).to_be_true()
-      expect(dominant(spec.fg)).to_be("r")
-    end)
-
-    it("brightens a grey count, having no hue to intensify", function()
-      -- Saturating a grey would invent a hue out of nowhere — hue 0 is red, so
-      -- a neutral count would flash pink. Brightness is the only direction left.
-      local GREY = 0x808080
-      define({ AgentsGrey = { fg = GREY } })
-      local spec = hl(fade.flash_group("AgentsGrey", 0))
-      expect(lum(spec.fg) > lum(GREY)).to_be_true()
-      expect(chroma(spec.fg) <= 2).to_be_true()
+    it("leaves a group alone when nothing anywhere has a hue", function()
+      vim._highlights.Removed = nil
+      define({ AgentsGreyBlock = { fg = 0x9a9a9a, bg = 0x303030 } })
+      expect(fade.count_group("AgentsGreyBlock", "removed", nil)).to_be("AgentsGreyBlock")
     end)
 
     it("stands down without truecolour", function()
       vim.o.termguicolors = false
-      expect(fade.flash_group("DiffAdd", 0)).to_be("DiffAdd")
+      expect(fade.count_group("DiffAdd", "added", nil)).to_be("DiffAdd")
+    end)
+
+    describe("the flash", function()
+      before_each(function()
+        define({ Added = { fg = 0xb3f6c0 }, AgentsAdd = { bg = GREEN_BLOCK } })
+      end)
+
+      it("goes to the theme's colour undiluted, on a louder block", function()
+        -- The peak *is* the colour the theme ships; rest is that held back. So a
+        -- count announcing itself is the same green turned up, never another one.
+        local rest = hl(fade.count_group("AgentsAdd", "added", nil))
+        local peak = hl(fade.count_group("AgentsAdd", "added", 0))
+        expect(chroma(peak.fg) > chroma(rest.fg)).to_be_true()
+        expect(chroma(peak.bg) > chroma(rest.bg)).to_be_true()
+        expect(dominant(peak.fg)).to_be("g")
+        expect(dominant(peak.bg)).to_be("g")
+        expect(contrast(peak.fg, peak.bg)).to_be_at_least(4.5)
+      end)
+
+      it("walks both halves back to the resting colours", function()
+        local rest = fade.count_group("AgentsAdd", "added", nil)
+        local peak = hl(fade.count_group("AgentsAdd", "added", 0))
+        local mid = hl(fade.count_group("AgentsAdd", "added", 1500))
+        expect(chroma(mid.fg) < chroma(peak.fg)).to_be_true()
+        expect(chroma(mid.fg) > chroma(hl(rest).fg)).to_be_true()
+        expect(chroma(mid.bg) < chroma(peak.bg)).to_be_true()
+        -- And the end of the ramp is the resting group itself, both halves.
+        expect(fade.count_group("AgentsAdd", "added", 3000)).to_be(rest)
+        expect(fade.count_group("AgentsAdd", "added", 20000)).to_be(rest)
+      end)
+
+      it("is back to rest exactly at flash_ms", function()
+        local rest = fade.count_group("AgentsAdd", "added", nil)
+        expect(fade.count_group("AgentsAdd", "added", 2999) ~= rest).to_be_true()
+        expect(fade.count_group("AgentsAdd", "added", 3000)).to_be(rest)
+      end)
+
+      it("does not fire at all with the fade switched off", function()
+        -- The resting colours are not an animation, so they stay; only the flash
+        -- goes. `fade = false` means "do not move", not "give me white on green".
+        fade.setup({ agents = { fade = false } })
+        define({ Added = { fg = 0xb3f6c0 }, AgentsAdd = { bg = GREEN_BLOCK } })
+        local rest = fade.count_group("AgentsAdd", "added", nil)
+        expect(rest ~= "AgentsAdd").to_be_true()
+        expect(dominant(hl(rest).fg)).to_be("g")
+        expect(fade.count_group("AgentsAdd", "added", 0)).to_be(rest)
+      end)
     end)
   end)
 
@@ -467,7 +435,9 @@ describe("agents.fade", function()
       fade.setup({ agents = { fade = false } })
       expect(fade.enabled()).to_be(false)
       expect(fade.dim_group("AgentsPath", 60000)).to_be("AgentsPath")
-      expect(fade.flash_group("DiffAdd", 0)).to_be("DiffAdd")
+      -- The count blocks keep their derived colours: those are what the theme's
+      -- diff looks like, not an animation. Only the flash stops (see above).
+      expect(fade.count_group("AgentsPath", "added", 0)).to_be(fade.count_group("AgentsPath", "added", nil))
     end)
   end)
 end)

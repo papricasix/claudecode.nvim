@@ -383,9 +383,16 @@ opts = {
       dim = 0.55,                 -- how far a rested row blends into the background
       flash_ms = 3000,            -- a changed count lights up and then spends
                                   -- ~all of this fading back (no flat hold)
-      flash_level = 0.55,         -- how far a changed count is pushed towards its
-                                  -- own hue (more green / more red, not whiter)
-      flash_text_lift = 0.25,     -- how much lighter the text is than its block
+      -- The +N/-N blocks: one hue -- the theme's own added/removed colour -- at
+      -- four strengths, so the number and its block are always the same colour.
+      count_sat = 0.25,           -- the resting number, as a fraction of that
+      count_dim = 0.60,           -- and dimmed this far towards its own block
+      count_bg_sat = 0.22,        -- the block, fainter still
+      count_bg_lift = 0.10,       -- and this far from the pane in lightness
+      flash_level = 0.50,         -- the block a count wears just after it moves
+      flash_lift = 0.05,          -- (the number goes to the theme's colour itself)
+      count_contrast = 4.5,       -- every one of them stays this legible on
+                                  -- whatever it sits on
     },
     fold_batch = 2,               -- transcripts read per tick while filling the list
     follow_cursor = false,        -- selecting follows the cursor
@@ -418,10 +425,11 @@ opts = {
     --     path  = "ClaudeCodeAgentsPath",        -- Directory
     --     added = "ClaudeCodeAgentsAdded",       -- DiffAdd
     --     removed = "ClaudeCodeAgentsRemoved",   -- DiffDelete
-    -- The +N/-N number is drawn the way a diff draws one: in the theme's own
-    -- added/removed colour on the block, not in Normal's white, and lightened or
-    -- darkened until it is legible there. Give the group a coloured foreground of
-    -- your own and that is used instead.
+    -- Only the *hue* is taken from these two groups: the +N/-N number and the
+    -- block behind it are both derived from it (see agents.fade above), the way
+    -- a diff draws one, rather than from the theme's own DiffAdd background --
+    -- which is frequently a different colour from the diff text the same theme
+    -- ships. Give the group a coloured foreground of your own to pick the hue.
     --     selected = "ClaudeCodeAgentsSelected", -- CursorLine
     --     header = "ClaudeCodeAgentsHelpHeader", -- Title
     --     key = "ClaudeCodeAgentsKey",           -- Special
