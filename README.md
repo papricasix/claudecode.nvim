@@ -261,11 +261,8 @@ there too.
   is where that order is stated — it names the direction in the criterion's own
   words ("newest first", "A → Z"). The choice lasts as long as the view is open;
   the next open starts from `agents.sessions.sort` again.
-- `dd` deletes the session under the cursor after a confirmation dialog (a
-  snacks.nvim float when you have it, `vim.fn.confirm` otherwise). This removes
-  the conversation's transcript from disk, so it is gone for good and can no
-  longer be resumed — from here or from the CLI. A session whose agent is still
-  running is refused; stop it with `x` first.
+- `dd` deletes the session under the cursor after a confirmation dialog (a snacks.nvim float when you have it, `vim.fn.confirm` otherwise). This removes the conversation's transcript from disk, so it is gone for good and can no longer be resumed — from here or from the CLI. A session whose agent is still running is refused; stop it with `x` first.
+- **Several at once**: `dd` takes a count (`3dd` deletes three rows from the cursor down), and `d` over a visual selection deletes every session the selection covers. One dialog for the whole batch, naming the first few and counting the rest. A running agent inside the range is left alone rather than vetoing the gesture — the dialog says how many were skipped and which key stops them.
 - Switching agents leaves the previous one **running**. That is the point: start
   three, come back to whichever finishes first.
 - `<C-n>` and `<C-p>` move through the session list from anywhere in the tab —
@@ -379,12 +376,16 @@ opts = {
       hold_ms = 3000,             -- an Activity row stays lifted this long,
       steps = 25,                 -- then fades over (steps - 1) * step_ms, ~3s
       step_ms = 120,              -- per step; matches spinner_ms, which samples it
-      boost = 0.5,                -- how far a fresh row is lifted above its colour
-                                  -- (0 = only fade, never brighten)
+      boost = 0.5,                -- how far a fresh row is pushed towards its own
+                                  -- hue (more coloured, never paler; 0 = only fade)
+      bold = true,                -- and drawn bold while fresh, which is the whole
+                                  -- of the lift for an already-vivid colour
       dim = 0.55,                 -- how far a rested row blends into the background
       flash_ms = 3000,            -- a changed count lights up and then spends
                                   -- ~all of this fading back (no flat hold)
-      flash_level = 0.8,          -- how bright the lit text is on the count's block
+      flash_level = 0.55,         -- how far a changed count is pushed towards its
+                                  -- own hue (more green / more red, not whiter)
+      flash_text_lift = 0.25,     -- how much lighter the text is than its block
     },
     fold_batch = 2,               -- transcripts read per tick while filling the list
     follow_cursor = false,        -- selecting follows the cursor
@@ -417,6 +418,10 @@ opts = {
     --     path  = "ClaudeCodeAgentsPath",        -- Directory
     --     added = "ClaudeCodeAgentsAdded",       -- DiffAdd
     --     removed = "ClaudeCodeAgentsRemoved",   -- DiffDelete
+    -- The +N/-N number is drawn the way a diff draws one: in the theme's own
+    -- added/removed colour on the block, not in Normal's white, and lightened or
+    -- darkened until it is legible there. Give the group a coloured foreground of
+    -- your own and that is used instead.
     --     selected = "ClaudeCodeAgentsSelected", -- CursorLine
     --     header = "ClaudeCodeAgentsHelpHeader", -- Title
     --     key = "ClaudeCodeAgentsKey",           -- Special

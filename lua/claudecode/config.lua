@@ -560,6 +560,7 @@ function M.validate(config)
       assert(type(ag.fade) == "table", "agents.fade must be a table, or false to disable it")
       local check_fade = checker(ag.fade, "agents.fade")
       check_fade("enabled", is_boolean, "must be a boolean")
+      check_fade("bold", is_boolean, "must be a boolean")
       for _, field in ipairs({ "hold_ms", "step_ms", "flash_ms" }) do
         check_fade(field, function(v)
           return type(v) == "number" and v >= 0
@@ -577,6 +578,7 @@ function M.validate(config)
       check_fade("boost", is_unit, "must be a number from 0 to 1")
       check_fade("dim", is_unit, "must be a number from 0 to 1")
       check_fade("flash_level", is_unit, "must be a number from 0 to 1")
+      check_fade("flash_text_lift", is_unit, "must be a number from 0 to 1")
     end
 
     if ag.sessions ~= nil then

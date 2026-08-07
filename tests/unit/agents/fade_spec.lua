@@ -84,33 +84,107 @@ describe("agents.fade", function()
   end)
 
   describe("dim_group", function()
-    it("lifts a fresh row above its own colour so it pops", function()
+    ---How much colour a value carries: the spread between its channels. A colour
+    ---going *paler* loses chroma however its channels climb, which is the
+    ---difference between "more blue" and "whiter".
+    local function chroma(n)
+      local r, g, b = math.floor(n / 65536) % 256, math.floor(n / 256) % 256, n % 256
+      return math.max(r, g, b) - math.min(r, g, b)
+    end
+
+    ---Largest per-channel gap. Packed RGB subtracts across channel boundaries,
+    ---so `math.abs(a - b)` says nothing about how close two colours look.
+    local function apart(a, b)
+      local function ch(n)
+        return math.floor(n / 65536) % 256, math.floor(n / 256) % 256, n % 256
+      end
+      local ar, ag, ab = ch(a)
+      local br, bg, bb = ch(b)
+      return math.max(math.abs(ar - br), math.abs(ag - bg), math.abs(ab - bb))
+    end
+
+    ---WCAG contrast, which is what "legible on this pane" actually means. Packed
+    ---RGB compares as an integer and channel sums weight blue like green; neither
+    ---says whether a colour got easier to read.
+    local function contrast(a, b)
+      local function lum(n)
+        local function channel(v)
+          v = v / 255
+          return v <= 0.03928 and v / 12.92 or ((v + 0.055) / 1.055) ^ 2.4
+        end
+        return 0.2126 * channel(math.floor(n / 65536) % 256)
+          + 0.7152 * channel(math.floor(n / 256) % 256)
+          + 0.0722 * channel(n % 256)
+      end
+      local la, lb = lum(a), lum(b)
+      if la < lb then
+        la, lb = lb, la
+      end
+      return (la + 0.05) / (lb + 0.05)
+    end
+
+    it("marks a fresh row without paling it or making it harder to read", function()
       -- Without the lift, "fresh" means only "not yet dimmed" — and two of the
       -- three columns draw in `Comment`, a muted grey, so a new row announced
       -- itself hardly at all.
+      --
+      -- The lift used to scale the channels towards their peak, which for a
+      -- colour already near it only added white: measured on tokyonight-moon,
+      -- `Directory` `#82aaff` came back `#a1bfff`, a pale wash of the scheme's
+      -- own blue rather than the blue. So it is intensity and weight now, and
+      -- neither is allowed to cost legibility.
       local lit = fade.dim_group("AgentsPath", 0)
       expect(lit ~= "AgentsPath").to_be_true()
-      expect(hl(lit).fg > CYAN).to_be_true()
-      -- Still lifted at the end of the hold, and dropping once past it.
+      local spec = hl(lit)
+      expect(spec.bold).to_be_true()
+      expect(chroma(spec.fg)).to_be_at_least(chroma(CYAN))
+      expect(contrast(spec.fg, BG)).to_be_at_least(contrast(CYAN, BG))
+
+      -- Still lifted at the end of the hold, and dropping — weight included — once
+      -- past it, so the row settles in one movement rather than two.
       expect(fade.dim_group("AgentsPath", 2999)).to_be(lit)
-      expect(fade.dim_group("AgentsPath", 3000) ~= lit).to_be_true()
+      local fading = fade.dim_group("AgentsPath", 3000)
+      expect(fading ~= lit).to_be_true()
+      expect(hl(fading).bold).to_be_nil()
     end)
 
-    it("passes back through the base colour on the way down", function()
-      -- One continuous ramp bright -> normal -> quiet, rather than a hold at the
-      -- base with a fade bolted after it.
+    it("lifts a muted colour by making it more coloured, not by washing it out", function()
+      -- Where the lift still has room to work: a `Comment`-ish grey-blue has most
+      -- of its saturation left, and that is what a fresh row should spend. It may
+      -- not spend legibility doing it — a blue carries a fourteenth of green's
+      -- luminance, so saturating alone drops the contrast (measured: 3.11 to
+      -- 2.88), which the lightness walk-back exists to give back.
+      local MUTED = 0x636da6
+      define({ AgentsMuted = { fg = MUTED } })
+      local spec = hl(fade.dim_group("AgentsMuted", 0))
+      expect(chroma(spec.fg) > chroma(MUTED)).to_be_true()
+      expect(contrast(spec.fg, BG)).to_be_at_least(contrast(MUTED, BG))
+    end)
+
+    it("starts at the group's own colour and walks down to the quiet one", function()
+      -- One continuous ramp rather than a hold at the base with a fade bolted
+      -- after it. The lit end is the base colour itself here — a saturated cyan
+      -- has nowhere left to be lifted to, which is what the weight covers — so
+      -- the ramp begins where the scheme put it and leaves from there.
       local o = fade.opts()
-      local lit_fg = hl(fade.dim_group("AgentsPath", 0)).fg
+      expect(apart(hl(fade.dim_group("AgentsPath", 0)).fg, CYAN) <= 4).to_be_true()
       local rested_fg = hl(fade.dim_group("AgentsPath", 60000)).fg
-      expect(lit_fg > CYAN).to_be_true()
       expect(rested_fg < CYAN).to_be_true()
-      -- Somewhere in the middle it is within a hair of the group's own colour.
-      local closest = math.huge
-      for step = 0, o.steps do
-        local fg = hl(fade.dim_group("AgentsPath", o.hold_ms + step * o.step_ms)).fg
-        closest = math.min(closest, math.abs(fg - CYAN))
+      expect(rested_fg > BG).to_be_true()
+      -- And every step in between is somewhere on that line.
+      for step = 1, o.steps do
+        local fg = hl(fade.dim_group("AgentsPath", o.hold_ms + (step - 1) * o.step_ms)).fg
+        expect(fg <= CYAN).to_be_true()
+        expect(fg >= rested_fg).to_be_true()
       end
-      expect(closest < 0x030303).to_be_true()
+    end)
+
+    it("can have the weight turned off on its own", function()
+      fade.setup({ agents = { fade = { bold = false } } })
+      local lit = fade.dim_group("AgentsPath", 0)
+      expect(hl(lit).bold).to_be_nil()
+      -- The colour half of the lift is untouched by it.
+      expect(lit ~= "AgentsPath").to_be_true()
     end)
 
     it("with the lift off, behaves exactly as it did before", function()
@@ -159,6 +233,91 @@ describe("agents.fade", function()
     end)
   end)
 
+  describe("count_group", function()
+    ---Which channel a colour is mostly made of, so "is green" is assertable.
+    local function dominant(n)
+      local r, g, b = math.floor(n / 65536) % 256, math.floor(n / 256) % 256, n % 256
+      if r >= g and r >= b then
+        return "r"
+      end
+      return g >= b and "g" or "b"
+    end
+
+    local function contrast(a, b)
+      local function lum(n)
+        local function channel(v)
+          v = v / 255
+          return v <= 0.03928 and v / 12.92 or ((v + 0.055) / 1.055) ^ 2.4
+        end
+        return 0.2126 * channel(math.floor(n / 65536) % 256)
+          + 0.7152 * channel(math.floor(n / 256) % 256)
+          + 0.0722 * channel(n % 256)
+      end
+      local la, lb = lum(a), lum(b)
+      if la < lb then
+        la, lb = lb, la
+      end
+      return (la + 0.05) / (lb + 0.05)
+    end
+
+    it("draws the number in the theme's own added colour, not in Normal's white", function()
+      -- The shape most colorschemes ship: a block with no foreground, so the
+      -- number fell through to `Normal` and a `+12` came out white on green —
+      -- "highlighted text", not "twelve lines were added". A diff never looks
+      -- like that.
+      define({ Added = { fg = 0xb3f6c0 }, AgentsAdd = { bg = GREEN_BLOCK } })
+      local group = fade.count_group("AgentsAdd", "added")
+      expect(group ~= "AgentsAdd").to_be_true()
+      local spec = hl(group)
+      expect(spec.bg).to_be(GREEN_BLOCK)
+      expect(dominant(spec.fg)).to_be("g")
+      expect(contrast(spec.fg, GREEN_BLOCK)).to_be_at_least(4.5)
+    end)
+
+    it("replaces a foreground that is really a white or a grey", function()
+      -- Neovim's own `DiffAdd` is `#eef1f8` on green. HSL calls that saturation
+      -- 0.42 — saturation runs away at the light end — so the test is the spread
+      -- between the channels, which is four percent. No colour was chosen there.
+      define({ Added = { fg = 0xb3f6c0 }, AgentsAdd = { fg = 0xeef1f8, bg = GREEN_BLOCK } })
+      local spec = hl(fade.count_group("AgentsAdd", "added"))
+      expect(spec.fg ~= 0xeef1f8).to_be_true()
+      expect(dominant(spec.fg)).to_be("g")
+    end)
+
+    it("keeps a foreground the theme actually chose, and makes it legible", function()
+      -- kanagawa paints `DiffDelete` red on salmon: it means that, and it is not
+      -- second-guessed — but it measures 1.99:1, which no number can be read at.
+      local SALMON, RED = 0xd9a594, 0xd7474b
+      define({ AgentsDel = { fg = RED, bg = SALMON } })
+      local spec = hl(fade.count_group("AgentsDel", "removed"))
+      expect(dominant(spec.fg)).to_be("r")
+      expect(contrast(spec.fg, SALMON)).to_be_at_least(4.5)
+      -- Darker, because the block is the light half of the pair.
+      expect(spec.fg < RED).to_be_true()
+    end)
+
+    it("falls back to the block's own hue when the theme names no colour", function()
+      -- Literally "more green than its background", and nothing invented: this is
+      -- the last resort, after the group's own foreground and `Added`/`Removed`.
+      vim._highlights.Added = nil
+      define({ AgentsAdd = { bg = GREEN_BLOCK } })
+      local spec = hl(fade.count_group("AgentsAdd", "added"))
+      expect(dominant(spec.fg)).to_be("g")
+      expect(contrast(spec.fg, GREEN_BLOCK)).to_be_at_least(4.5)
+    end)
+
+    it("leaves a group with no block alone", function()
+      -- No background is invented for it: the count is text there, and text is
+      -- already drawn in whatever colour the theme gave the group.
+      expect(fade.count_group("DiffDelete", "removed")).to_be("DiffDelete")
+    end)
+
+    it("stands down without truecolour", function()
+      vim.o.termguicolors = false
+      expect(fade.count_group("DiffAdd", "added")).to_be("DiffAdd")
+    end)
+  end)
+
   describe("flash_group", function()
     it("ignores a count that has never changed", function()
       expect(fade.flash_group("DiffAdd", nil)).to_be("DiffAdd")
@@ -170,13 +329,44 @@ describe("agents.fade", function()
       return math.floor(n / 65536) % 256 + math.floor(n / 256) % 256 + n % 256
     end
 
-    it("lights the text and its block together, the text further", function()
-      -- Both halves lift, unequally. Lifting them the same amount put #04de5d on
-      -- #005523 — green on green — so a count that had just changed was less
-      -- legible than one at rest. The gap is what keeps the number readable.
+    ---How much colour a value carries: the spread between its channels. A grey
+    ---is 0 however bright it is, and a colour going *paler* loses chroma even
+    ---as its brightness climbs — which is the difference this effect turns on.
+    local function chroma(n)
+      local r = math.floor(n / 65536) % 256
+      local g = math.floor(n / 256) % 256
+      local b = n % 256
+      return math.max(r, g, b) - math.min(r, g, b)
+    end
+
+    ---Which channel a colour is mostly made of, so "still green" is assertable.
+    local function dominant(n)
+      local r = math.floor(n / 65536) % 256
+      local g = math.floor(n / 256) % 256
+      local b = n % 256
+      if r >= g and r >= b then
+        return "r"
+      end
+      return g >= b and "g" or "b"
+    end
+
+    it("turns a changed count's block more green, not whiter", function()
+      -- The point of the effect: `+N` announces itself by being *more* of the
+      -- colour it already is. A brightened block would carry less colour, not
+      -- more, and a block already near peak could only go pale.
       local spec = hl(fade.flash_group("DiffAdd", 0))
-      expect(lum(spec.bg) > lum(GREEN_BLOCK)).to_be_true()
+      expect(chroma(spec.bg) > chroma(GREEN_BLOCK)).to_be_true()
+      expect(dominant(spec.bg)).to_be("g")
+    end)
+
+    it("lights the text in the block's own hue, one notch up", function()
+      -- Same colour, lighter — the pair reads as one thing. Giving them the
+      -- same colour once painted #04de5d on #005523, green on green, so a count
+      -- that had just changed was less legible than one at rest.
+      local spec = hl(fade.flash_group("DiffAdd", 0))
+      expect(spec.fg ~= spec.bg).to_be_true()
       expect(lum(spec.fg) > lum(spec.bg)).to_be_true()
+      expect(dominant(spec.fg)).to_be(dominant(spec.bg))
     end)
 
     it("walks both halves back to the group's own colours", function()
@@ -187,16 +377,16 @@ describe("agents.fade", function()
       local lit = hl(fade.flash_group("DiffAddText", 0))
       local mid = hl(fade.flash_group("DiffAddText", 2000))
 
-      -- The block lifts, then sinks back towards its own colour.
-      expect(lum(lit.bg) > lum(GREEN_BLOCK)).to_be_true()
-      expect(lum(mid.bg) < lum(lit.bg)).to_be_true()
-      expect(lum(mid.bg) > lum(GREEN_BLOCK)).to_be_true()
+      -- The block saturates, then sinks back towards its own colour.
+      expect(chroma(lit.bg) > chroma(GREEN_BLOCK)).to_be_true()
+      expect(chroma(mid.bg) < chroma(lit.bg)).to_be_true()
+      expect(chroma(mid.bg) > chroma(GREEN_BLOCK)).to_be_true()
 
-      -- The text starts as a bright version of the *block*, not as the group's
+      -- The text starts as a lighter version of the *block*, not as the group's
       -- own foreground, and is on its way there by the middle of the ramp.
       expect(lit.fg ~= WHITE).to_be_true()
       expect(mid.fg ~= lit.fg).to_be_true()
-      expect(lum(mid.fg) > lum(lit.fg)).to_be_true() -- climbing towards white
+      expect(chroma(mid.fg) < chroma(lit.fg)).to_be_true() -- draining towards white
 
       -- And the end of the ramp is the base group itself, both halves included.
       expect(fade.flash_group("DiffAddText", 3000)).to_be("DiffAddText")
@@ -208,17 +398,28 @@ describe("agents.fade", function()
       expect(fade.flash_group("DiffAdd", 20000)).to_be("DiffAdd")
     end)
 
-    it("brightens a foreground-only count instead of blocking it out", function()
+    it("saturates a foreground-only count instead of blocking it out", function()
       -- A scheme whose DiffDelete is a foreground and nothing else: using that
       -- foreground as a background too paints the number in its own colour and
       -- it vanishes. It must stay a foreground, and it must actually change —
-      -- a colour already at peak brightness cannot be scaled up.
+      -- a pale pink already at peak brightness cannot be scaled up, but it has
+      -- plenty of room to become red.
       local lit = fade.flash_group("DiffDelete", 0)
       expect(lit ~= "DiffDelete").to_be_true()
       local spec = hl(lit)
       expect(spec.bg).to_be_nil()
-      expect(spec.fg ~= PINK_TEXT).to_be_true()
-      expect(spec.fg > PINK_TEXT).to_be_true()
+      expect(chroma(spec.fg) > chroma(PINK_TEXT)).to_be_true()
+      expect(dominant(spec.fg)).to_be("r")
+    end)
+
+    it("brightens a grey count, having no hue to intensify", function()
+      -- Saturating a grey would invent a hue out of nowhere — hue 0 is red, so
+      -- a neutral count would flash pink. Brightness is the only direction left.
+      local GREY = 0x808080
+      define({ AgentsGrey = { fg = GREY } })
+      local spec = hl(fade.flash_group("AgentsGrey", 0))
+      expect(lum(spec.fg) > lum(GREY)).to_be_true()
+      expect(chroma(spec.fg) <= 2).to_be_true()
     end)
 
     it("stands down without truecolour", function()

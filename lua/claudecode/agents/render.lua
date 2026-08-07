@@ -522,11 +522,16 @@ local function counts_text(added, removed, ages)
   end
   local plus_at = text:find("+", 1, true)
   local minus_at = text:find("-", plus_at or 1, true)
+  -- `count_group` is the resting look — the number in the block's own colour, the
+  -- way a diff draws one — and the flash ramps back to *that* rather than to the
+  -- raw group, so a count that has just moved settles onto the colour it had.
   if plus_at then
-    spans[#spans + 1] = { offset = plus_at - 1, len = #plus, hl = fade.flash_group(hl("added"), ages.added) }
+    local group = fade.count_group(hl("added"), "added")
+    spans[#spans + 1] = { offset = plus_at - 1, len = #plus, hl = fade.flash_group(group, ages.added) }
   end
   if minus_at then
-    spans[#spans + 1] = { offset = minus_at - 1, len = #minus, hl = fade.flash_group(hl("removed"), ages.removed) }
+    local group = fade.count_group(hl("removed"), "removed")
+    spans[#spans + 1] = { offset = minus_at - 1, len = #minus, hl = fade.flash_group(group, ages.removed) }
   end
   return text, spans
 end
