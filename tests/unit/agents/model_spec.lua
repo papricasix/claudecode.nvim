@@ -651,6 +651,46 @@ describe("agents.model", function()
     end)
   end)
 
+  describe("an agent moving to another conversation", function()
+    before_each(function()
+      summaries.aaa = summary_for("aaa")
+      model.attach(1, "/proj")
+    end)
+
+    it("forgets what the abandoned conversation was doing", function()
+      -- /clear leaves the terminal running and swaps the chat underneath it. The
+      -- old conversation is not mid-tool any more; leaving its entry alone left a
+      -- spinner on a row nothing was going to report about again.
+      model.note({ hook_event_name = "UserPromptSubmit", session_id = "aaa" })
+      expect(model.status_of("aaa").state).to_be("busy")
+
+      model.note_session_change("aaa", "bbb")
+      expect(model.status_of("aaa")).to_be(nil)
+    end)
+
+    it("says whether the selection was pointing at the old conversation", function()
+      model.select("aaa")
+      expect(model.note_session_change("aaa", "bbb")).to_be_true()
+      expect(model.note_session_change("zzz", "yyy")).to_be(false)
+    end)
+
+    it("lists the new conversation from the registry before it has a transcript", function()
+      -- The CLI writes nothing until the first message, so this is the whole
+      -- window in which the running agent would otherwise be off the list.
+      live.bbb = true
+      model.note_session_change("aaa", "bbb")
+      model.refresh_list()
+
+      local by_id = {}
+      for _, row in ipairs(model.rows()) do
+        by_id[row.session_id] = row
+      end
+      expect(by_id.bbb).to_be_table()
+      expect(by_id.bbb.live).to_be_true()
+      expect(by_id.aaa.live).to_be(false)
+    end)
+  end)
+
   describe("interrupting an agent", function()
     before_each(function()
       summaries.aaa = summary_for("aaa")

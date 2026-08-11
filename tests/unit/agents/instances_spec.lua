@@ -130,6 +130,35 @@ describe("instance registry", function()
       expect(claudecode.instance_for_session("nobody")).to_be(nil)
     end)
 
+    it("renames an agent's instance onto its new conversation", function()
+      -- /clear does not touch the socket; only the conversation on the other end
+      -- of it changes. The server, port and lock file have a client attached and
+      -- must survive, but everything downstream names the conversation from here.
+      local inst = claudecode.start_agent_instance("session-a", 3)
+      local server, port = inst.server, inst.port
+
+      claudecode.rekey_agent_instance(inst, "session-b")
+
+      expect(claudecode.instance_for_session("session-b")).to_be(inst)
+      expect(claudecode.instance_for_session("session-a")).to_be(nil)
+      expect(inst.session_id).to_be("session-b")
+      expect(inst.server).to_be(server)
+      expect(inst.port).to_be(port)
+      expect(server.stopped).to_be(false)
+
+      -- ...and the agent's next launch of that old id is a separate instance.
+      local other = claudecode.start_agent_instance("session-a", 3)
+      expect(other ~= inst).to_be_true()
+    end)
+
+    it("ignores a rename to the id it already has, or to nothing", function()
+      local inst = claudecode.start_agent_instance("session-a", 3)
+      claudecode.rekey_agent_instance(inst, "session-a")
+      claudecode.rekey_agent_instance(inst, "")
+      claudecode.rekey_agent_instance(nil, "session-b")
+      expect(claudecode.instance_for_session("session-a")).to_be(inst)
+    end)
+
     it("lists every instance living in a tab", function()
       claudecode.register_tab_instance(3, { server = {}, port = 1 })
       claudecode.start_agent_instance("session-a", 3)

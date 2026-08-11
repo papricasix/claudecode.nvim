@@ -56,6 +56,12 @@ dbg("read " .. #data .. " bytes of stdin")
 -- is always a safe integer.
 local tab = tonumber((os.getenv("CLAUDECODE_NVIM_TAB") or ""):match("%d+") or "0") or 0
 
+-- Which agents-mode launch this Claude is (empty for every other launch). The
+-- conversation id in the payload names the chat, and `/clear` starts a new one
+-- in the same terminal, so this is the only stable name the plugin can key a
+-- running agent by.
+local agent = os.getenv("CLAUDECODE_AGENT_ID") or ""
+
 -- TCP addresses look like `127.0.0.1:6789`; everything else (a Unix socket path
 -- or a Windows named pipe `\\.\pipe\nvim...`) is a "pipe" connection.
 local kind = server:match("^%d[%d%.]*:%d+$") and "tcp" or "pipe"
@@ -74,10 +80,10 @@ local req_ok, req_err = pcall(
   chan,
   "nvim_exec_lua",
   [[
-    local json, source_tab = ...
-    return require("claudecode.live_cursor").ingest(json, source_tab)
+    local json, source_tab, agent_id = ...
+    return require("claudecode.live_cursor").ingest(json, source_tab, agent_id)
   ]],
-  { data, tab }
+  { data, tab, agent }
 )
 if not req_ok then
   bail("rpcrequest failed: " .. tostring(req_err))

@@ -855,6 +855,32 @@ function M.start_agent_instance(session_id, tab_id)
   return inst, nil
 end
 
+---Point an agent's server at a different conversation, without restarting it.
+---
+---The CLI keeps its socket across a `/clear`; only the conversation on the other
+---end of it changes. The instance is what names that conversation to everything
+---downstream — `request_context.session_id()` reads it, and diffs and file opens
+---tag their floats with it — so it is renamed rather than replaced. The server,
+---the port and the lock file are untouched, which is the point: the client is
+---still connected to them.
+---@param inst table|nil The agent's instance record.
+---@param session_id string The conversation it is having now.
+function M.rekey_agent_instance(inst, session_id)
+  if type(inst) ~= "table" or type(session_id) ~= "string" or session_id == "" then
+    return
+  end
+  local next_id = agent_instance_id(session_id)
+  if inst.id == next_id then
+    return
+  end
+  if inst.id then
+    M.instances[inst.id] = nil
+  end
+  inst.id = next_id
+  inst.session_id = session_id
+  M.instances[next_id] = inst
+end
+
 ---Stop the server dedicated to one agents-mode conversation.
 ---@param session_id string
 function M.stop_agent_instance(session_id)

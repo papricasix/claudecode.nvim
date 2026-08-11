@@ -252,6 +252,25 @@ describe("live_cursor", function()
       expect(#shown).to_be(1)
     end)
 
+    it("tells agents mode which launch reported an event", function()
+      -- A conversation id names the chat, and `/clear` swaps it for another one
+      -- in the same terminal; the launch key is what stays put, so it is the only
+      -- thing that says which of several agents this came from afterwards.
+      local noted = {}
+      package.loaded["claudecode.agents_view"] = {
+        note = function(event, tab, agent_id)
+          noted[#noted + 1] = { session_id = event.session_id, tab = tab, agent_id = agent_id }
+        end,
+        is_agents_tab = function()
+          return false
+        end,
+      }
+      live_cursor.dispatch({ hook_event_name = "SessionStart", session_id = "new" }, 3, "1:old")
+      expect(#noted).to_be(1)
+      expect(noted[1].session_id).to_be("new")
+      expect(noted[1].agent_id).to_be("1:old")
+    end)
+
     it("shows nothing for a conversation the agents registry is running", function()
       -- The tab stamp is where the CLI launched; the registry is the authority.
       package.loaded["claudecode.agents.registry"] = {
@@ -447,6 +466,29 @@ describe("live_cursor", function()
       assert.is_truthy(contents:match("ExitPlanMode"))
       assert.is_truthy(contents:match("PostToolUse"))
       -- live_cursor off -> the file-tool matcher must not be present.
+      assert.is_falsy(contents:match("Read|Edit|Write|MultiEdit"))
+    end)
+
+    it("injects SessionStart for agents mode even under polling", function()
+      -- Agents mode keys everything by conversation, and `/clear` changes which
+      -- conversation a running agent is having without touching its terminal or
+      -- writing anything that attributes the change to it — so no amount of
+      -- polling can see it. This is the second and last hook polling asks for.
+      package.loaded["claudecode.agents_view"] = {
+        is_enabled = function()
+          return true
+        end,
+        wants_hooks = function()
+          return false
+        end,
+      }
+      live_cursor.setup(base_config({ enabled = false }))
+      local contents = settings_of(live_cursor.build_launch_injection())
+      package.loaded["claudecode.agents_view"] = nil
+
+      assert.is_truthy(contents:match("SessionStart"))
+      -- ...and none of the per-tool-call ones that make hooks opt-in.
+      assert.is_falsy(contents:match('"%*"'))
       assert.is_falsy(contents:match("Read|Edit|Write|MultiEdit"))
     end)
 

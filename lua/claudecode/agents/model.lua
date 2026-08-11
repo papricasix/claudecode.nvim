@@ -1169,6 +1169,34 @@ function M.mark_read(session_id)
   return true
 end
 
+---A running agent moved onto a different conversation (`/clear`, or a resume from
+---inside the CLI).
+---
+---Only the state this module keeps *about a conversation* needs moving, and the
+---honest move for the one being left is to forget it: it is not running any more,
+---and whatever it was last doing — mid-tool, waiting on a permission prompt — it
+---is not doing now. Dropping the entry lands its row on "not running" straight
+---away rather than leaving a stale spinner on it until the `SessionEnd` for it
+---arrives (a separate hook process, so its order against the `SessionStart` that
+---brought us here is not guaranteed). The new conversation's own state comes from
+---the same event, through `note`.
+---@param previous string The id it was running until now.
+---@param session_id string The id it reports now.
+---@return boolean selected Whether the selection was pointing at the old id.
+function M.note_session_change(previous, session_id)
+  if type(previous) ~= "string" or type(session_id) ~= "string" then
+    return false
+  end
+  state.status[previous] = nil
+  -- A marker that has already been acted on belongs to the turn it ended, and
+  -- that conversation is over; keeping it would only pin memory to an id nothing
+  -- will report again.
+  state.interrupted[previous] = nil
+  state.dirty.list = true
+  state.dirty.transcript = true
+  return state.selected == previous
+end
+
 ---@param session_id string
 ---@return table|nil
 function M.status_of(session_id)

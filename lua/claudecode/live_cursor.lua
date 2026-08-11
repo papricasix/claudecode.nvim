@@ -165,7 +165,8 @@ function M.build_launch_injection()
   local session_on = session_enabled()
   local status_on = status_enabled()
   local agents_on = agents_enabled()
-  local plan_close_on = plan_on or agents_on_at_all()
+  local agents_any = agents_on_at_all()
+  local plan_close_on = plan_on or agents_any
   if not lc_on and not plan_on and not session_on and not status_on and not agents_on and not plan_close_on then
     return nil
   end
@@ -258,9 +259,17 @@ function M.build_launch_injection()
       register("PostToolUse", "ExitPlanMode")
     end
   end
-  if session_on or status_on or agents_on then
+  if session_on or status_on or agents_on or agents_any then
     -- SessionStart carries the id the CLI runs under (including after /clear or a
     -- manual --resume), which is what session persistence stores per tab.
+    --
+    -- Agents mode asks for it even under polling, where it is the second and last
+    -- hook it wants. Everything there is keyed by conversation, and `/clear`
+    -- changes which conversation a running agent is having without touching its
+    -- terminal or its process — a change nothing on disk attributes to a
+    -- particular agent, so no amount of polling can see it. One headless nvim per
+    -- session start (a launch, a `/clear`, a resume) is a different order of cost
+    -- from the `"*"` tool matcher that makes hooks opt-in.
     register("SessionStart")
   end
 
@@ -299,8 +308,9 @@ end
 ---passed through directly — no tempfile — so the transport is the same on platform.
 ---@param data string The raw tool-event JSON Claude piped to the hook.
 ---@param source_tab integer|string|nil Tabpage the triggering Claude was launched in.
+---@param agent_id string|nil Agents-mode launch key, empty for every other launch.
 ---@return string Empty string (the remote call expects a return value).
-function M.ingest(data, source_tab)
+function M.ingest(data, source_tab, agent_id)
   if type(data) ~= "string" or data == "" then
     return ""
   end
@@ -309,8 +319,9 @@ function M.ingest(data, source_tab)
     return ""
   end
   local tab = tonumber(source_tab)
+  local agent = (type(agent_id) == "string" and agent_id ~= "") and agent_id or nil
   vim.schedule(function()
-    pcall(M.dispatch, event, tab)
+    pcall(M.dispatch, event, tab, agent)
   end)
   return ""
 end
@@ -416,7 +427,8 @@ end
 ---Route a hook event to the appropriate visual action.
 ---@param event table Decoded hook payload.
 ---@param source_tab integer|nil Tabpage the triggering Claude was launched in.
-function M.dispatch(event, source_tab)
+---@param agent_id string|nil Agents-mode launch key, if this Claude is one.
+function M.dispatch(event, source_tab, agent_id)
   local tool = event.tool_name
   local ehn = event.hook_event_name
 
@@ -429,8 +441,11 @@ function M.dispatch(event, source_tab)
 
   -- Agents mode keys by conversation rather than tab, since several agents share
   -- its tabpage; it folds the same events into per-agent state and live counts.
+  -- The launch key goes with it: a conversation id names the chat and `/clear`
+  -- swaps it for another one mid-terminal, so this is what says which agent the
+  -- event came from once that has happened.
   pcall(function()
-    require("claudecode.agents_view").note(event, source_tab)
+    require("claudecode.agents_view").note(event, source_tab, agent_id)
   end)
 
   -- Every hook payload names the session it came from. Recording it makes the
