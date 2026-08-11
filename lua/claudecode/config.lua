@@ -146,12 +146,23 @@ M.defaults = {
       border = "rounded",
       cascade_offset = 2, -- rows/columns each stacked float is offset by
     },
+    -- `gf` in the sessions pane: read this project's transcripts for what was
+    -- said in them. There is no index — every query past the debounce re-reads
+    -- the store and is cancelled by the next keystroke — so these two settings
+    -- are what that costs.
+    search = {
+      debounce_ms = 150, -- how long typing has to settle before a scan starts
+      max_per_session = 3, -- match lines shown per conversation; a scan stops there
+    },
     keymaps = {
       select = "<CR>",
       new = "a",
       stop = "x", -- stop the running agent (keeps the conversation)
       delete = "dd", -- delete the conversation from disk, after a confirmation
       refresh = "r", -- re-read the sessions, and re-sort the list
+      -- Search the conversations for what was said in them. Sessions pane only:
+      -- `gf` opens a file in the other two panes, and no pane offers both.
+      search = "gf",
       sort = "gs", -- choose what the list is ordered by (it does not re-sort itself)
       close = "q",
       open = "<CR>", -- open the file under the cursor (Activity / Changes panes)
@@ -615,6 +626,17 @@ function M.validate(config)
       check_sessions("foreign", is_boolean, "must be a boolean")
     end
 
+    if ag.search ~= nil then
+      assert(type(ag.search) == "table", "agents.search must be a table")
+      local check_search = checker(ag.search, "agents.search")
+      check_search("debounce_ms", function(v)
+        -- 0 is "scan on every keystroke", which is allowed: the run is cancelled
+        -- by the next one anyway, so it costs latency rather than correctness.
+        return type(v) == "number" and v >= 0
+      end, "must be a number of milliseconds")
+      check_search("max_per_session", is_positive, "must be a positive number")
+    end
+
     M.validate_float(ag.float, "agents.float")
 
     if ag.keymaps ~= nil then
@@ -625,6 +647,7 @@ function M.validate(config)
         "stop",
         "delete",
         "refresh",
+        "search",
         "sort",
         "close",
         "open",
@@ -657,6 +680,7 @@ function M.validate(config)
         "normal_nc",
         "header",
         "key",
+        "match",
       }
       for _, field in ipairs(highlight_fields) do
         checker(ag.highlights, "agents.highlights")(field, function(v)

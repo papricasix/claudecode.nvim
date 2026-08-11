@@ -1022,6 +1022,435 @@ function M.events(path)
 end
 
 --------------------------------------------------------------------------------
+-- Search
+--------------------------------------------------------------------------------
+
+--- Lines above this are not searched. A transcript's bulk is tool output — one
+--- real 490KB file here is a single 188KB line — and tool results are not what a
+--- search of the conversation means, so the cap is a promise that a keystroke
+--- never hands the decoder a file's worth of Bash output.
+local SEARCH_LINE_LIMIT = 256 * 1024
+
+--- How much of a matching line a result row shows, in bytes.
+local SNIPPET_WIDTH = 88
+
+local ELLIPSIS = "…"
+
+---Compile a query into something that can be run against a string.
+---
+---Smartcase, and **literal**: the query is matched verbatim, so a `.` or a `-` in
+---a path behaves the way it looks. Case-insensitivity is compiled into a Lua
+---pattern (`[aA]`) rather than done by lowering the haystack, because the haystack
+---here is every line of every transcript and a lowered copy of each is an
+---allocation per line for nothing.
+---@param query string
+---@return { query: string, plain: boolean, find: fun(hay: string, init: integer|nil): integer|nil, integer|nil }|nil
+function M.compile_query(query)
+  if type(query) ~= "string" or query == "" then
+    return nil
+  end
+  -- The user typing a capital is the user asking for case to matter.
+  local plain = query:find("%u") ~= nil
+  local pattern = nil
+  if not plain then
+    pattern = query:gsub("[%^%$%(%)%%%.%[%]%*%+%-%?]", "%%%0"):gsub("%a", function(char)
+      return "[" .. char:lower() .. char:upper() .. "]"
+    end)
+  end
+  return {
+    query = query,
+    plain = plain,
+    find = function(hay, init)
+      if plain then
+        return hay:find(query, init, true)
+      end
+      return hay:find(pattern, init)
+    end,
+  }
+end
+
+---Back up `at` to the start of the UTF-8 sequence it lands in.
+---@param text string
+---@param at integer 1-based byte index.
+---@return integer
+local function utf8_floor(text, at)
+  while at > 1 and at <= #text do
+    local byte = text:byte(at)
+    if not byte or byte < 0x80 or byte >= 0xC0 then
+      break
+    end
+    at = at - 1
+  end
+  return at
+end
+
+---Drop a trailing partial UTF-8 sequence, so a windowed snippet is still text.
+---@param text string
+---@return string
+local function utf8_trim_tail(text)
+  local at = #text
+  local scanned = 0
+  while at > 0 and scanned < 4 do
+    local byte = text:byte(at)
+    if byte < 0x80 then
+      return text
+    end
+    if byte >= 0xC0 then
+      local need = (byte >= 0xF0 and 4) or (byte >= 0xE0 and 3) or 2
+      if #text - at + 1 >= need then
+        return text
+      end
+      return text:sub(1, at - 1)
+    end
+    at = at - 1
+    scanned = scanned + 1
+  end
+  return text
+end
+
+---The one line of `text` a match falls on, windowed to a readable width.
+---
+---A message is a document; a result row is a line. So the match is shown in its
+---own line of that document, with the rest of it cut away — from the *inside* when
+---the line is long, since the whole point is to show the words around the match.
+---@param text string
+---@param s integer 1-based byte start of the match.
+---@param e integer 1-based byte end of the match, inclusive.
+---@param width integer|nil
+---@return string snippet
+---@return integer col 0-based byte offset of the match within the snippet.
+---@return integer len Byte length of the match within the snippet.
+function M._snippet(text, s, e, width)
+  width = width or SNIPPET_WIDTH
+
+  local at = 0
+  while true do
+    local nl = text:find("\n", at + 1, true)
+    if not nl or nl >= s then
+      break
+    end
+    at = nl
+  end
+  local line_start = at + 1
+  local nl_after = text:find("\n", e, true)
+  local line_end = nl_after and (nl_after - 1) or #text
+
+  local line = text:sub(line_start, line_end):gsub("[\t\r]", " ")
+  local rel_s = s - line_start + 1
+  local rel_e = e - line_start + 1
+
+  local lead = #(line:match("^%s*") or "")
+  if lead > 0 and lead < rel_s then
+    line = line:sub(lead + 1)
+    rel_s, rel_e = rel_s - lead, rel_e - lead
+  end
+
+  if #line <= width then
+    return line, rel_s - 1, rel_e - rel_s + 1
+  end
+
+  -- A third of the window ahead of the match, so there is context on both sides
+  -- of it rather than the match sitting on the left edge.
+  local from = math.max(1, rel_s - math.floor(width / 3))
+  from = utf8_floor(line, from)
+  local piece = utf8_trim_tail(line:sub(from, from + width - 1))
+  local prefix = from > 1 and ELLIPSIS or ""
+  local suffix = (from + #piece - 1) < #line and ELLIPSIS or ""
+  local col = #prefix + (rel_s - from)
+  local len = rel_e - rel_s + 1
+  -- A match cut off by the window is highlighted only as far as the snippet goes.
+  len = math.max(0, math.min(len, #prefix + #piece - col))
+  return prefix .. piece .. suffix, col, len
+end
+
+--- The `tool_use` input fields worth reading first, in this order. Everything
+--- else a tool takes is read after them, alphabetically — `pairs` order is not
+--- stable, and a result list that reorders itself between identical queries is
+--- worse than one that is occasionally in a dull order.
+local TOOL_FIELDS = { "command", "prompt", "description", "new_string", "old_string", "content", "pattern", "query" }
+
+--- Fields skipped in a `tool_use` input: the file a call names is reported by its
+--- `toolUseResult` as a `file` match, which is the canonical one. Reading both
+--- would spend a session's whole cap saying the same path twice.
+local TOOL_SKIP = { file_path = true, path = true, notebook_path = true, filePath = true }
+
+---The string fields of a tool call, in a stable, useful order.
+---@param input table
+---@return string[]
+function M._tool_fields(input)
+  local seen, order = {}, {}
+  for _, field in ipairs(TOOL_FIELDS) do
+    if type(input[field]) == "string" and not TOOL_SKIP[field] then
+      seen[field] = true
+      order[#order + 1] = field
+    end
+  end
+  local rest = {}
+  for field, value in pairs(input) do
+    if type(value) == "string" and not seen[field] and not TOOL_SKIP[field] then
+      rest[#rest + 1] = field
+    end
+  end
+  table.sort(rest)
+  for _, field in ipairs(rest) do
+    order[#order + 1] = field
+  end
+  return order
+end
+
+--- What a session's few rows are spent on, best first. A conversation is looked
+--- for by what was **said** in it; the file it touched is the next strongest
+--- claim, then what it ran, and last what it was reasoning about.
+---
+--- This is a global order, not a per-entry one, and it has to be: measured on
+--- this project's real store, "windows" matches 26 thinking lines and 6 message
+--- lines, so whichever came first in the file would otherwise take every row and
+--- the sentence the user actually wrote would never be shown.
+M.SEARCH_KINDS = { "message", "file", "tool", "thinking" }
+
+---An empty per-kind bag of matches.
+---@return table<string, table[]>
+local function new_bag()
+  local bag = {}
+  for _, kind in ipairs(M.SEARCH_KINDS) do
+    bag[kind] = {}
+  end
+  return bag
+end
+
+---Whether a scan can stop: nothing later in the file could improve this answer.
+---
+---Either the top tiers are full — no lower-tier match would be shown anyway — or
+---enough of anything has been found that reading on is not worth it. Without the
+---second bound a thinking-heavy transcript would always be read to the end.
+---@param bag table<string, table[]>
+---@param limit integer
+---@return boolean
+local function bag_done(bag, limit)
+  if #bag.message + #bag.file >= limit then
+    return true
+  end
+  local total = 0
+  for _, kind in ipairs(M.SEARCH_KINDS) do
+    total = total + #bag[kind]
+  end
+  return total >= limit * 3
+end
+
+---The rows a bag is worth, best tier first.
+---@param bag table<string, table[]>
+---@param limit integer
+---@return table[]
+local function bag_matches(bag, limit)
+  local out = {}
+  for _, kind in ipairs(M.SEARCH_KINDS) do
+    for _, match in ipairs(bag[kind]) do
+      if #out >= limit then
+        return out
+      end
+      out[#out + 1] = match
+    end
+  end
+  return out
+end
+
+---@param bag table<string, table[]>
+---@param match table
+---@param limit integer
+local function keep(bag, match, limit)
+  local bucket = bag[match.kind]
+  -- More than `limit` of one kind can never be shown, so they are not kept.
+  if bucket and #bucket < limit then
+    bucket[#bucket + 1] = match
+  end
+end
+
+---@param entry table Decoded transcript line.
+---@param matcher table From `compile_query`.
+---@param bag table<string, table[]> Matches so far, by kind.
+---@param limit integer
+local function search_entry(entry, matcher, bag, limit)
+  local ts = M._iso_to_epoch(entry.timestamp)
+
+  -- A tool result is not the conversation, so its output is not searched — but the
+  -- file it names is: "which session touched lockfile.lua" is the same question the
+  -- Changes pane answers, and this is the entry that answers it.
+  local result = entry.toolUseResult
+  if type(result) == "table" then
+    local path = result.filePath
+    if type(path) ~= "string" and type(result.file) == "table" then
+      path = result.file.filePath
+    end
+    if type(path) == "string" then
+      local s, e = matcher.find(path)
+      if s then
+        keep(bag, { kind = "file", text = path, col = s - 1, len = e - s + 1, ts = ts }, limit)
+      end
+    end
+    return
+  end
+
+  local role = entry.type
+  if role ~= "user" and role ~= "assistant" then
+    return
+  end
+  local content = type(entry.message) == "table" and entry.message.content or nil
+
+  -- What the turn said, what it did, and what it was reasoning about. Which of
+  -- those is worth a row is decided once, over the whole file, by the tier order
+  -- above — not here, where only this entry is in view.
+  local candidates = {}
+  local function candidate(kind, text, tool, field)
+    candidates[#candidates + 1] = { kind = kind, text = text, tool = tool, field = field }
+  end
+
+  if type(content) == "string" then
+    candidate("message", content)
+  elseif type(content) == "table" then
+    for _, block in ipairs(content) do
+      if type(block) == "table" then
+        if block.type == "text" and type(block.text) == "string" then
+          candidate("message", block.text)
+        elseif block.type == "thinking" and type(block.thinking) == "string" then
+          candidate("thinking", block.thinking)
+        elseif block.type == "tool_use" and type(block.input) == "table" then
+          for _, field in ipairs(M._tool_fields(block.input)) do
+            candidate("tool", block.input[field], block.name, field)
+          end
+        end
+      end
+    end
+  end
+
+  for _, item in ipairs(candidates) do
+    local s, e = matcher.find(item.text)
+    if s then
+      local snippet, col, len = M._snippet(item.text, s, e)
+      keep(bag, {
+        kind = item.kind,
+        role = role,
+        tool = item.tool,
+        field = item.field,
+        text = snippet,
+        col = col,
+        len = len,
+        ts = ts,
+      }, limit)
+    end
+  end
+end
+
+---Search one transcript, calling back with up to `limit` matches.
+---
+---Cancellable and chunked, like every other read here: the caller cancels the
+---whole run on the next keystroke, and a cancelled scan answers nobody.
+---
+---The prefilter runs against the **raw JSON line**, which is what makes this cheap
+---enough to run per keystroke with no index — a line that does not contain the
+---query at all is never decoded. The cost is JSON's own escaping: a query
+---containing a quote, a backslash or a newline is spelled differently in the file
+---than it is in the message, so it will not be found. Ordinary words, paths and
+---identifiers — what a search of a conversation is actually made of — are spelled
+---the same either way.
+---@param path string Transcript path.
+---@param matcher table From `compile_query`.
+---@param opts { limit: integer|nil }|nil
+---@param cb fun(matches: table[])
+---@return { cancel: fun() } job
+function M.search(path, matcher, opts, cb)
+  opts = opts or {}
+  local limit = opts.limit or 3
+  local job = { cancelled = false }
+  job.cancel = function()
+    job.cancelled = true
+  end
+
+  local bag = new_bag()
+  local function answer()
+    if job.cancelled then
+      return
+    end
+    -- Through the scheduler for `file_history`'s reason: these callbacks land in a
+    -- libuv fast context, and what the caller does with matches is paint a window.
+    vim.schedule(function()
+      if not job.cancelled then
+        cb(bag_matches(bag, limit))
+      end
+    end)
+  end
+
+  if type(path) ~= "string" or not matcher then
+    answer()
+    return job
+  end
+  local st = M._io.stat(path)
+  if not st then
+    answer()
+    return job
+  end
+
+  local function scan_line(line)
+    if #line == 0 or #line > SEARCH_LINE_LIMIT or not matcher.find(line) then
+      return
+    end
+    local ok, entry = pcall(vim.json.decode, line)
+    if ok and type(entry) == "table" then
+      pcall(search_entry, entry, matcher, bag, limit)
+    end
+  end
+
+  local offset = 0
+  local function step()
+    if job.cancelled then
+      return
+    end
+    -- Enough found: the rest of the file cannot change what this row says.
+    if offset >= st.size or bag_done(bag, limit) then
+      answer()
+      return
+    end
+    local want = math.min(M._chunk_size, st.size - offset)
+    M._io.read(path, offset, want, function(data)
+      if job.cancelled then
+        return
+      end
+      if not data or data == "" then
+        answer()
+        return
+      end
+      local consumed, start = 0, 1
+      while true do
+        local nl = data:find("\n", start, true)
+        if not nl then
+          break
+        end
+        scan_line(data:sub(start, nl - 1))
+        consumed, start = nl, nl + 1
+      end
+      if consumed == 0 then
+        -- No line boundary in a whole chunk, so this line is longer than one —
+        -- which puts it past `SEARCH_LINE_LIMIT` by definition. `fold_chunks`
+        -- pulls such a line in whole because it has something to fold; here there
+        -- is nothing to look at, so walk over it a slice at a time instead of
+        -- holding a quarter-megabyte of Bash output to throw away.
+        if st.size - offset <= want then
+          answer()
+          return
+        end
+        offset = offset + want
+        step()
+        return
+      end
+      offset = offset + consumed
+      step()
+    end)
+  end
+  step()
+
+  return job
+end
+
+--------------------------------------------------------------------------------
 -- One file's history within one session
 --------------------------------------------------------------------------------
 

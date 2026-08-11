@@ -122,6 +122,22 @@ local function keymaps()
   return opts().keymaps or {}
 end
 
+---A directory that still exists, or nil.
+---
+---A row records the directory its conversation *ran* in, and a rename or a move
+---can have taken that directory away from under it — every transcript of a moved
+---project names a path that is gone. Starting a CLI there is not a near miss but
+---an outright failure (`termopen` refuses a cwd it cannot enter), so a recorded
+---path is only used while it is real.
+---@param path string|nil
+---@return string|nil
+local function usable_dir(path)
+  if type(path) ~= "string" or path == "" then
+    return nil
+  end
+  return vim.fn.isdirectory(vim.fn.expand(path)) == 1 and path or nil
+end
+
 --- Forward-declared: `setup` registers a frame listener that calls this, and a
 --- `local function` declared further down the file would not be in scope there —
 --- the reference resolves to a nil global instead, and the listener then dies
@@ -557,6 +573,17 @@ local KEY_SPECS = {
     end,
     visual = function()
       M.delete_visual()
+    end,
+  },
+  {
+    field = "search",
+    -- The sessions pane alone. `gf` opens a *file* in the other two, and the same
+    -- key can mean two things in one view only because no pane is offered both.
+    panes = { "sessions" },
+    group = "Sessions",
+    desc = "Search these conversations for what was said in them",
+    run = function()
+      M.show_search()
     end,
   },
   {
@@ -1159,6 +1186,13 @@ function M.close()
   end)
   pcall(function()
     require("claudecode.agents.help").close()
+  end)
+  -- The query outlives the picker but not the view, like the sort criterion: a
+  -- later sitting starts from a blank search rather than from an old one.
+  pcall(function()
+    local search = require("claudecode.agents.search")
+    search.close(true)
+    search.reset()
   end)
 
   if opts().kill_on_close then
@@ -1911,6 +1945,94 @@ function M.cycle_session(delta)
   M.redraw()
 end
 
+---Select a session without starting anything: what cycling does, from an id.
+---
+---The panes all follow the selection, so this is "look at that conversation" —
+---and it is what the search picker calls as the highlighted row moves, which is
+---why it must stay as cheap as `<C-n>` is.
+---@param session_id string
+function M.preview_session(session_id)
+  if not M.is_open() or type(session_id) ~= "string" then
+    return
+  end
+  model.select(session_id)
+  reveal_session(session_id)
+  show_or_offer(session_id)
+  M.redraw()
+end
+
+---Select a session and land in it, resuming it if it is not running.
+---
+---`focus_term`'s intent — "put me in this session" — reached from an id rather
+---than from the offer on screen. This is what choosing a search result does:
+---searching for a conversation is looking for one to work in, so it does the
+---starting that merely moving the selection deliberately does not.
+---@param session_id string
+function M.enter_session(session_id)
+  if not M.is_open() or type(session_id) ~= "string" then
+    return
+  end
+  M.select(session_id)
+  -- `select` jumps tabs for a conversation running elsewhere; following it with a
+  -- focus of our centre pane would drag the user straight back out of it.
+  if vim.api.nvim_get_current_tabpage() ~= state.tab then
+    return
+  end
+  reveal_session(session_id)
+  M.focus_terminal()
+end
+
+---Search this project's conversations, and select the one you pick.
+---
+---The selection follows the highlighted result while the picker is open, so
+---cancelling has to put back the conversation that was selected when it opened —
+---otherwise browsing would leave the panes on whatever you happened to scroll
+---past. Only `<CR>` commits.
+function M.show_search()
+  if not M.is_open() then
+    return
+  end
+  local ok, search = pcall(require, "claudecode.agents.search")
+  if not ok then
+    return
+  end
+
+  local sessions = {}
+  for _, row in ipairs(model.rows()) do
+    sessions[#sessions + 1] = {
+      session_id = row.session_id,
+      title = row.title,
+      icon = row.icon,
+      hl = row.hl,
+      path = model.transcript_path(row.session_id),
+    }
+  end
+  if #sessions == 0 then
+    vim.notify("ClaudeCode: no conversations to search yet", vim.log.levels.INFO)
+    return
+  end
+
+  local restore = model.selected()
+  local settings = opts().search or {}
+  search.open({
+    sessions = sessions,
+    query = search.last_query(),
+    limit = settings.max_per_session,
+    debounce_ms = settings.debounce_ms,
+    on_preview = function(session_id)
+      M.preview_session(session_id)
+    end,
+    on_accept = function(session_id)
+      M.enter_session(session_id)
+    end,
+    on_cancel = function()
+      if restore then
+        M.preview_session(restore)
+      end
+    end,
+  })
+end
+
 ---Show a conversation in the centre pane, resuming it if it is not already live.
 ---@param session_id string
 function M.select(session_id)
@@ -1944,7 +2066,10 @@ function M.select(session_id)
   local term, err = registry.launch(session_id, {
     win = center,
     tab = state.tab,
-    cwd = (row and row.cwd) or model.cwd(),
+    -- The view's own cwd is where the user is now, and for a moved project it is
+    -- where these transcripts live — so it is the right place to fall back to
+    -- when the row names a directory that no longer exists.
+    cwd = usable_dir(row and row.cwd) or model.cwd(),
     -- `--resume` needs a transcript to read, and a conversation that was started
     -- and then stopped before its first message has none — it is a name, not yet
     -- a conversation, and it is off the list because nothing enumerates it. Such
@@ -2552,11 +2677,60 @@ end
 ---Fold one Claude Code hook event into the view.
 ---@param event table Decoded hook payload.
 ---@param source_tab integer|nil
-function M.note(event, source_tab)
+---@param agent_id string|nil Launch key of the agent that reported it, if it is one.
+function M.note(event, source_tab, agent_id)
   if not M.is_enabled() then
     return
   end
+  if type(event) == "table" then
+    -- `SessionStart` is the CLI stating which conversation it is having; every
+    -- other event merely mentions one, and may well be a late report from the
+    -- conversation this agent has just left.
+    M.note_session_switch(agent_id, event.session_id, {
+      reclaim = event.hook_event_name == "SessionStart",
+    })
+  end
   model.note(event, source_tab)
+end
+
+---A running agent is having a different conversation than it was.
+---
+---`/clear` ends the chat and starts another one under a fresh id in the same
+---terminal — the process, the port and the buffer all carry on. Everything in
+---this view is keyed by conversation, so until this runs the list describes a
+---chat that has been abandoned: the old row keeps its running bullet, and the new
+---conversation shows up minutes later (whenever the CLI first writes its
+---transcript) as a row that looks stopped, which is what a user sees as "a new
+---session appeared and it is not active".
+---
+---The selection follows the terminal, but only if it was on the conversation
+---being left: the centre pane is showing that terminal, and leaving the panes
+---describing the old chat while the terminal shows the new one is the same lie
+---one level down. A selection parked on some other agent is the user's and is not
+---moved.
+---@param agent_id string|nil
+---@param session_id string|nil
+---@param switch_opts { reclaim: boolean? }|nil
+---@return boolean moved
+function M.note_session_switch(agent_id, session_id, switch_opts)
+  local previous = registry.rekey(agent_id, session_id, switch_opts)
+  if not previous then
+    return false
+  end
+  local follow = model.note_session_change(previous, session_id)
+  -- Straight away rather than on the next poll: the CLI writes no transcript for
+  -- the new conversation until its first message, so it is listed from the
+  -- registry until then — and a row is the only way back to it.
+  model.refresh_list()
+  if follow then
+    if M.is_open() then
+      M.select(session_id)
+    else
+      model.select(session_id)
+    end
+  end
+  M.redraw()
+  return true
 end
 
 ---An agent's terminal ended.

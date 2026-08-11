@@ -1034,7 +1034,9 @@ describe("agents_view", function()
       setup_with({ enabled = true })
       expect(keys_for("changes")["gf"]).to_be_string()
       expect(keys_for("feed")["gf"]).to_be_string()
-      expect(keys_for("sessions")["gf"]).to_be(nil) -- a session row is not a file
+      -- A session row is not a file, so `gf` is free there and means the other
+      -- thing you might go looking for: the conversation itself.
+      expect(keys_for("sessions")["gf"]).to_be("Search these conversations for what was said in them")
     end)
 
     it("offers the sort menu from every pane that shows the list", function()
@@ -1205,6 +1207,91 @@ describe("agents_view", function()
       agents_view.setup(base_config({ enabled = false }))
       local ok = pcall(agents_view.note, { hook_event_name = "PostToolUse", tool_name = "Edit", session_id = "x" })
       expect(ok).to_be_true()
+    end)
+  end)
+
+  describe("an agent that ran /clear", function()
+    local rekeyed, changed, selected, refreshed
+
+    before_each(function()
+      rekeyed, changed, selected, refreshed = {}, {}, {}, 0
+
+      package.loaded["claudecode.agents.registry"] = {
+        -- The launch key is what stays put; the conversation is what moves.
+        rekey = function(agent_key, session_id, opts)
+          rekeyed[#rekeyed + 1] = { agent_key, session_id, opts and opts.reclaim }
+          return agent_key == "1:old" and "old" or nil
+        end,
+        is_live = function()
+          return false
+        end,
+        live_ids = function()
+          return {}
+        end,
+      }
+      package.loaded["claudecode.agents.model"] = {
+        setup = function() end,
+        on_change = function() end,
+        note = function() end,
+        note_session_change = function(previous, session_id)
+          changed[#changed + 1] = { previous, session_id }
+          return previous == "old"
+        end,
+        refresh_list = function()
+          refreshed = refreshed + 1
+        end,
+        select = function(session_id)
+          selected[#selected + 1] = session_id
+        end,
+        set_armed = function() end,
+      }
+
+      package.loaded["claudecode.agents_view"] = nil
+      agents_view = require("claudecode.agents_view")
+      agents_view.setup(base_config({ enabled = true }))
+    end)
+
+    after_each(function()
+      package.loaded["claudecode.agents.registry"] = nil
+      package.loaded["claudecode.agents.model"] = nil
+      package.loaded["claudecode.agents_view"] = nil
+    end)
+
+    it("moves the agent onto the conversation the hook reports", function()
+      agents_view.note({ hook_event_name = "SessionStart", session_id = "new" }, 1, "1:old")
+      expect(#rekeyed).to_be(1)
+      expect(rekeyed[1][1]).to_be("1:old")
+      expect(rekeyed[1][2]).to_be("new")
+      expect(changed[1][1]).to_be("old")
+      expect(changed[1][2]).to_be("new")
+    end)
+
+    it("lists it at once rather than on the next poll", function()
+      -- No transcript exists until the first message, so nothing on disk would
+      -- turn the running agent up.
+      agents_view.note({ hook_event_name = "SessionStart", session_id = "new" }, 1, "1:old")
+      expect(refreshed).to_be(1)
+    end)
+
+    it("takes the selection with it when it was on the old conversation", function()
+      agents_view.note({ hook_event_name = "SessionStart", session_id = "new" }, 1, "1:old")
+      expect(selected[1]).to_be("new")
+    end)
+
+    it("only lets a SessionStart claim a conversation the agent already left", function()
+      -- Every other event may be a late report from the chat it just abandoned;
+      -- the two events describing a /clear arrive in either order.
+      agents_view.note({ hook_event_name = "SessionStart", session_id = "new" }, 1, "1:old")
+      agents_view.note({ hook_event_name = "SessionEnd", session_id = "old" }, 1, "1:old")
+      expect(rekeyed[1][3]).to_be_true()
+      expect(rekeyed[2][3]).to_be(false)
+    end)
+
+    it("does nothing for a launch it does not know, or one that has not moved", function()
+      agents_view.note({ hook_event_name = "SessionStart", session_id = "new" }, 1, "9:other")
+      agents_view.note({ hook_event_name = "SessionStart", session_id = "x" }, 1, nil)
+      expect(#changed).to_be(0)
+      expect(refreshed).to_be(0)
     end)
   end)
 end)

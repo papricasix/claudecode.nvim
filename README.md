@@ -261,6 +261,20 @@ there too.
   is where that order is stated — it names the direction in the criterion's own
   words ("newest first", "A → Z"). The choice lasts as long as the view is open;
   the next open starts from `agents.sessions.sort` again.
+- `gf` in the sessions pane **searches the conversations themselves**: type, and
+  the sessions whose transcripts mention it are listed with the lines they
+  mention it in — what you said, what Claude said, the paths the session touched,
+  the commands it ran, and what it was thinking. Each row says which (`you`,
+  `claude`, `file`, `bash`, `think`). Tool _output_ is not searched, so a word is
+  a match because it was written or run, not because it scrolled past in a `Bash`
+  result. A session's few rows go to what was said first, so a talkative one does
+  not bury its own sentences under its reasoning. Matching is literal and
+  smartcase: lowercase finds any case, one capital makes case count.
+  `<C-n>`/`<C-j>` and `<C-p>`/`<C-k>` (or the arrows) move through the results and
+  the panes follow along, so you can read what a session did before committing;
+  `<CR>` selects it and puts you in it, resuming it if it is not running; `<Esc>`
+  puts the selection back where it was. The query survives the picker (reopening
+  starts from it, selected) but not the view.
 - `dd` deletes the session under the cursor after a confirmation dialog (a snacks.nvim float when you have it, `vim.fn.confirm` otherwise). This removes the conversation's transcript from disk, so it is gone for good and can no longer be resumed — from here or from the CLI. A session whose agent is still running is refused; stop it with `x` first.
 - **Several at once**: `dd` takes a count (`3dd` deletes three rows from the cursor down), and `d` over a visual selection deletes every session the selection covers. One dialog for the whole batch, naming the first few and counting the rest. A running agent inside the range is left alone rather than vetoing the gesture — the dialog says how many were skipped and which key stops them.
 - Switching agents leaves the previous one **running**. That is the point: start
@@ -335,7 +349,11 @@ Live state comes from Claude Code's lifecycle hooks when you already have
 [per-tab status](#per-tab-status) enabled, and otherwise from watching the
 transcripts, which costs nothing but lags the status dot by up to half a second.
 Force either with `agents = { source = "hooks" }` or `"poll"` — hooks run a
-headless Neovim per tool call, per running agent.
+headless Neovim per tool call, per running agent. Two hooks are registered
+either way: one when a plan is answered, and one when a session starts, which is
+how the view follows an agent that has run `/clear` (the CLI starts a new
+conversation in the same terminal, and nothing on disk says which agent it
+belongs to). That is one headless Neovim per `/clear`, not per tool call.
 
 <details>
 <summary>All agents options</summary>
@@ -402,8 +420,16 @@ opts = {
     resume_mode = "resume",       -- "resume" | "fork" (--fork-session)
     -- Overrides the top-level `float` block for agent-opened floats only.
     float = { width = 0.7, height = 0.7, border = "rounded", cascade_offset = 2 },
+    -- `gf` in the sessions pane: read the transcripts for what was said in them.
+    -- There is no index -- each query re-reads the store and is cancelled by the
+    -- next keystroke -- so these two settings are what a search costs.
+    search = {
+      debounce_ms = 150,          -- how long typing settles before a scan starts
+      max_per_session = 3,        -- match lines per conversation; a scan stops there
+    },
     keymaps = {
       select = "<CR>", new = "a", stop = "x", delete = "dd", refresh = "r",
+      search = "gf",              -- search the conversations (sessions pane)
       sort = "gs",                -- choose what the list is ordered by
       close = "q", open = "<CR>", git_diff = ".", goto_file = "gf", help = "?",
       next_pane = "<Tab>", focus_term = "i",

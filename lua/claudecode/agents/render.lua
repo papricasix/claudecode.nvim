@@ -65,6 +65,7 @@ local DEFAULT_HIGHLIGHTS = {
   normal_nc = "ClaudeCodeAgentsNormalNC",
   header = "ClaudeCodeAgentsHelpHeader",
   key = "ClaudeCodeAgentsKey",
+  match = "ClaudeCodeAgentsMatch",
 }
 
 local HIGHLIGHT_LINKS = {
@@ -86,6 +87,9 @@ local HIGHLIGHT_LINKS = {
   ClaudeCodeAgentsFloat = "FloatBorder",
   ClaudeCodeAgentsHelpHeader = "Title",
   ClaudeCodeAgentsKey = "Special",
+  -- What the search picker lights up inside a result. `Search` rather than
+  -- `IncSearch`: these are the matches, not the one being stepped onto.
+  ClaudeCodeAgentsMatch = "Search",
 }
 
 ---Where the panes take their background from.
