@@ -136,6 +136,41 @@ local function reuse_window(win, entry, buf, title, owned_buf)
   return win, buf
 end
 
+---The window a closing float should hand insert mode back to, or nil.
+---
+---**The current window is only the answer when it actually holds a terminal.**
+---A float is often opened from inside `nvim_win_call`, which makes another
+---window current for the duration while leaving the mode alone — so `mode()`
+---still says `t` while `nvim_get_current_win()` names a window the user is not
+---in. Recording that window meant the restore below never matched the window
+---focus came back to, and the terminal stayed in normal mode. A caller that
+---knows it is about to spoof the current window passes `term_win` itself.
+---@return integer|nil win
+function M.terminal_mode_window()
+  if vim.fn.mode() ~= "t" then
+    return nil
+  end
+  local win = vim.api.nvim_get_current_win()
+  local ok, buf = pcall(vim.api.nvim_win_get_buf, win)
+  if ok and buf and vim.bo[buf].buftype == "terminal" then
+    return win
+  end
+  return nil
+end
+
+---@param win integer|nil A window a caller offered as the one to return to.
+---@return integer|nil win nil unless it is a live window showing a terminal.
+local function valid_terminal_window(win)
+  if not win or not vim.api.nvim_win_is_valid(win) then
+    return nil
+  end
+  local ok, buf = pcall(vim.api.nvim_win_get_buf, win)
+  if ok and buf and vim.bo[buf].buftype == "terminal" then
+    return win
+  end
+  return nil
+end
+
 ---Put the terminal a float interrupted back into insert mode when it closes.
 ---
 ---Answering a diff and dismissing it hands focus back to the Claude terminal the
@@ -187,14 +222,16 @@ end
 ---the float at all.
 ---@param opts { session_id: string?, title: string?, buf: integer?, reuse: integer?,
 ---             float_opts: table?, border_hl: string?, tags: table<string, any>?,
----             purpose: string? }|nil
+---             purpose: string?, term_win: integer? }|nil
 ---@return integer|nil win
 ---@return integer|nil buf
 function M.create(opts)
   opts = opts or {}
   -- Read before the float opens: entering it leaves terminal-mode, so by the
-  -- time the window exists there is nothing left to notice.
-  local term_win = vim.fn.mode() == "t" and vim.api.nvim_get_current_win() or nil
+  -- time the window exists there is nothing left to notice. A caller that is
+  -- inside `nvim_win_call` has to say which window that was; see
+  -- `terminal_mode_window`.
+  local term_win = valid_terminal_window(opts.term_win) or M.terminal_mode_window()
   local buf = opts.buf
   -- Whether the buffer is ours to put keymaps on; see `bind_close`.
   local owned_buf = false
@@ -450,6 +487,29 @@ function M.close_all(session_id, purpose)
     end
     return purpose == nil or entry.purpose == purpose
   end)
+end
+
+---A conversation was renamed under an open float.
+---
+---An agent that runs `/clear` keeps its floats — they are windows on work it has
+---already done — but the conversation that asked for them now goes by a
+---different id, and `close_all` is what takes them down when the agent ends. A
+---float left under the old name would outlive its agent.
+---@param old_session_id string
+---@param session_id string
+---@return integer retagged
+function M.retag(old_session_id, session_id)
+  if type(old_session_id) ~= "string" or type(session_id) ~= "string" then
+    return 0
+  end
+  local moved = 0
+  for _, entry in ipairs(floats) do
+    if entry.session_id == old_session_id then
+      entry.session_id = session_id
+      moved = moved + 1
+    end
+  end
+  return moved
 end
 
 ---Close everything.

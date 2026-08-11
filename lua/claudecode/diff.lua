@@ -207,8 +207,11 @@ M._find_main_editor_window = find_main_editor_window
 ---The float is titled with the agent that asked, which is the only way to tell
 ---several agents' diffs apart on one screen.
 ---@param file_path string|nil Shown in the float's title.
+---@param term_win integer|nil The terminal the user was typing in, noticed before
+---       `in_owning_tab` made another window current; the float hands insert mode
+---       back to it when it closes.
 ---@return integer|nil win nil when a normal editor window should be used.
-function M._float_window_for_diff(file_path)
+function M._float_window_for_diff(file_path, term_win)
   local wants_float = config and config.diff_opts and config.diff_opts.layout == "float"
 
   -- A float holds one buffer, which is exactly what the unified provider needs:
@@ -241,6 +244,7 @@ function M._float_window_for_diff(file_path)
     file_path = file_path,
     owner = owner,
     purpose = "diff",
+    term_win = term_win,
   })
 end
 
@@ -252,7 +256,7 @@ end
 ---and is configured by the top-level `float` block. Before they were split, a
 ---user with agents disabled was sizing their diffs through `agents.float`.
 ---@param opts { session_id: string?, file_path: string?, owner: table?, purpose: string?,
----             title: string? }
+---             title: string?, term_win: integer? }
 ---@return integer|nil win
 function M.open_float(opts)
   opts = opts or {}
@@ -272,9 +276,23 @@ function M.open_float(opts)
       return nil
     end
     -- Parenthesised: `create` also hands back the buffer, and this returns a window.
-    return (float.create({ session_id = opts.session_id, title = title, purpose = opts.purpose }))
+    return (
+      float.create({
+        session_id = opts.session_id,
+        title = title,
+        purpose = opts.purpose,
+        term_win = opts.term_win,
+      })
+    )
   end
-  return (float.create_for({ session_id = opts.session_id, title = title, purpose = opts.purpose }))
+  return (
+    float.create_for({
+      session_id = opts.session_id,
+      title = title,
+      purpose = opts.purpose,
+      term_win = opts.term_win,
+    })
+  )
 end
 
 ---Where a file should go, for every caller that has to put one somewhere.
@@ -1826,6 +1844,13 @@ function M._setup_blocking_diff_unified(params, resolution_callback)
 
   dismiss_live_cursor_preview(params.old_file_path)
 
+  -- Read here, not inside the float: the work below runs under `in_owning_tab`,
+  -- which makes a window of the owning tab current for the duration, so a float
+  -- opened in there sees that window rather than the terminal the user is
+  -- actually typing in. Without this the float has no terminal to give insert
+  -- mode back to when the diff is answered.
+  local term_win = require("claudecode.float").terminal_mode_window()
+
   local setup_success, setup_error = pcall(function()
     ensure_unified_initialized()
     local unified_diff = require("unified.diff")
@@ -1856,7 +1881,7 @@ function M._setup_blocking_diff_unified(params, resolution_callback)
     -- already on screen is not.
     local float_window = nil
     local owning_tab = in_owning_tab(function(tab)
-      target_window = M._float_window_for_diff(params.old_file_path)
+      target_window = M._float_window_for_diff(params.old_file_path, term_win)
       float_window = target_window
       if not target_window then
         target_window = find_window_adjacent_to_terminal()

@@ -64,7 +64,8 @@ end
 ---The routing seam knows only the module name a tab put on its layout
 ---descriptor, so this is the adapter onto this wrapper's own signature — the
 ---seam never learns that agents mode exists.
----@param opts { session_id: string?, title: string?, purpose: string?, buf: integer?, reuse: integer? }
+---@param opts { session_id: string?, title: string?, purpose: string?, buf: integer?,
+---             reuse: integer?, term_win: integer? }
 ---@return integer|nil win
 ---@return integer|nil buf
 function M.create_for(opts)
@@ -75,6 +76,7 @@ function M.create_for(opts)
     buf = opts.buf,
     reuse = opts.reuse,
     purpose = opts.purpose,
+    term_win = opts.term_win,
     float_opts = float_opts(),
     border_hl = border_hl(),
     tags = TAGS,
@@ -103,6 +105,7 @@ M.jump_to = base.jump_to
 M.bind_close = base.bind_close
 M.close = base.close
 M.close_all = base.close_all
+M.retag = base.retag
 M.close_every = base.close_every
 M.focus_next = base.focus_next
 M.list = base.list

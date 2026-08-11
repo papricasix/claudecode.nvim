@@ -203,6 +203,65 @@ describe("float", function()
       expect(vim._last_command).to_be_nil()
     end)
 
+    it("ignores a current window that is not a terminal", function()
+      -- A diff float is opened from inside `nvim_win_call`, which makes another
+      -- window current for the duration while leaving the mode alone: `mode()`
+      -- still says `t` and `nvim_get_current_win()` names a window the user is
+      -- not in. Recording that one meant the restore never matched the window
+      -- focus came back to.
+      float.setup(base_config())
+      local term_win = terminal_window()
+      local other = vim.api.nvim_open_win(
+        vim.api.nvim_create_buf(false, true),
+        true,
+        { relative = "editor", width = 10, height = 5, row = 0, col = 0 }
+      )
+      vim.fn.mode = function()
+        return "t"
+      end
+
+      expect(float.terminal_mode_window()).to_be_nil()
+      vim.api.nvim_set_current_win(term_win)
+      expect(float.terminal_mode_window()).to_be(term_win)
+      expect(other).not_to_be_nil()
+    end)
+
+    it("takes the terminal the caller noticed before the spoof", function()
+      -- Which is why `_setup_blocking_diff_unified` reads it before entering
+      -- `in_owning_tab` and hands it over.
+      float.setup(base_config())
+      local term_win = terminal_window()
+      vim.api.nvim_open_win(
+        vim.api.nvim_create_buf(false, true),
+        true,
+        { relative = "editor", width = 10, height = 5, row = 0, col = 0 }
+      )
+      vim.fn.mode = function()
+        return "t"
+      end
+
+      local win = float.create({ title = "a.lua", term_win = term_win })
+      vim.api.nvim_set_current_win(term_win)
+      float.close(win)
+
+      expect(vim._last_command).to_be("startinsert")
+    end)
+
+    it("refuses a handed-over window that is not a terminal", function()
+      float.setup(base_config())
+      local plain = vim.api.nvim_open_win(
+        vim.api.nvim_create_buf(false, true),
+        true,
+        { relative = "editor", width = 10, height = 5, row = 0, col = 0 }
+      )
+
+      local win = float.create({ title = "a.lua", term_win = plain })
+      vim.api.nvim_set_current_win(plain)
+      float.close(win)
+
+      expect(vim._last_command).to_be_nil()
+    end)
+
     it("does nothing when focus did not go back to that terminal", function()
       -- Floats stack: closing the top one often lands on another float, which
       -- will restore the mode itself when *it* closes.
@@ -230,6 +289,21 @@ describe("float", function()
       local existing = vim.api.nvim_create_buf(false, true)
       float.create({ title = "given", buf = existing })
       expect(float.list()[2].owned_buf).to_be(false)
+    end)
+  end)
+
+  describe("retag", function()
+    it("follows a conversation that was renamed under an open float", function()
+      -- An agent that runs /clear keeps its floats but goes by a new id, and
+      -- `close_all` — what takes them down when the agent ends — asks by id.
+      float.setup(base_config())
+      float.create({ session_id = "old", title = "a" })
+      float.create({ session_id = "other", title = "b" })
+
+      expect(float.retag("old", "new")).to_be(1)
+      expect(float.close_all("old")).to_be(0)
+      expect(float.close_all("new")).to_be(1)
+      expect(float.count()).to_be(1)
     end)
   end)
 
