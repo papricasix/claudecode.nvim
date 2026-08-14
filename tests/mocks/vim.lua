@@ -280,6 +280,11 @@ local vim = {
         else
           -- TODO: Consider if error handling for 'buffer not found' is needed for tests.
         end
+      elseif opts and opts.win then
+        -- The same store `vim.wo[win]` reads, so a spec can assert what a window
+        -- was given whichever of the two APIs set it. Without this a window
+        -- option landed in the *global* table and read back as everyone's.
+        vim.wo[opts.win][name] = value
       else
         vim._options[name] = value
       end
@@ -1427,6 +1432,20 @@ vim._current_window = 1000
 
 -- Global options table (minimal)
 vim.o = setmetatable({ columns = 120, lines = 40 }, {
+  __index = function(_, k)
+    return vim._options[k]
+  end,
+  __newindex = function(_, k, v)
+    vim._options[k] = v
+  end,
+})
+
+-- The *global* value of an option. Real Neovim distinguishes this from `vim.o`
+-- for a window-local option like 'wrap': `vim.o.wrap` is the current window's
+-- value, `vim.go.wrap` is the one the user set in their config. Code that wants
+-- the user's setting rather than whichever window happens to be current reads
+-- this, so the mock has to have it; here both are the same store.
+vim.go = setmetatable({}, {
   __index = function(_, k)
     return vim._options[k]
   end,

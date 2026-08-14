@@ -20,6 +20,7 @@
 local M = {}
 
 local logger = require("claudecode.logger")
+local utils = require("claudecode.utils")
 
 --- Cached `claudecode.diff` module — reused only for its canonical editor-window
 --- finder. `false` means a load attempt already failed (don't retry every event).
@@ -96,10 +97,10 @@ local function apply_marker(win)
   -- '%=' alignment items literal so they render as a centered, colored label.
   local label = (config.label or "● Claude plan"):gsub("%%", "%%%%")
   pcall(function()
-    vim.wo[win].winbar = "%#" .. hl .. "#%=" .. label .. "%="
+    utils.set_win_option(win, "winbar", "%#" .. hl .. "#%=" .. label .. "%=")
   end)
   pcall(function()
-    vim.wo[win].winhighlight = "WinSeparator:" .. hl
+    utils.set_win_option(win, "winhighlight", "WinSeparator:" .. hl)
   end)
 end
 

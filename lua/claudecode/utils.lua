@@ -3,6 +3,29 @@
 
 local M = {}
 
+---Set a window-local option **without touching the user's global value**.
+---
+---This is not a stylistic preference, it is the only correct way to configure a
+---window we made. `vim.wo[win].wrap = false` and `nvim_set_option_value(…, {win =
+---w})` both behave like `:set` rather than `:setlocal` **when `w` is the current
+---window** — they write the global value too, and every window opened afterwards
+---inherits it. Measured: opening the agents view (whose panes are configured
+---while each is current, and which turn `wrap`, `number`, `list` and `spell` off
+---because they draw fixed-width list rows) left the user's global `wrap=false
+---number=false list=false`, so every file they opened for the rest of the session
+---wore a list pane's settings. A float did the same, one option at a time.
+---
+---`scope = "local"` is the fix, and it is safe on a window that is not current
+---too, so this is used for every window option this plugin sets on its own
+---windows.
+---@param win integer
+---@param name string
+---@param value any
+---@return boolean ok
+function M.set_win_option(win, name, value)
+  return (pcall(vim.api.nvim_set_option_value, name, value, { win = win, scope = "local" }))
+end
+
 ---Normalizes focus parameter to default to true for backward compatibility
 ---@param focus boolean? The focus parameter
 ---@return boolean valid Whether the focus parameter is valid

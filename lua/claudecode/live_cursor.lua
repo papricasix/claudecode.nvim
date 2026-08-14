@@ -16,6 +16,7 @@
 local M = {}
 
 local logger = require("claudecode.logger")
+local utils = require("claudecode.utils")
 
 --- Cached `claudecode.diff` module — reused for window discovery, filetype
 --- detection, unified.nvim init, and the review-diff suppression check. `false`
@@ -633,7 +634,7 @@ local function set_winopt(win, name, value)
     return
   end
   pcall(function()
-    vim.wo[win][name] = value
+    utils.set_win_option(win, name, value)
   end)
 end
 
@@ -682,12 +683,12 @@ local function apply_preview_marker(win, info)
     local bar = (config.preview_align or "center") == "left" and ("%#" .. hl .. "#" .. label)
       or ("%#" .. hl .. "#%=" .. label .. "%=")
     did_winbar = pcall(function()
-      vim.wo[win].winbar = bar
+      utils.set_win_option(win, "winbar", bar)
     end)
   end
   if config.preview_divider ~= false then
     did_divider = pcall(function()
-      vim.wo[win].winhighlight = "WinSeparator:" .. hl
+      utils.set_win_option(win, "winhighlight", "WinSeparator:" .. hl)
     end)
   end
   logger.debug(

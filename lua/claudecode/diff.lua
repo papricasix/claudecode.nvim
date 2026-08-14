@@ -3,6 +3,7 @@
 local M = {}
 
 local logger = require("claudecode.logger")
+local utils = require("claudecode.utils")
 
 ---Tell the live-cursor feature to dismiss its ride-along preview before we build
 ---a review diff for `file_path`. Done first thing in diff setup so the preview
@@ -607,7 +608,10 @@ end
 ---@param options WindowOptions Window options to apply
 local function apply_window_options(win_id, options)
   for opt_name, opt_value in pairs(options) do
-    pcall(vim.api.nvim_set_option_value, opt_name, opt_value, { win = win_id })
+    -- Local scope: on a window that happens to be current, an unscoped write
+    -- behaves like `:set` and would leave these terminal-shaped values as the
+    -- user's globals. See `utils.set_win_option`.
+    utils.set_win_option(win_id, opt_name, opt_value)
   end
 end
 

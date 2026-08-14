@@ -30,6 +30,30 @@ describe("agents.float", function()
       expect(vim.w[win].claudecode_agents_float).to_be_true()
     end)
 
+    it("shows a file the way the user's own settings say to", function()
+      -- A float copies its window-local options from the *current* window, which
+      -- for these is an agents pane — and a pane turns `wrap`, `number` and the
+      -- rest off because it draws fixed-width list rows. Inherited, that left a
+      -- long line running off the right edge of a diff with no way to read it.
+      vim.go.wrap = true
+      vim.go.number = true
+      vim.go.list = true
+      vim.go.signcolumn = "yes"
+      local win = float.create("aaa", { title = "a.lua" })
+      expect(vim.wo[win].wrap).to_be_true()
+      expect(vim.wo[win].number).to_be_true()
+      expect(vim.wo[win].list).to_be_true()
+      expect(vim.wo[win].signcolumn).to_be("yes")
+    end)
+
+    it("follows the user the other way too", function()
+      vim.go.wrap = false
+      vim.go.number = false
+      local win = float.create("aaa", { title = "a.lua" })
+      expect(vim.wo[win].wrap).to_be_false()
+      expect(vim.wo[win].number).to_be_false()
+    end)
+
     it("remembers which conversation each float belongs to", function()
       float.create("aaa", { title = "a" })
       float.create("bbb", { title = "b" })

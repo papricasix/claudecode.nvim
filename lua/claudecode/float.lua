@@ -26,6 +26,8 @@
 ---@brief ]]
 ---@module 'claudecode.float'
 
+local utils = require("claudecode.utils")
+
 local M = {}
 
 --- The top-level `float` config table.
@@ -109,6 +111,64 @@ local function next_geometry(opts)
     style = "minimal",
     border = opts.border or "rounded",
   }
+end
+
+--- The window-local options a float takes from the user rather than from
+--- wherever it happened to be opened.
+---
+--- Two things conspire to make this necessary, both measured rather than assumed.
+--- A float **copies its window-local options from the current window**, not from
+--- the user's globals — and these floats are usually opened from an agents pane,
+--- which deliberately turns `wrap`, `number` and the rest off because it draws
+--- fixed-width list rows. So a diff or a command's output inherited a list pane's
+--- settings and a long line ran off the right edge with no way to read it.
+--- `style = "minimal"` then wipes most of the same options a second time, which
+--- is why this runs *after* the window is open rather than being left to
+--- inheritance at all.
+---
+--- So the float starts from `minimal`'s known-empty state and the user's own
+--- settings are put back on top: whatever `:set wrap`, `number`, `list`,
+--- `signcolumn` and friends say in their config is what a float shows. Not
+--- `fillchars`, which `minimal` uses to keep the `~` end-of-buffer column out of
+--- a small floating frame — that is the frame's chrome rather than a reading
+--- preference.
+local USER_WINDOW_OPTIONS = {
+  "wrap",
+  "linebreak",
+  "breakindent",
+  "breakindentopt",
+  "showbreak",
+  "list",
+  "number",
+  "relativenumber",
+  "numberwidth",
+  "signcolumn",
+  "statuscolumn",
+  "foldcolumn",
+  "cursorline",
+  "cursorlineopt",
+  "cursorcolumn",
+  "colorcolumn",
+  "conceallevel",
+  "concealcursor",
+  "spell",
+  "scrolloff",
+  "sidescrolloff",
+}
+
+---Give a float the user's own display settings.
+---@param win integer
+local function apply_user_options(win)
+  for _, name in ipairs(USER_WINDOW_OPTIONS) do
+    -- The *global* value, which is what the user set in their config; the local
+    -- one belongs to whichever window this float was opened from.
+    local ok, value = pcall(function()
+      return vim.go[name]
+    end)
+    if ok and value ~= nil then
+      utils.set_win_option(win, name, value)
+    end
+  end
 end
 
 ---@param win integer
@@ -270,16 +330,9 @@ function M.create(opts)
     for name, value in pairs(opts.tags or {}) do
       vim.w[win][name] = value
     end
-    vim.wo[win].winhighlight = "FloatBorder:" .. (opts.border_hl or "FloatBorder")
-    vim.wo[win].wrap = false
-    -- Almost everything that opens in one of these floats is a diff, and a diff
-    -- is read by line — "which line was that" has no answer without the column.
-    -- Set on the window rather than left to the user's global `number`, which a
-    -- float does not reliably inherit. Absolute, since a diff is navigated by
-    -- the numbers the rest of the world uses for that file, not by distance.
-    vim.wo[win].number = true
-    vim.wo[win].relativenumber = false
   end)
+  utils.set_win_option(win, "winhighlight", "FloatBorder:" .. (opts.border_hl or "FloatBorder"))
+  apply_user_options(win)
 
   floats[#floats + 1] = {
     win = win,
@@ -331,6 +384,28 @@ end
 ---             float_opts: table?, border_hl: string?, tags: table<string, any>?,
 ---             purpose: string? }
 ---@return integer|nil win
+---A read-only scratch buffer holding `lines`, ready to be put in a float.
+---
+---Named rather than anonymous so `:ls` and a window picker say what the float is,
+---and wiped when it leaves the screen: these buffers are a rendering, not a file,
+---and one per float opened would pile up over a session.
+---@param lines string[]
+---@param name string
+---@return integer|nil buf
+function M.scratch(lines, name)
+  local buf = vim.api.nvim_create_buf(false, true)
+  if not buf or buf == 0 then
+    return nil
+  end
+  pcall(vim.api.nvim_set_option_value, "buftype", "nofile", { buf = buf })
+  pcall(vim.api.nvim_set_option_value, "bufhidden", "wipe", { buf = buf })
+  pcall(vim.api.nvim_set_option_value, "swapfile", false, { buf = buf })
+  pcall(vim.api.nvim_buf_set_lines, buf, 0, -1, false, lines)
+  pcall(vim.api.nvim_set_option_value, "modifiable", false, { buf = buf })
+  pcall(vim.api.nvim_buf_set_name, buf, name)
+  return buf
+end
+
 function M.open_file(opts)
   local path = opts and opts.path
   if type(path) ~= "string" or path == "" then

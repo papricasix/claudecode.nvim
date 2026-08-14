@@ -27,6 +27,7 @@ local FOOTER = "pick the active one again to reverse it"
 local ACTIVE_MARK = "❯"
 
 local render = require("claudecode.agents.render")
+local utils = require("claudecode.utils")
 
 ---@param name string
 ---@return string group
@@ -222,7 +223,7 @@ local function open_native(buf, title, lines, lnum)
     return false
   end
   shown = { win = win, buf = buf }
-  pcall(vim.api.nvim_set_option_value, "cursorline", true, { win = win })
+  utils.set_win_option(win, "cursorline", true)
   pcall(vim.api.nvim_win_set_cursor, win, { lnum, 0 })
   for _, lhs in ipairs({ "q", "<Esc>" }) do
     pcall(vim.keymap.set, "n", lhs, function()

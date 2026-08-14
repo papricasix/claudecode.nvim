@@ -32,6 +32,7 @@ local M = {}
 
 local render = require("claudecode.agents.render")
 local transcript = require("claudecode.agents.transcript")
+local utils = require("claudecode.utils")
 
 --- Transcripts read at once. Reads are latency-bound, so a few in flight is much
 --- faster than one at a time; more than a few only queues syscalls.
@@ -502,7 +503,7 @@ end
 
 ---@param win integer
 local function float_highlight(win)
-  pcall(vim.api.nvim_set_option_value, "winhighlight", "FloatBorder:" .. hl("float"), { win = win })
+  utils.set_win_option(win, "winhighlight", "FloatBorder:" .. hl("float"))
 end
 
 ---@param state table
@@ -550,8 +551,8 @@ local function open_windows(state)
     return false
   end
   state.list_win = list_win
-  pcall(vim.api.nvim_set_option_value, "cursorline", true, { win = list_win })
-  pcall(vim.api.nvim_set_option_value, "wrap", false, { win = list_win })
+  utils.set_win_option(list_win, "cursorline", true)
+  utils.set_win_option(list_win, "wrap", false)
   float_highlight(list_win)
 
   local ok_input, input_win = pcall(vim.api.nvim_open_win, state.input_buf, true, {
@@ -570,7 +571,7 @@ local function open_windows(state)
     return false
   end
   state.input_win = input_win
-  pcall(vim.api.nvim_set_option_value, "wrap", false, { win = input_win })
+  utils.set_win_option(input_win, "wrap", false)
   float_highlight(input_win)
   return true
 end
