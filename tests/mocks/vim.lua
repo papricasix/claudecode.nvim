@@ -945,6 +945,36 @@ local vim = {
     end
   end,
 
+  filetype = {
+    -- Enough of Neovim's matcher for the callers that ask it about a filename.
+    -- Extensions only: nothing here inspects content or shebangs.
+    match = function(opts)
+      local name = type(opts) == "table" and opts.filename or nil
+      if type(name) ~= "string" then
+        return nil
+      end
+      local by_extension = {
+        lua = "lua",
+        py = "python",
+        js = "javascript",
+        ts = "typescript",
+        json = "json",
+        md = "markdown",
+        sh = "sh",
+        toml = "toml",
+        yaml = "yaml",
+        yml = "yaml",
+        rs = "rust",
+        go = "go",
+        c = "c",
+        diff = "diff",
+        patch = "diff",
+      }
+      local ext = name:match("%.([%w_%-]+)$")
+      return ext and by_extension[ext:lower()] or nil
+    end,
+  },
+
   json = {
     encode = function(data)
       -- Extremely simplified JSON encoding, sufficient for basic test cases.

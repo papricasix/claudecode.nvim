@@ -177,6 +177,67 @@ describe("agents.tools", function()
     end)
   end)
 
+  describe("what a command's output is", function()
+    it("reads a patch out of the output rather than out of the command", function()
+      -- The command that produced a patch is routinely not `git diff`.
+      local patch = {
+        "diff --git a/init.lua b/init.lua",
+        "index 1a2b3c4..5d6e7f8 100644",
+        "--- a/init.lua",
+        "+++ b/init.lua",
+        "@@ -1,3 +1,3 @@",
+        "-old",
+        "+new",
+      }
+      expect(tools.detect_filetype("git diff | head -50", patch)).to_be("diff")
+      expect(tools.detect_filetype(nil, { "@@ -1,3 +1,3 @@", "-a", "+b" })).to_be("diff")
+      expect(tools.detect_filetype("diff -u a.txt b.txt", { "--- a.txt", "+++ b.txt", "@@ -1 +1 @@" })).to_be("diff")
+    end)
+
+    it("calls a commit log git, which embeds the patch below it", function()
+      local log = { "commit 4fffa88c0de1f2a3b4c5d6e7f8a9b0c1d2e3f4a5", "Author: A", "", "    feat: x" }
+      expect(tools.detect_filetype("git log -p", log)).to_be("git")
+    end)
+
+    it("does not call a lone `--- ` line a patch", function()
+      -- It opens a YAML document and closes Markdown front matter as readily.
+      expect(tools.detect_filetype("cat notes", { "--- ", "title: x", "keep" })).to_be_nil()
+    end)
+
+    it("takes a printed file's word for what it is", function()
+      expect(tools.detect_filetype("cat lua/claudecode/init.lua", { "local M = {}" })).to_be("lua")
+      expect(tools.detect_filetype("head -50 config.json", { "{" })).to_be("json")
+      -- The command as typed may be a path, and the pipeline's last stage is the
+      -- one whose output this is.
+      expect(tools.detect_filetype("rg foo | /usr/bin/head -3 x.md", { "# x" })).to_be("markdown")
+    end)
+
+    it("calls jq's output JSON unless it was asked for raw text", function()
+      expect(tools.detect_filetype("cat x | jq .items", { "[" })).to_be("json")
+      expect(tools.detect_filetype("cat x | jq -r .name", { "claudecode" })).to_be_nil()
+    end)
+
+    it("guesses nothing from a command whose output says nothing", function()
+      expect(tools.detect_filetype("ls -la", { "total 8", "drwxr-xr-x  4 u  s  128 x" })).to_be_nil()
+      expect(tools.detect_filetype("mise run test", { "320 successes" })).to_be_nil()
+      expect(tools.detect_filetype(nil, nil)).to_be_nil()
+    end)
+
+    it("puts the filetype on the float a command's output is read in", function()
+      local body = tools.body("Bash", { command = "git diff" }, {
+        stdout = "diff --git a/x b/x\n@@ -1 +1 @@\n-a\n+b\n",
+        stderr = "",
+      })
+      expect(body.filetype).to_be("diff")
+      expect(body.ansi).to_be_true()
+    end)
+
+    it("detects from stdout alone: stderr is progress, and the headings are ours", function()
+      local body = tools.body("Bash", { command = "ls" }, { stdout = "a.lua\n", stderr = "--- x\n+++ y\n" })
+      expect(body.filetype).to_be_nil()
+    end)
+  end)
+
   describe("pretty JSON", function()
     it("is valid JSON, commas and all", function()
       -- A reader copies this out of the float; output that merely looks like JSON

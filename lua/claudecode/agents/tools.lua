@@ -413,6 +413,145 @@ local function bash_command_lines(input)
   return lines
 end
 
+--------------------------------------------------------------------------------
+-- What a command's output is
+--------------------------------------------------------------------------------
+
+--- How far into the output something has to say what it is. A patch announces
+--- itself in its first lines; hunting for a `@@` a thousand lines down finds a
+--- coincidence rather than a diff.
+local SNIFF_LINES = 40
+
+--- Commands that print a file, and whose output is therefore whatever the file
+--- is. Nothing else about a shell command's output is knowable without reading
+--- it, which is why this list is short rather than a table of every tool an agent
+--- runs.
+local READERS = {
+  cat = true,
+  bat = true,
+  head = true,
+  tail = true,
+  more = true,
+  less = true,
+}
+
+--- `jq` flags that print something other than JSON.
+local JQ_RAW = {
+  ["-r"] = true,
+  ["--raw-output"] = true,
+  ["-j"] = true,
+  ["--join-output"] = true,
+}
+
+---What the output itself says it is.
+---
+---Asked of the output rather than of the command, because the command that
+---produced a patch is routinely not `git diff`: `git diff | head`, a `--patch`
+---anywhere in a `log`, `diff -u` on two files, a `.patch` a script wrote out. A
+---`commit <sha>` header means the `git` syntax, which embeds `diff` for the patch
+---below it; a bare patch is `diff`.
+---@param lines string[]|nil
+---@return string|nil
+local function sniff(lines)
+  if type(lines) ~= "table" then
+    return nil
+  end
+  local from = false
+  for index = 1, math.min(#lines, SNIFF_LINES) do
+    local line = lines[index]
+    if type(line) == "string" then
+      if line:match("^commit %x%x%x%x%x%x%x") then
+        return "git"
+      elseif line:match("^diff %-") or line:match("^@@ %-%d") or line:match("^index %x+%.%.%x+") then
+        return "diff"
+      elseif line:match("^%-%-%- ") then
+        -- Only as the first half of a pair: a lone `--- ` opens a YAML document
+        -- and closes a Markdown front matter block as readily as it names the old
+        -- side of a patch.
+        from = true
+      elseif from and line:match("^%+%+%+ ") then
+        return "diff"
+      else
+        from = false
+      end
+    end
+  end
+  return nil
+end
+
+---The last command of a pipeline, which is the one whose output this is.
+---@param command string
+---@return string
+local function last_stage(command)
+  local stage = command
+  for part in command:gmatch("[^|]+") do
+    stage = part
+  end
+  return stage
+end
+
+---The filetype of a path, asked of Neovim's own matcher.
+---@param path string
+---@return string|nil
+local function filetype_for_path(path)
+  if not (vim.filetype and type(vim.filetype.match) == "function") then
+    return nil
+  end
+  local ok, ft = pcall(vim.filetype.match, { filename = path })
+  if ok and type(ft) == "string" and ft ~= "" then
+    return ft
+  end
+  return nil
+end
+
+---What the command says its output will be, for the few commands that say.
+---@param command string|nil
+---@return string|nil
+local function from_command(command)
+  if type(command) ~= "string" or command == "" then
+    return nil
+  end
+  local words = {}
+  for word in last_stage(command):gmatch("%S+") do
+    words[#words + 1] = (word:gsub("^['\"]", ""):gsub("['\"]$", ""))
+  end
+  -- The command as it was typed may be a path (`/usr/bin/cat`, `./scripts/x`).
+  local name = words[1] and words[1]:match("([^/\\]+)$") or nil
+  if not name then
+    return nil
+  end
+  if name == "jq" then
+    for _, word in ipairs(words) do
+      if JQ_RAW[word] then
+        return nil
+      end
+    end
+    return "json"
+  end
+  if not READERS[name] then
+    return nil
+  end
+  for index = 2, #words do
+    if words[index]:sub(1, 1) ~= "-" then
+      return filetype_for_path(words[index])
+    end
+  end
+  return nil
+end
+
+---What a shell command's output is, so the float that shows it can highlight it.
+---
+---A `git diff` read as plain text is the same wall of `+`/`-` lines that the
+---Changes pane exists to spare you; with `diff` on it, it reads as the patch it
+---is. Nothing is guessed from thin evidence — a command whose output says nothing
+---about itself gets no filetype at all, which is what it had before.
+---@param command string|nil The command that produced the output.
+---@param lines string[]|nil The output.
+---@return string|nil filetype
+function M.detect_filetype(command, lines)
+  return sniff(lines) or from_command(command)
+end
+
 --- Per-tool bodies. Each returns the float's lines, and may name a filetype for
 --- them or ask for the ANSI pass. Falling through to nil means "pretty JSON".
 ---@type table<string, fun(input: table, result: any): { lines: string[], filetype: string?, ansi: boolean? }|nil>
@@ -446,7 +585,12 @@ local BODIES = {
       lines[#lines + 1] = rule("stderr")
       extend(lines, stderr)
     end
-    return { lines = lines, ansi = true }
+    -- Detected from `stdout` alone: stderr is progress and warnings, and the
+    -- headings are ours. The filetype goes on the whole buffer either way, which
+    -- costs nothing — the `$ …` and `── stdout ──` lines are not something a
+    -- syntax file matches.
+    local command = type(input) == "table" and input.command or nil
+    return { lines = lines, filetype = M.detect_filetype(command, stdout), ansi = true }
   end,
   TodoWrite = function(_, result)
     local todos = type(result) == "table" and (result.newTodos or result.todos) or nil
