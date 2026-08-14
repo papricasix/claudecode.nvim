@@ -78,6 +78,10 @@ local function new_state()
     -- `{ key, desc }` once asked for; nil until then, so the first ask takes
     -- `agents.sessions.sort`. Lives and dies with the open view.
     sort = nil,
+    -- Which Activity rows are shown: "all" | "files" | "tools". Lives and dies
+    -- with the view, like the sort criterion — it is a way of reading the list,
+    -- not a setting about it.
+    feed_filter = "all",
   }
 end
 
@@ -976,12 +980,59 @@ function M.feed(visible)
   if type(visible) == "number" and visible > 0 and visible < limit then
     limit = visible
   end
-  local first = math.max(1, #events - limit + 1)
+  local filter = state.feed_filter
   local out = {}
-  for index = #events, first, -1 do
-    out[#out + 1] = events[index]
+  -- Walked from the newest end and stopped at the limit, rather than sliced and
+  -- then filtered: with a filter on, the rows that fill the pane may come from
+  -- anywhere in the history, and slicing first would show a short list of
+  -- whatever happened to be in the last `limit` events.
+  for index = #events, 1, -1 do
+    local event = events[index]
+    local is_tool = event.kind == "tool"
+    if filter == "all" or (filter == "tools") == is_tool then
+      out[#out + 1] = event
+      if #out >= limit then
+        break
+      end
+    end
   end
   return out, stamp_feed(out)
+end
+
+--- The filters, in the order `M.cycle_feed_filter` walks them.
+M.FEED_FILTERS = {
+  { key = "all", desc = "everything the agent did" },
+  { key = "files", desc = "files it read and changed" },
+  { key = "tools", desc = "commands and searches it ran" },
+}
+
+---What the Activity pane is currently showing.
+---@return string filter
+function M.feed_filter()
+  return state.feed_filter
+end
+
+---Show the next kind of Activity row, and say which.
+---
+---A busy session runs nearly as many tools as it touches files — one real
+---session here folds 211 tool calls against 239 file events — so the two halves
+---crowd each other out, and "only what it did to the code" and "only what it
+---ran" are each worth one keypress. Cycled rather than set, since there are three
+---of them and the order is stable.
+---@return table filter The entry from `FEED_FILTERS` now in force.
+function M.cycle_feed_filter()
+  local at = 1
+  for index, entry in ipairs(M.FEED_FILTERS) do
+    if entry.key == state.feed_filter then
+      at = index
+    end
+  end
+  local next_entry = M.FEED_FILTERS[(at % #M.FEED_FILTERS) + 1]
+  state.feed_filter = next_entry.key
+  -- The rows that come next are a different set, not news: without this every one
+  -- of them would arrive lit and the pane would flash on every filter change.
+  state.feed_baseline = true
+  return next_entry
 end
 
 ---Files the selected session touched, with git's letter where we have one.

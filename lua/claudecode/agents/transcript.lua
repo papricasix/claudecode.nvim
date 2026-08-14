@@ -41,6 +41,7 @@
 ---@module 'claudecode.agents.transcript'
 
 local logger = require("claudecode.logger")
+local tools = require("claudecode.agents.tools")
 
 local uv = vim.uv or vim.loop
 
@@ -61,6 +62,11 @@ local DEFAULT_EVENT_LIMIT = 500
 --- `for tool use` is appended when a tool was running, hence the prefix match.
 M.INTERRUPT_MARKER = "[Request interrupted by user"
 
+--- What the CLI writes as the result of a call the user declined. An `is_error`
+--- like any other as far as the JSON goes, but the agent did nothing wrong, so
+--- the pane says so differently.
+local REJECTION_MARKER = "The user doesn't want to proceed with this tool use"
+
 --- Live summaries: [path] = ClaudeCodeAgentsSummary.
 local cache = {}
 
@@ -77,12 +83,16 @@ local config = nil
 
 ---@class ClaudeCodeAgentsEvent
 ---@field ts number Epoch seconds (0 when the entry carried no timestamp).
----@field kind "read"|"add"|"edit" What the agent did to the file.
----@field path string Absolute path as the CLI recorded it.
+---@field kind "read"|"add"|"edit"|"tool" What the agent did. `tool` is a call that touched no file.
+---@field path string|nil Absolute path as the CLI recorded it; nil on a `tool` event.
 ---@field added integer
 ---@field removed integer
 ---@field start_line integer|nil First line of a read (the CLI records the window it read).
 ---@field num_lines integer|nil How many lines that read covered.
+---@field tool string|nil `tool` events: the tool's own name, e.g. `Bash`.
+---@field label string|nil `tool` events: one line naming what the call was for.
+---@field tool_id string|nil `tool` events: the `toolu_…` id its result is joined by.
+---@field status "running"|"done"|"error"|"interrupted"|"rejected"|nil `tool` events; see `resolve_tool`.
 
 ---@class ClaudeCodeAgentsFileHistory What one session did to one file.
 ---@field path string The file.
@@ -111,6 +121,7 @@ local config = nil
 ---@field files table<string, ClaudeCodeAgentsFile>
 ---@field order string[] Touched paths in first-touch order.
 ---@field events ClaudeCodeAgentsEvent[] Oldest first; trimmed to the event limit.
+---@field pending table<string, ClaudeCodeAgentsEvent> Tool events whose result has not been folded yet, by tool_use id.
 ---@field last_ts number Epoch seconds of the last entry carrying a timestamp.
 ---@field interrupted_ts number|nil Set when the CLI recorded a user interrupt; see INTERRUPT_MARKER.
 ---@field size integer Bytes of the file when last folded.
@@ -574,6 +585,113 @@ local function touch_file(sum, path, kind, added, removed, ts)
   end
 end
 
+---Whether the Activity pane wants rows for tool calls at all.
+---
+---Read per line rather than captured once: `setup` can replace the config while a
+---scan is in flight, and folding half a transcript one way and half the other
+---would leave a session's feed half populated.
+---@return boolean
+local function tools_wanted()
+  return not config or config.feed_tools ~= false
+end
+
+---Fold the tool calls an assistant entry made.
+---
+---A call and its result are two entries, joined by the `toolu_…` id: the call
+---carries what was run, the result what came back. The row is built from the call,
+---so it appears the moment the agent starts a command rather than when it
+---finishes — which is the question the pane answers, and the reason a `Bash` that
+---has not returned yet can be shown as still running at all.
+---
+---File tools are skipped: their results already produce rows, and a second one for
+---the call would say the same thing twice.
+---@param sum ClaudeCodeAgentsSummary
+---@param entry table Decoded transcript line.
+---@return boolean handled
+local function fold_tool_use(sum, entry)
+  local message = entry.message
+  local content = type(message) == "table" and message.content or nil
+  if type(content) ~= "table" then
+    return false
+  end
+  local ts = M._iso_to_epoch(entry.timestamp)
+  if ts > sum.last_ts then
+    sum.last_ts = ts
+  end
+
+  local handled = false
+  for _, block in ipairs(content) do
+    if
+      type(block) == "table"
+      and block.type == "tool_use"
+      and type(block.name) == "string"
+      and not tools.FILE_TOOLS[block.name]
+    then
+      handled = true
+      local event = {
+        ts = ts,
+        kind = "tool",
+        tool = block.name,
+        label = tools.label(block.name, block.input),
+        tool_id = type(block.id) == "string" and block.id or nil,
+        -- Nothing has come back yet, by construction: the result is a later line.
+        status = "running",
+        added = 0,
+        removed = 0,
+      }
+      push_event(sum, event)
+      if event.tool_id then
+        sum.pending[event.tool_id] = event
+      end
+    end
+  end
+  return handled
+end
+
+---Mark the call a result belongs to as finished, from the raw line alone.
+---
+---Read by substring rather than decoded, which is the whole reason a `Bash` result
+---can be folded at all: these lines carry the command's entire output — up to the
+---CLI's own cap — and handing one to `vim.json.decode` on every scan is exactly
+---what the prefilter exists to avoid. What is needed here is three bits, and each
+---is a fixed string.
+---
+---**Failure is `is_error`, not stderr.** Measured across this project's store, one
+---session has 3 `is_error` results out of 340 and 55 with something on stderr —
+---the usual `git`/`rg` progress and warnings from commands that succeeded. Calling
+---those failures would paint most of the pane red and mean nothing. `is_error` is
+---the CLI's own verdict and covers what a reader means by failed: a non-zero exit
+---(`Error: Exit code 1…`), a patch that did not apply, a blocked command.
+---
+---**A refusal is not a failure**, and it is common enough to tell apart: 32 of the
+---379 `is_error` results across this store are the user declining the call. Those
+---are the one thing in the pane the agent did not do wrong.
+---@param sum ClaudeCodeAgentsSummary
+---@param line string
+local function resolve_tool(sum, line)
+  local at = line:find('"tool_use_id":"', 1, true)
+  if not at then
+    return
+  end
+  local id = line:match('^"tool_use_id":"([^"]+)"', at)
+  local event = id and sum.pending[id]
+  if not event then
+    return
+  end
+  sum.pending[id] = nil
+  if not line:find('"is_error":true', 1, true) then
+    -- `"interrupted":true` is on the Bash result shape, and is worth nothing:
+    -- across 25 real transcripts here it is `false` every single time. A turn the
+    -- user stopped is reported by the interrupt marker instead, which is what
+    -- `_fold_line` resolves the calls still outstanding from.
+    event.status = "done"
+  elseif line:find(REJECTION_MARKER, 1, true) then
+    event.status = "rejected"
+  else
+    event.status = "error"
+  end
+end
+
 ---Fold one decoded `toolUseResult` entry into the summary.
 ---@param sum ClaudeCodeAgentsSummary
 ---@param entry table Decoded transcript line.
@@ -717,6 +835,14 @@ function M._fold_line(sum, line)
     -- interrupt that predates that turn says nothing about it. A synthetic
     -- "newer than the last one" value would break that comparison.
     sum.interrupted_ts = sum.last_ts
+    -- Every call still waiting for a result was cut off by this: the turn ended
+    -- and nothing will answer them now. Without this an interrupted `Bash` keeps
+    -- its "still running" marker for the rest of the conversation — which is the
+    -- one thing in the pane that would be a lie rather than merely stale.
+    for id, event in pairs(sum.pending) do
+      event.status = "interrupted"
+      sum.pending[id] = nil
+    end
     return
   end
 
@@ -740,9 +866,28 @@ function M._fold_line(sum, line)
     return
   end
 
+  -- The tool calls themselves, which is where a shell command, a search or a
+  -- subagent launch is recorded — none of them produce a `filePath`, so before
+  -- this the pane could not see them at all. Prefiltered like everything else, and
+  -- cheap in a way worth stating: measured on this project's largest transcript
+  -- (11.9MB, 2628 lines), 451 lines carry a `tool_use` block, 1.26MB in total,
+  -- 20ms to decode all of them once.
+  if tools_wanted() and line:find('"type":"tool_use"', 1, true) then
+    local ok, entry = pcall(vim.json.decode, line)
+    if ok and type(entry) == "table" then
+      pcall(fold_tool_use, sum, entry)
+    end
+    return
+  end
+
   -- Bash results carry neither a patch nor a `file` object, which is what keeps
   -- their (often huge) stdout out of the decoder.
   if line:find('"toolUseResult"', 1, true) then
+    -- Which call this answers, and how it went: three substring tests on a line
+    -- that is never decoded (see `resolve_tool`).
+    if tools_wanted() then
+      resolve_tool(sum, line)
+    end
     if line:find('"structuredPatch"', 1, true) or line:find('"file":', 1, true) then
       local ok, entry = pcall(vim.json.decode, line)
       if ok and type(entry) == "table" then
@@ -799,6 +944,7 @@ local function new_summary(path)
     files = {},
     order = {},
     events = {},
+    pending = {},
     last_ts = 0,
     size = 0,
     mtime = 0,
@@ -1614,6 +1760,133 @@ function M.file_history(transcript_path, file_path, cb)
           end
           history_cache[key] = { size = st.size, mtime = st.mtime, history = hist }
           answer(hist)
+        end)
+        return
+      end
+      offset = offset + consumed
+      step()
+    end)
+  end
+  step()
+end
+
+--------------------------------------------------------------------------------
+-- One tool call within one session
+--------------------------------------------------------------------------------
+
+---@class ClaudeCodeAgentsToolCall
+---@field tool string|nil Tool name, as the call recorded it.
+---@field input table|nil What the call was given (a `Bash`'s command, say).
+---@field result any The decoded `toolUseResult`, or nil when none has landed yet.
+---@field ts number Epoch seconds of the call.
+
+---Everything the transcript holds about one tool call, read on demand.
+---
+---The Activity row carries only what it draws — the tool, a one-line label and the
+---call's id — because a row is folded for every call an agent makes and the
+---payloads are the bulk of a transcript: a session's commands and their output ran
+---to 116KB in one measured here, and `Task` prompts and MCP results are larger
+---still. Holding those for every session in the list, to answer a question asked
+---once per `<CR>`, is what `file_history` already declines to do for patches.
+---
+---So the two lines are found again when they are wanted. The id is the prefilter
+---and it is an exceptionally good one: exactly two lines in the file contain it,
+---so the scan decodes two lines however large the transcript is.
+---
+---Answered through `vim.schedule` for `file_history`'s reason: the reads land in a
+---libuv fast context, and what a caller does with a tool call is open a window.
+---@param transcript_path string
+---@param tool_id string The `toolu_…` id joining the call to its result.
+---@param cb fun(call: ClaudeCodeAgentsToolCall|nil)
+function M.tool_call(transcript_path, tool_id, cb)
+  local function answer(call)
+    vim.schedule(function()
+      cb(call)
+    end)
+  end
+
+  if type(transcript_path) ~= "string" or type(tool_id) ~= "string" or tool_id == "" then
+    answer(nil)
+    return
+  end
+  local st = M._io.stat(transcript_path)
+  if not st then
+    answer(nil)
+    return
+  end
+
+  ---@type ClaudeCodeAgentsToolCall
+  local call = { ts = 0 }
+  local found_use = false
+
+  ---@param line string
+  local function fold(line)
+    if not line:find(tool_id, 1, true) then
+      return
+    end
+    local ok, entry = pcall(vim.json.decode, line)
+    if not ok or type(entry) ~= "table" then
+      return
+    end
+    local content = type(entry.message) == "table" and entry.message.content or nil
+    if type(content) == "table" then
+      for _, block in ipairs(content) do
+        if type(block) == "table" and block.type == "tool_use" and block.id == tool_id then
+          found_use = true
+          call.tool = type(block.name) == "string" and block.name or nil
+          call.input = type(block.input) == "table" and block.input or nil
+          call.ts = M._iso_to_epoch(entry.timestamp)
+        elseif type(block) == "table" and block.tool_use_id == tool_id then
+          -- The result entry. `toolUseResult` is the decoded, tool-shaped copy the
+          -- CLI writes beside the raw block; the block's own `content` is the
+          -- fallback for an entry that has none (a rejected call, say).
+          if entry.toolUseResult ~= nil then
+            call.result = entry.toolUseResult
+          elseif block.content ~= nil then
+            call.result = block.content
+          end
+        end
+      end
+    end
+  end
+
+  local offset = 0
+  local function step()
+    if offset >= st.size then
+      answer(found_use and call or nil)
+      return
+    end
+    local want = math.min(M._chunk_size, st.size - offset)
+    M._io.read(transcript_path, offset, want, function(data)
+      if not data or data == "" then
+        answer(found_use and call or nil)
+        return
+      end
+      local consumed, start = 0, 1
+      while true do
+        local nl = data:find("\n", start, true)
+        if not nl then
+          break
+        end
+        fold(data:sub(start, nl - 1))
+        consumed, start = nl, nl + 1
+      end
+      if consumed == 0 then
+        -- A line longer than one chunk — a big result is exactly that — so the
+        -- rest is pulled in one read rather than spinning on the same bytes.
+        M._io.read(transcript_path, offset, st.size - offset, function(all)
+          if all then
+            local from = 1
+            while true do
+              local nl = all:find("\n", from, true)
+              if not nl then
+                break
+              end
+              fold(all:sub(from, nl - 1))
+              from = nl + 1
+            end
+          end
+          answer(found_use and call or nil)
         end)
         return
       end

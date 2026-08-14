@@ -67,25 +67,9 @@ local function set_filetype(buf, path)
   end
 end
 
----A scratch buffer holding `lines`, ready to be put in a float.
----@param lines string[]
----@param name string
----@return integer|nil buf
-local function scratch(lines, name)
-  local buf = vim.api.nvim_create_buf(false, true)
-  if not buf or buf == 0 then
-    return nil
-  end
-  pcall(vim.api.nvim_set_option_value, "buftype", "nofile", { buf = buf })
-  pcall(vim.api.nvim_set_option_value, "bufhidden", "wipe", { buf = buf })
-  pcall(vim.api.nvim_set_option_value, "swapfile", false, { buf = buf })
-  pcall(vim.api.nvim_buf_set_lines, buf, 0, -1, false, lines)
-  pcall(vim.api.nvim_set_option_value, "modifiable", false, { buf = buf })
-  -- Named so `:ls` and a window picker show what this float is, rather than an
-  -- anonymous scratch buffer.
-  pcall(vim.api.nvim_buf_set_name, buf, name)
-  return buf
-end
+--- A scratch buffer holding lines, ready to be put in a float. Shared with the
+--- tool view, which builds its buffers exactly the same way.
+local scratch = float.scratch
 
 ---Highlight whole lines, the way the live cursor marks what Claude read — in
 ---the same group, so `live_cursor.highlight` reaches this view too.

@@ -946,6 +946,62 @@ describe("agents_view", function()
       press("<C-n>")
       expect(opened[2]).to_be("HEAD:/proj/b.lua")
     end)
+
+    describe("a row that is a tool call", function()
+      before_each(function()
+        payloads[3] = { kind = "tool", tool = "Bash", tool_id = "toolu_3", label = "run it", status = "done" }
+        package.loaded["claudecode.agents.tool_view"] = {
+          open = function(opts, done)
+            opened[#opened + 1] = "TOOL:" .. tostring(opts.tool_id)
+            answer(opts, done)
+          end,
+        }
+      end)
+
+      after_each(function()
+        package.loaded["claudecode.agents.tool_view"] = nil
+      end)
+
+      it("opens the call rather than a file", function()
+        vim.api.nvim_win_set_cursor(agents_view._state().wins.changes, { 3, 0 })
+        agents_view.open_under_cursor()
+        expect(opened[1]).to_be("TOOL:toolu_3")
+      end)
+
+      it("is stepped onto like any other row", function()
+        -- The float is a view of one row, and a row that is a command has as much
+        -- to show as one that is a file.
+        agents_view.open_under_cursor()
+        press("<C-n>")
+        press("<C-n>")
+        expect(opened[3]).to_be("TOOL:toolu_3")
+      end)
+
+      it("is skipped by a float showing a file against HEAD", function()
+        -- `.` asks what is uncommitted in a file, which a command has no answer
+        -- to at all — and warning on every repeat of a held key would be noise.
+        agents_view.diff_head_under_cursor()
+        press("<C-n>")
+        press("<C-n>")
+        expect(opened[3]).to_be("HEAD:/proj/c.lua")
+      end)
+
+      it("says so rather than opening nothing when asked for a file", function()
+        local warned = {}
+        local logger = require("claudecode.logger")
+        local real = logger.warn
+        logger.warn = function(_, message)
+          warned[#warned + 1] = message
+        end
+        vim.api.nvim_win_set_cursor(agents_view._state().wins.changes, { 3, 0 })
+        agents_view.diff_head_under_cursor()
+        agents_view.goto_file_under_cursor()
+        logger.warn = real
+        expect(#warned).to_be(2)
+        expect(warned[1]:find("not a file", 1, true) ~= nil).to_be_true()
+        expect(#opened).to_be(0)
+      end)
+    end)
   end)
 
   describe("`gf` on a Changes or Activity row", function()
@@ -1037,6 +1093,13 @@ describe("agents_view", function()
       -- A session row is not a file, so `gf` is free there and means the other
       -- thing you might go looking for: the conversation itself.
       expect(keys_for("sessions")["gf"]).to_be("Search these conversations for what was said in them")
+    end)
+
+    it("offers the activity filter only where there are two kinds of row", function()
+      setup_with({ enabled = true })
+      expect(keys_for("feed")["f"]).to_be_string()
+      expect(keys_for("changes")["f"]).to_be(nil)
+      expect(keys_for("sessions")["f"]).to_be(nil)
     end)
 
     it("offers the sort menu from every pane that shows the list", function()

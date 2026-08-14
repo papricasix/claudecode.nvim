@@ -292,6 +292,20 @@ there too.
   be chosen before the panes have something to show.
 - The Activity pane lists the selected agent's tool calls **newest first**, so
   what it is doing now is at the top rather than scrolled off the bottom.
+- It lists **everything the agent did**, not only its file work: the shell
+  commands it ran, the searches it made, the subagents it launched, each named by
+  the tool it used and by what the call was for. A call still running is marked
+  `…`, one that failed `✗`, and one you cancelled or declined `⊘` — a call that
+  simply worked says nothing, since most of them do. `f` cycles the pane between
+  everything, files only and commands only; `feed_tools = false` leaves the
+  commands out for good.
+- `<CR>` on one of those rows shows **what it ran and what it printed** —
+  the command above its output, each stream under its own `── stdout ──` /
+  `── stderr ──` heading, and the colours the command wrote rendered as colour
+  rather than as `^[[32m` litter. A search shows
+  its matches, a subagent its reply, and anything else its result as formatted
+  JSON. Nothing is read until you ask: the row carries only the call's id, and
+  the transcript is re-read for the two lines that carry it.
 - `.` in the Activity or Changes pane diffs that file against **git HEAD** —
   everything uncommitted in it, whoever put it there — rather than against what
   the session started from. Useful once several agents have been over the same
@@ -316,6 +330,11 @@ there too.
 - `q` closes the view; the agents keep running unless you set
   `kill_on_close = true`.
 
+Floating windows — diffs, files, command output — use **your own display
+settings**: `wrap`, `number`, `list`, `signcolumn` and the rest come from your
+config rather than from the list pane the float was opened over. The panes
+themselves stay unwrapped, since they draw fixed-width rows.
+
 Each agent gets its own connection to Neovim, so a diff, a file open or an
 `@` mention reaches the agent it belongs to and no other. Diffs open as floating
 windows titled with the agent that asked, cascading so several are answerable at
@@ -337,6 +356,9 @@ that work rather than the file:
   highlighted.
 - **A file the agent created** reads as one long addition, since there was
   nothing before it.
+- **A command in the Activity pane** opens what it ran and what it printed, with
+  its colours intact; a search opens its matches, a subagent its reply, and
+  anything else its result as formatted JSON.
 
 The diff is reconstructed by undoing the session's own edits, so a file that
 moved on afterwards — later sessions, your own editing — can have changes that
@@ -377,6 +399,10 @@ opts = {
       foreign = true,             -- also list Claudes running in your other tabs
     },
     feed_limit = 500,             -- activity events kept per session
+    feed_tools = true,            -- also list the calls that touch no file:
+                                  -- shell commands, searches, subagents. `<CR>`
+                                  -- reads what one ran and printed out of the
+                                  -- transcript, on demand.
     refresh_ms = 150,
     git = true,                   -- annotate Changes with git status letters
     git_refresh_ms = 1500,
@@ -432,6 +458,7 @@ opts = {
       search = "gf",              -- search the conversations (sessions pane)
       sort = "gs",                -- choose what the list is ordered by
       close = "q", open = "<CR>", git_diff = ".", goto_file = "gf", help = "?",
+      filter = "f",               -- Activity: everything / files / commands
       next_pane = "<Tab>", focus_term = "i",
       -- Cycle the selected session from any pane, and from inside the agent's
       -- terminal (bound there in terminal mode too). Inside a file float the same
@@ -448,6 +475,8 @@ opts = {
     --     title = "ClaudeCodeAgentsTitle",       -- links to Normal
     --     time  = "ClaudeCodeAgentsTime",        -- Comment
     --     kind  = "ClaudeCodeAgentsKind",        -- Comment (Activity's read/edit column)
+    --     failed = "ClaudeCodeAgentsFailed",     -- DiagnosticError (a tool call
+    --                                            -- the CLI marked as an error)
     --     path  = "ClaudeCodeAgentsPath",        -- Directory
     --     stopped = "ClaudeCodeAgentsStopped",   -- Comment (the bullet of a session
     --                                            -- that is not running; a running

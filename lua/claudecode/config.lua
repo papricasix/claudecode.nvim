@@ -114,6 +114,11 @@ M.defaults = {
       foreign = true, -- also list Claudes running in your other tabs
     },
     feed_limit = 500, -- activity events kept per session
+    -- Also list the calls that touch no file — the shell commands, searches and
+    -- subagents — with `<CR>` reading what they ran and printed back out of the
+    -- transcript. `false` folds none of them, which is a little cheaper and
+    -- leaves the pane a list of file work alone.
+    feed_tools = true,
     refresh_ms = 150, -- coalescing window for redraws
     list_refresh_ms = 2000, -- how often the session list is re-enumerated
     git = true, -- annotate the Changes pane with git status letters
@@ -168,6 +173,7 @@ M.defaults = {
       open = "<CR>", -- open the file under the cursor (Activity / Changes panes)
       git_diff = ".", -- diff that file against git HEAD instead of against the session
       goto_file = "gf", -- open the file itself, on disk, in a new tab
+      filter = "f", -- Activity pane: everything / only files / only commands
       help = "?", -- show the keys that reach the pane you are in
       next_pane = "<Tab>",
       focus_term = "i",
@@ -547,6 +553,7 @@ function M.validate(config)
     check("source", one_of({ "hooks", "poll", "auto" }), 'must be "hooks", "poll" or "auto"')
     check("poll_ms", is_positive, "must be a positive number")
     check("feed_limit", is_positive, "must be a positive number")
+    check("feed_tools", is_boolean, "must be a boolean")
     check("refresh_ms", is_positive, "must be a positive number")
     check("list_refresh_ms", is_positive, "must be a positive number")
     check("git", is_boolean, "must be a boolean")
@@ -653,6 +660,7 @@ function M.validate(config)
         "open",
         "git_diff",
         "goto_file",
+        "filter",
         "help",
         "next_pane",
         "focus_term",
@@ -675,6 +683,7 @@ function M.validate(config)
         "path",
         "kind",
         "stopped",
+        "failed",
         "float",
         "normal",
         "normal_nc",

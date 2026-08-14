@@ -14,6 +14,7 @@
 ---@module 'claudecode.agents.render'
 
 local fade = require("claudecode.agents.fade")
+local tools = require("claudecode.agents.tools")
 
 local M = {}
 
@@ -60,6 +61,7 @@ local DEFAULT_HIGHLIGHTS = {
   path = "ClaudeCodeAgentsPath",
   kind = "ClaudeCodeAgentsKind",
   stopped = "ClaudeCodeAgentsStopped",
+  failed = "ClaudeCodeAgentsFailed",
   float = "ClaudeCodeAgentsFloat",
   normal = "ClaudeCodeAgentsNormal",
   normal_nc = "ClaudeCodeAgentsNormalNC",
@@ -84,6 +86,9 @@ local HIGHLIGHT_LINKS = {
   -- a tabline draws nothing at all for a tab with no Claude — but here those
   -- sessions are rows on screen, and they are the ones that should read quietest.
   ClaudeCodeAgentsStopped = "Comment",
+  -- A tool call the CLI marked `is_error`. The one thing in the pane that is not
+  -- a neutral record of work, so it borrows the editor's own error colour.
+  ClaudeCodeAgentsFailed = "DiagnosticError",
   ClaudeCodeAgentsFloat = "FloatBorder",
   ClaudeCodeAgentsHelpHeader = "Title",
   ClaudeCodeAgentsKey = "Special",
@@ -117,6 +122,19 @@ end
 --- Markers for what an agent did to a file. Kept narrow enough not to shift the
 --- columns after them.
 local KIND_LABEL = { read = "read", add = "added", edit = "edit", delete = "del" }
+
+--- What a tool call's row says about how it went, drawn at the right edge. A call
+--- that simply worked says nothing: most of them do, and a pane of ticks is a pane
+--- with no signal in it. Which leaves the three that are worth a glance — it is
+--- still running, it failed, or the user stopped it.
+local STATUS_MARK = {
+  running = { text = "…", hl = "time" },
+  error = { text = "✗", hl = "failed" },
+  -- Stopped by the user, either way: a turn they cancelled, or a call they said
+  -- no to. Quiet rather than red — the agent did nothing wrong in either case.
+  interrupted = { text = "⊘", hl = "stopped" },
+  rejected = { text = "⊘", hl = "stopped" },
+}
 
 ---@param name string Key in the highlights config.
 ---@return string group
@@ -650,24 +668,55 @@ function M.feed(buf, events, opts)
   end
 
   for index, event in ipairs(events) do
-    local label = KIND_LABEL[event.kind] or event.kind or "?"
+    local is_tool = event.kind == "tool"
+    -- A tool call's column is the tool's own name — `bash`, `grep`, `agent` —
+    -- which is what a glance at the pane is asking; the label beside it says what
+    -- that call was for.
+    local label = is_tool and tools.short(event.tool) or (KIND_LABEL[event.kind] or event.kind or "?")
     local clock = event.ts and event.ts > 0 and os.date("%H:%M", event.ts) or "--:--"
-    local path = M.relative_path(event.path, opts.cwd)
     local head = string.format("%s%s %-5s ", GUTTER, clock, label)
-    local name = M.shorten_path(path, math.max(8, width - #head - 1))
+
+    -- The marker takes its cells out of the text, not out of the pane: a row that
+    -- reads to the edge and then grows a `…` would reflow the whole column.
+    local mark = is_tool and STATUS_MARK[event.status] or nil
+    local room = math.max(8, width - #head - 1 - (mark and (vim.fn.strdisplaywidth(mark.text) + 1) or 0))
+    local name
+    if is_tool then
+      -- Cut from the end: a label is a sentence, and its first words are the ones
+      -- that identify it. A path is the opposite, hence `shorten_path` below.
+      name = M.truncate(event.label or event.tool or "", room)
+    else
+      name = M.shorten_path(M.relative_path(event.path, opts.cwd), room)
+    end
     local line = head .. name
 
     local lnum = index - 1
+    local mark_at
+    if mark then
+      line, mark_at = right_align(line, width, mark.text)
+    end
     lines[#lines + 1] = line
-    -- The event's own kind and read window travel with the row: opening a read
-    -- shows the lines that read covered, not the whole session's changes.
-    payload_map[index] = {
-      kind = "file",
-      path = event.path,
-      event_kind = event.kind,
-      start_line = event.start_line,
-      num_lines = event.num_lines,
-    }
+    if is_tool then
+      -- What the call was, not where it was: `<CR>` reads the command and its
+      -- output back out of the transcript by this id.
+      payload_map[index] = {
+        kind = "tool",
+        tool = event.tool,
+        tool_id = event.tool_id,
+        label = event.label,
+        status = event.status,
+      }
+    else
+      -- The event's own kind and read window travel with the row: opening a read
+      -- shows the lines that read covered, not the whole session's changes.
+      payload_map[index] = {
+        kind = "file",
+        path = event.path,
+        event_kind = event.kind,
+        start_line = event.start_line,
+        num_lines = event.num_lines,
+      }
+    end
 
     -- A row arrives at full colour and settles into the quieter resting one, so
     -- what the agent is doing *now* stands out from what it has already done —
@@ -683,7 +732,16 @@ function M.feed(buf, events, opts)
       end_col = label_at + #label,
       hl = fade.dim_group(hl("kind"), age),
     }
-    marks[#marks + 1] = { row = lnum, col = #head, end_col = #head + #name, hl = fade.dim_group(hl("path"), age) }
+    -- A tool call's text is what it was for, which is prose rather than a path;
+    -- drawn in the pane's own foreground so the two kinds of row are told apart
+    -- by more than their column.
+    local text_group = is_tool and hl("title") or hl("path")
+    marks[#marks + 1] = { row = lnum, col = #head, end_col = #head + #name, hl = fade.dim_group(text_group, age) }
+    if mark and mark_at then
+      -- The marker does not fade with the row: "this is still running" and "this
+      -- failed" are true now, however long ago the row arrived.
+      marks[#marks + 1] = { row = lnum, col = mark_at, end_col = mark_at + #mark.text, hl = hl(mark.hl) }
+    end
   end
 
   paint(buf, lines, marks, payload_map)

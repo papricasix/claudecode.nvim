@@ -101,6 +101,7 @@ function M.open_file(session_id, path, line, reuse)
   })
 end
 
+M.scratch = base.scratch
 M.jump_to = base.jump_to
 M.bind_close = base.bind_close
 M.close = base.close

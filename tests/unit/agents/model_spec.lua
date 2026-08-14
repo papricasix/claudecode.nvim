@@ -529,6 +529,55 @@ describe("agents.model", function()
       expect(feed[2].path).to_be("/proj/second.lua")
     end)
 
+    describe("the activity filter", function()
+      before_each(function()
+        summaries.aaa.events = {
+          { ts = 1, kind = "edit", path = "/proj/first.lua" },
+          { ts = 2, kind = "tool", tool = "Bash", label = "run it", tool_id = "t1", status = "done" },
+          { ts = 3, kind = "read", path = "/proj/second.lua" },
+          { ts = 4, kind = "tool", tool = "Grep", label = "find it", tool_id = "t2", status = "done" },
+        }
+        model.select("aaa")
+      end)
+
+      it("shows everything until asked otherwise", function()
+        expect(#model.feed()).to_be(4)
+        expect(model.feed_filter()).to_be("all")
+      end)
+
+      it("cycles through files only and commands only", function()
+        expect(model.cycle_feed_filter().key).to_be("files")
+        local feed = model.feed()
+        expect(#feed).to_be(2)
+        expect(feed[1].path).to_be("/proj/second.lua")
+
+        expect(model.cycle_feed_filter().key).to_be("tools")
+        feed = model.feed()
+        expect(#feed).to_be(2)
+        expect(feed[1].tool).to_be("Grep")
+
+        expect(model.cycle_feed_filter().key).to_be("all")
+        expect(#model.feed()).to_be(4)
+      end)
+
+      it("fills the pane from the whole history, not from the last few events", function()
+        -- Slicing to the limit first and filtering after would show a short list
+        -- of whatever happened to be at the end — with a filter on, the rows that
+        -- fill the pane can come from anywhere.
+        summaries.aaa.events = {
+          { ts = 1, kind = "edit", path = "/proj/a.lua" },
+          { ts = 2, kind = "edit", path = "/proj/b.lua" },
+          { ts = 3, kind = "tool", tool = "Bash", label = "one", tool_id = "t1" },
+          { ts = 4, kind = "tool", tool = "Bash", label = "two", tool_id = "t2" },
+          { ts = 5, kind = "tool", tool = "Bash", label = "three", tool_id = "t3" },
+        }
+        model.cycle_feed_filter() -- files
+        local feed = model.feed(2)
+        expect(#feed).to_be(2)
+        expect(feed[1].path).to_be("/proj/b.lua")
+      end)
+    end)
+
     it("leaves reads out of the changed-files list", function()
       summaries.aaa.files["/proj/read.lua"] = { added = 0, removed = 0, kind = "read", last_ts = 1 }
       table.insert(summaries.aaa.order, "/proj/read.lua")

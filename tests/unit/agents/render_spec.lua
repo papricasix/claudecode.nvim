@@ -297,6 +297,62 @@ describe("agents.render", function()
       render.feed(feed, { { ts = 1, kind = "edit", path = "/proj/b.lua" } }, { width = 40, cwd = "/proj" })
       expect(render.payload_at(feed, 1).path).to_be("/proj/b.lua")
     end)
+
+    it("draws a tool call as the tool and what the call was for", function()
+      local feed = render.create_buf("feed")
+      render.feed(feed, {
+        { ts = 1785700000, kind = "tool", tool = "Bash", label = "Count commits", tool_id = "t1", status = "done" },
+      }, { width = 44, cwd = "/proj" })
+      local line = lines_of(feed)[1]
+      expect(line:find("bash", 1, true) ~= nil).to_be_true()
+      expect(line:find("Count commits", 1, true) ~= nil).to_be_true()
+    end)
+
+    it("says nothing about a call that simply worked", function()
+      -- Most of them do, and a pane of ticks is a pane with no signal in it.
+      local feed = render.create_buf("feed")
+      render.feed(feed, {
+        { ts = 1, kind = "tool", tool = "Bash", label = "ok", tool_id = "t1", status = "done" },
+      }, { width = 40 })
+      expect(lines_of(feed)[1]:find("✗", 1, true)).to_be_nil()
+      expect(lines_of(feed)[1]:find("…", 1, true)).to_be_nil()
+    end)
+
+    it("marks the three outcomes that are worth a glance", function()
+      local feed = render.create_buf("feed")
+      render.feed(feed, {
+        { ts = 1, kind = "tool", tool = "Bash", label = "a", tool_id = "t1", status = "running" },
+        { ts = 1, kind = "tool", tool = "Bash", label = "b", tool_id = "t2", status = "error" },
+        { ts = 1, kind = "tool", tool = "Bash", label = "c", tool_id = "t3", status = "rejected" },
+      }, { width = 40 })
+      local lines = lines_of(feed)
+      expect(lines[1]:find("…", 1, true) ~= nil).to_be_true()
+      expect(lines[2]:find("✗", 1, true) ~= nil).to_be_true()
+      expect(lines[3]:find("⊘", 1, true) ~= nil).to_be_true()
+    end)
+
+    it("keeps the marker inside the pane rather than past its edge", function()
+      -- A row that reads to the edge and then grows a marker would reflow the
+      -- whole column.
+      local feed = render.create_buf("feed")
+      render.feed(feed, {
+        { ts = 1, kind = "tool", tool = "Bash", label = string.rep("x", 200), tool_id = "t1", status = "error" },
+      }, { width = 30 })
+      expect(vim.fn.strdisplaywidth(lines_of(feed)[1]) <= 30).to_be_true()
+    end)
+
+    it("records what a tool row is, so <CR> can read the call back", function()
+      local feed = render.create_buf("feed")
+      render.feed(feed, {
+        { ts = 1, kind = "tool", tool = "Bash", label = "Count commits", tool_id = "toolu_9", status = "error" },
+      }, { width = 40 })
+      local payload = render.payload_at(feed, 1)
+      expect(payload.kind).to_be("tool")
+      expect(payload.tool_id).to_be("toolu_9")
+      expect(payload.tool).to_be("Bash")
+      expect(payload.status).to_be("error")
+      expect(payload.path).to_be_nil() -- it is not a file, and `.`/`gf` rely on that
+    end)
   end)
 
   describe("the leading blank cell", function()

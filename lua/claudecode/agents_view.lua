@@ -36,6 +36,7 @@ local logger = require("claudecode.logger")
 local model = require("claudecode.agents.model")
 local registry = require("claudecode.agents.registry")
 local render = require("claudecode.agents.render")
+local utils = require("claudecode.utils")
 
 local M = {}
 
@@ -278,9 +279,7 @@ local function tag_window(win, pane)
   -- editor's own `Normal`, so they read as part of the editor rather than as
   -- three more floating surfaces.
   if pane == "center" then
-    pcall(function()
-      vim.wo[win].winhighlight = render.terminal_winhighlight()
-    end)
+    utils.set_win_option(win, "winhighlight", render.terminal_winhighlight())
   end
 
   -- The sidebars hold their size; the terminal absorbs whatever is left. Fixing
@@ -303,9 +302,10 @@ local function tag_window(win, pane)
     winfixheight = fixed,
   }
   for name, value in pairs(chrome) do
-    pcall(function()
-      vim.wo[win][name] = value
-    end)
+    -- Local scope, or configuring a pane rewrites the user's own global: a pane
+    -- is the current window while it is being built, and there `vim.wo` means
+    -- `:set` rather than `:setlocal`. See `utils.set_win_option`.
+    utils.set_win_option(win, name, value)
   end
 end
 
@@ -315,9 +315,7 @@ local function apply_marker(win, label)
   local group = (opts().highlights and opts().highlights.title) or "ClaudeCodeAgentsTitle"
   -- Escape '%' in the visible label; keep the '%#group#'/'%=' items literal.
   local safe = label:gsub("%%", "%%%%")
-  pcall(function()
-    vim.wo[win].winbar = "%#" .. group .. "#%=" .. safe .. "%="
-  end)
+  utils.set_win_option(win, "winbar", "%#" .. group .. "#%=" .. safe .. "%=")
 end
 
 ---The pane sizes the config asks for, in cells.
@@ -366,10 +364,8 @@ local function build_layout()
   -- ('equalalways' is deliberately left alone: turning it off for the
   -- construction works, but turning it back on immediately re-equalises every
   -- window, which throws away the sizes just applied. Measured.)
-  pcall(function()
-    vim.wo[center].winfixwidth = false
-    vim.wo[center].winfixheight = false
-  end)
+  utils.set_win_option(center, "winfixwidth", false)
+  utils.set_win_option(center, "winfixheight", false)
 
   pcall(vim.cmd, "topleft " .. left_width .. "vsplit")
   state.wins.changes = vim.api.nvim_get_current_win()
@@ -601,9 +597,19 @@ local KEY_SPECS = {
     field = "open",
     panes = { "feed", "changes" },
     group = "This file",
-    desc = "Open it, showing what this agent did to it",
+    desc = "Open it, showing what this agent did to it (a command: what it ran and printed)",
     run = function()
       M.open_under_cursor()
+    end,
+  },
+  {
+    field = "filter",
+    -- The Activity pane alone: it is the only list with two kinds of row in it.
+    panes = { "feed" },
+    group = "Activity",
+    desc = "Show everything / only files / only commands",
+    run = function()
+      M.cycle_feed_filter()
     end,
   },
   {
@@ -2322,16 +2328,24 @@ end
 ---@type fun(payload: table|nil, pane: string|nil, lnum: integer|nil, action: string, nav_opts: table|nil)
 local open_row
 
----The next row of a pane that has a file on it, wrapping at both ends.
+---The next row of a pane there is something to open on, wrapping at both ends.
 ---
 ---Wrapping rather than stopping, like the session cycling: a pane is a ring of
 ---rows, and running off the end of the Changes list with no way back would be the
 ---one place in this view where a key silently does nothing.
+---
+---A tool call counts: the float is a view of one row, and a row that is a command
+---has as much to show as one that is a file. Stepping therefore walks the feed as
+---it is drawn, swapping between a file's diff and a command's output — one reading
+---frame for the whole session rather than one per kind of row.
+---A HEAD float is the exception, and skips them: `.` asks what is uncommitted in
+---a file, which a command has no answer to at all.
 ---@param pane string
 ---@param lnum integer
 ---@param delta integer
+---@param action string|nil What the float is showing; "head" wants files only.
 ---@return integer|nil
-local function next_file_row(pane, lnum, delta)
+local function next_open_row(pane, lnum, delta, action)
   local buf = state.bufs[pane]
   if not buf or not vim.api.nvim_buf_is_valid(buf) then
     return nil
@@ -2343,7 +2357,8 @@ local function next_file_row(pane, lnum, delta)
   for step = 1, count do
     local candidate = ((lnum - 1 + delta * step) % count) + 1
     local payload = render.payload_at(buf, candidate)
-    if payload and payload.path then
+    local openable = payload and (payload.path or (payload.kind == "tool" and action ~= "head"))
+    if openable then
       return candidate
     end
   end
@@ -2402,7 +2417,7 @@ local function step_float(win, delta)
   if not nav then
     return
   end
-  local target = next_file_row(nav.pane, nav.aim or nav.lnum, delta)
+  local target = next_open_row(nav.pane, nav.aim or nav.lnum, delta, nav.action)
   if not target then
     return
   end
@@ -2494,6 +2509,30 @@ function open_row(payload, pane, lnum, action, nav_opts)
     end
   end
 
+  -- A tool call: not a file, so none of what follows applies. `.` and `gf` are
+  -- about a file and say so; `<CR>` is the row's own question and is answered by
+  -- reading the call and its output back out of the transcript.
+  if payload and payload.kind == "tool" then
+    if action ~= "diff" then
+      logger.warn("agents", "this row is a " .. (payload.tool or "tool") .. " call, not a file")
+      return opened(nil)
+    end
+    local ok_tool, tool_view = pcall(require, "claudecode.agents.tool_view")
+    if not ok_tool then
+      return opened(nil)
+    end
+    tool_view.open({
+      session_id = model.selected(),
+      transcript = model.transcript_path(),
+      tool_id = payload.tool_id,
+      tool = payload.tool,
+      label = payload.label,
+      status = payload.status,
+      reuse = nav_opts.reuse,
+    }, opened)
+    return
+  end
+
   if not payload or not payload.path then
     return opened(nil)
   end
@@ -2560,10 +2599,25 @@ end
 ---ordinary editor tab it is.
 function M.goto_file_under_cursor()
   local payload = payload_under_cursor()
+  if payload and payload.kind == "tool" then
+    logger.warn("agents", "this row is a " .. (payload.tool or "tool") .. " call, not a file")
+    return
+  end
   if not payload or not payload.path then
     return
   end
   M.open_file_in_tab(payload.path, payload.line)
+end
+
+---`f` in the Activity pane: show files only, tool calls only, or everything.
+---
+---A busy agent runs several tools per file it touches, so the two halves of the
+---feed crowd each other out. The filter is a way of reading the list rather than a
+---setting about it, so it lives on the view and dies with it, like the sort order.
+function M.cycle_feed_filter()
+  local filter = model.cycle_feed_filter()
+  M.redraw()
+  vim.notify("ClaudeCode: activity — " .. filter.desc, vim.log.levels.INFO)
 end
 
 ---Open a path in a new tabpage, on `line` when there is one.

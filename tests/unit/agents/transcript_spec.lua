@@ -524,6 +524,223 @@ describe("agents.transcript", function()
     end)
   end)
 
+  describe("tool calls", function()
+    ---An assistant entry making one tool call.
+    local function tool_use_line(name, input, id, ts)
+      return vim.json.encode({
+        type = "assistant",
+        timestamp = ts or "2026-08-02T20:30:00.000Z",
+        message = {
+          role = "assistant",
+          content = { { type = "tool_use", id = id or "toolu_1", name = name, input = input or {} } },
+        },
+      })
+    end
+
+    ---The result of one, as the CLI writes it: the raw block plus its decoded copy.
+    local function tool_result_line(id, opts)
+      opts = opts or {}
+      return vim.json.encode({
+        type = "user",
+        timestamp = opts.ts or "2026-08-02T20:30:05.000Z",
+        message = {
+          role = "user",
+          content = {
+            {
+              type = "tool_result",
+              tool_use_id = id,
+              is_error = opts.is_error or nil,
+              content = opts.content or "ok",
+            },
+          },
+        },
+        toolUseResult = opts.result or { stdout = "hello", stderr = "", interrupted = false },
+      })
+    end
+
+    it("gives a shell command a row of its own", function()
+      -- A Bash call produces no `filePath`, so before this the pane could not see
+      -- it at all — and it is most of what a busy agent does.
+      put("/p/a.jsonl", {
+        tool_use_line("Bash", { command = "ls -la", description = "List the tree" }, "toolu_a"),
+        tool_result_line("toolu_a"),
+      })
+      local sum = fold("/p/a.jsonl")
+      expect(#sum.events).to_be(1)
+      expect(sum.events[1].kind).to_be("tool")
+      expect(sum.events[1].tool).to_be("Bash")
+      expect(sum.events[1].label).to_be("List the tree")
+      expect(sum.events[1].tool_id).to_be("toolu_a")
+      expect(sum.events[1].status).to_be("done")
+    end)
+
+    it("leaves the file tools to the rows they already have", function()
+      put("/p/a.jsonl", {
+        tool_use_line("Edit", { file_path = "/proj/x.lua" }, "toolu_e"),
+        edit_line("/proj/x.lua", 2, 1),
+      })
+      local sum = fold("/p/a.jsonl")
+      expect(#sum.events).to_be(1)
+      expect(sum.events[1].kind).to_be("edit")
+    end)
+
+    it("shows a call with no result yet as still running", function()
+      -- The row exists from the moment the agent starts the command, which is
+      -- the question the pane answers.
+      put("/p/a.jsonl", { tool_use_line("Bash", { command = "sleep 30" }, "toolu_b") })
+      local sum = fold("/p/a.jsonl")
+      expect(sum.events[1].status).to_be("running")
+    end)
+
+    it("finishes it when the result arrives in a later read", function()
+      put("/p/a.jsonl", { tool_use_line("Bash", { command = "sleep 1" }, "toolu_c") })
+      fold("/p/a.jsonl")
+      append("/p/a.jsonl", { tool_result_line("toolu_c") })
+      local sum = fold("/p/a.jsonl")
+      expect(sum.events[1].status).to_be("done")
+    end)
+
+    it("calls a failure a failure", function()
+      put("/p/a.jsonl", {
+        tool_use_line("Bash", { command = "false" }, "toolu_d"),
+        tool_result_line("toolu_d", { is_error = true, content = "Error: Exit code 1" }),
+      })
+      local sum = fold("/p/a.jsonl")
+      expect(sum.events[1].status).to_be("error")
+    end)
+
+    it("does not call a refusal a failure", function()
+      -- The CLI records both as `is_error`, and 32 of the 379 `is_error` results
+      -- across this project's real store are the user declining the call. Those
+      -- are the one thing in the pane the agent did not do wrong.
+      put("/p/a.jsonl", {
+        tool_use_line("Bash", { command = "rm -rf /" }, "toolu_r"),
+        tool_result_line("toolu_r", {
+          is_error = true,
+          content = "The user doesn't want to proceed with this tool use. The tool use was rejected",
+        }),
+      })
+      local sum = fold("/p/a.jsonl")
+      expect(sum.events[1].status).to_be("rejected")
+    end)
+
+    it("does not call output on stderr a failure", function()
+      -- Measured on one real session here: 3 `is_error` results against 55 with
+      -- something on stderr, nearly all of them from commands that succeeded.
+      put("/p/a.jsonl", {
+        tool_use_line("Bash", { command = "git status" }, "toolu_s"),
+        tool_result_line("toolu_s", { result = { stdout = "ok", stderr = "warning: detached HEAD" } }),
+      })
+      local sum = fold("/p/a.jsonl")
+      expect(sum.events[1].status).to_be("done")
+    end)
+
+    it("ends a call the user cancelled, rather than leaving it running for ever", function()
+      -- No result is ever written for one, so the interrupt marker is the only
+      -- thing that can close it — and a "still running" marker on a call that
+      -- ended an hour ago is the one thing in the pane that would be a lie.
+      put("/p/a.jsonl", {
+        tool_use_line("Bash", { command = "sleep 300" }, "toolu_i"),
+        vim.json.encode({
+          type = "user",
+          timestamp = "2026-08-02T20:31:00.000Z",
+          message = { role = "user", content = "[Request interrupted by user for tool use]" },
+        }),
+      })
+      local sum = fold("/p/a.jsonl")
+      expect(sum.events[1].status).to_be("interrupted")
+    end)
+
+    it("folds every call in one entry", function()
+      local line = vim.json.encode({
+        type = "assistant",
+        timestamp = "2026-08-02T20:30:00.000Z",
+        message = {
+          role = "assistant",
+          content = {
+            { type = "tool_use", id = "toolu_x", name = "Grep", input = { pattern = "foo" } },
+            { type = "tool_use", id = "toolu_y", name = "Bash", input = { command = "ls" } },
+          },
+        },
+      })
+      put("/p/a.jsonl", { line })
+      local sum = fold("/p/a.jsonl")
+      expect(#sum.events).to_be(2)
+      expect(sum.events[1].tool).to_be("Grep")
+      expect(sum.events[2].tool).to_be("Bash")
+    end)
+
+    it("folds none of them when the pane does not want them", function()
+      transcript.setup({ agents = { feed_tools = false } })
+      put("/p/a.jsonl", {
+        tool_use_line("Bash", { command = "ls" }, "toolu_a"),
+        tool_result_line("toolu_a"),
+        edit_line("/proj/x.lua", 1, 0),
+      })
+      local sum = fold("/p/a.jsonl")
+      expect(#sum.events).to_be(1)
+      expect(sum.events[1].kind).to_be("edit")
+    end)
+
+    describe("reading one back", function()
+      ---`tool_call` always answers through `vim.schedule`; the mock runs that
+      ---immediately, so this stays synchronous.
+      local function call_of(path, id)
+        local result, called = nil, false
+        transcript.tool_call(path, id, function(call)
+          result, called = call, true
+        end)
+        assert.is_true(called, "tool_call() did not answer synchronously")
+        return result
+      end
+
+      it("hands back what was run and what came back", function()
+        put("/p/a.jsonl", {
+          tool_use_line("Bash", { command = "ls -la", description = "List" }, "toolu_a"),
+          tool_result_line("toolu_a", { result = { stdout = "a.lua\n", stderr = "" } }),
+        })
+        local call = call_of("/p/a.jsonl", "toolu_a")
+        expect(call).not_to_be_nil()
+        expect(call.tool).to_be("Bash")
+        expect(call.input.command).to_be("ls -la")
+        expect(call.result.stdout).to_be("a.lua\n")
+      end)
+
+      it("decodes only the two lines that carry the id", function()
+        -- Which is why the payloads are read on demand instead of held: the id is
+        -- an exceptionally good prefilter, so the scan costs the same on a 12MB
+        -- transcript as on a small one.
+        local lines = {}
+        for index = 1, 20 do
+          lines[#lines + 1] = edit_line("/proj/x" .. index .. ".lua", 1, 0)
+        end
+        lines[#lines + 1] = tool_use_line("Bash", { command = "ls" }, "toolu_z")
+        lines[#lines + 1] = tool_result_line("toolu_z")
+        put("/p/a.jsonl", lines)
+        local before = decodes
+        call_of("/p/a.jsonl", "toolu_z")
+        expect(decodes - before).to_be(2)
+      end)
+
+      it("answers nil for a call the transcript no longer has", function()
+        put("/p/a.jsonl", { edit_line("/proj/x.lua", 1, 0) })
+        expect(call_of("/p/a.jsonl", "toolu_gone")).to_be_nil()
+      end)
+
+      it("answers nil rather than half a call when only the result survives", function()
+        put("/p/a.jsonl", { tool_result_line("toolu_orphan") })
+        expect(call_of("/p/a.jsonl", "toolu_orphan")).to_be_nil()
+      end)
+
+      it("hands back a call with no result as one still running", function()
+        put("/p/a.jsonl", { tool_use_line("Bash", { command = "sleep 30" }, "toolu_run") })
+        local call = call_of("/p/a.jsonl", "toolu_run")
+        expect(call).not_to_be_nil()
+        expect(call.result).to_be_nil()
+      end)
+    end)
+  end)
+
   describe("file history", function()
     ---`file_history` always answers through `vim.schedule`; the mock runs that
     ---immediately, so this stays synchronous.
