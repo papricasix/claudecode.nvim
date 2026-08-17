@@ -1,476 +1,452 @@
 # CLAUDE.md
 
-This file provides context for Claude Code when working with this codebase.
+Context for Claude Code when working with this codebase.
 
 ## Project Overview
 
-claudecode.nvim - A Neovim plugin that implements the same WebSocket-based MCP protocol as Anthropic's official IDE extensions. Built with pure Lua and zero dependencies.
+claudecode.nvim — Neovim plugin implementing the same WebSocket-based MCP protocol as Anthropic's official IDE extensions. Pure Lua, zero dependencies.
 
 ## Common Development Commands
 
 ### Testing
 
-- `mise run test` - Run all tests using busted with coverage
-- `busted tests/unit/specific_spec.lua` - Run specific test file
-- `busted --coverage -v` - Run tests with coverage
+- `mise run test` — run all tests (busted, with coverage)
+- `busted tests/unit/specific_spec.lua` — run one test file
 
 ### Code Quality
 
-- `mise run check` - Check Lua syntax and run luacheck
-- `mise run format` - Format code with treefmt
-- `luacheck lua/ tests/ --no-unused-args --no-max-line-length` - Direct linting
+- `mise run check` — Lua syntax + luacheck (0 warnings required)
+- `mise run format` — treefmt
+- `luacheck lua/ tests/ --no-unused-args --no-max-line-length`
 
-### Build Commands
+### Build
 
-- `mise run all` - **RECOMMENDED**: Run formatting, linting, and testing (complete validation)
-- `mise run test` - Run all tests using busted with coverage
-- `mise run check` - Check Lua syntax and run luacheck
-- `mise run format` - Format code with treefmt
-- `mise run clean` - Remove generated test files
-- `mise tasks` - List available tasks
+- `mise run all` — **RECOMMENDED**: format, lint, test. Always run before committing.
+- `mise run clean` — remove generated test files
+- `mise tasks` — list tasks
 
-**Best Practice**: Always use `mise run all` at the end of editing sessions for complete validation.
+### Toolchain (mise)
 
-### Development with mise
+Toolchain comes from [mise](https://mise.jdx.dev) (`mise.toml`); it replaced the former Nix flake devShell.
 
-The dev toolchain is provisioned by [mise](https://mise.jdx.dev) (see `mise.toml`), which replaced the former Nix flake devShell.
+- `mise install` — install tools (Neovim, LuaJIT, formatters)
+- `mise run setup` — build test rocks (busted/luacheck/luacov) into `./.luarocks`
+- Activate mise in your shell (`eval "$(mise activate fish)"`) so its tools and `fixtures/bin` are on PATH. `mise run <task>` works without activation.
+- `mise` sets `LUA_PATH`/`LUA_CPATH` (`mise.toml` `[env]`). Module-not-found in tests usually means busted ran outside the mise env — use `mise exec -- busted ...`.
 
-- `mise install` - Install all tools (Neovim, LuaJIT, formatters, etc.)
-- `mise run setup` - Build the Lua test rocks (busted/luacheck/luacov) into `./.luarocks`
-- `mise run all` - Format, lint, and test
-- `mise run format` - Format all files with treefmt
-- Activate mise in your shell so its tools (and `fixtures/bin`) are on PATH — add `eval "$(mise activate bash)"` (or `zsh`/`fish`) to your shell rc. (`mise run <task>` works without activation.)
+### Integration Fixtures
 
-### Integration Testing with Fixtures
+`fixtures/` holds test Neovim configs. `source fixtures/nvim-aliases.sh` enables:
 
-The `fixtures/` directory contains test Neovim configurations for verifying plugin integrations:
+- `vv <config>` / `vve <config>` — start Neovim with a fixture config
+- `list-configs` — list available configs
 
-- `vv <config>` - Start Neovim with a specific fixture configuration
-- `vve <config>` - Start Neovim with a fixture config in edit mode
-- `list-configs` - Show available fixture configurations
-- Source `fixtures/nvim-aliases.sh` to enable these commands
-
-**Available Fixtures**:
-
-- `netrw` - Tests with Neovim's built-in file explorer
-- `nvim-tree` - Tests with nvim-tree.lua file explorer
-- `oil` - Tests with oil.nvim file explorer
-- `mini-files` - Tests with mini.files file explorer
-
-**Usage**: `source fixtures/nvim-aliases.sh && vv oil` starts Neovim with oil.nvim configuration
+Available: `netrw`, `nvim-tree`, `oil`, `mini-files`.
 
 ## Architecture Overview
 
 ### Core Components
 
-1. **WebSocket Server** (`lua/claudecode/server/`) - Pure Neovim implementation using vim.loop, RFC 6455 compliant
-2. **MCP Tool System** (`lua/claudecode/tools/`) - Implements tools that Claude can execute (openFile, getCurrentSelection, etc.)
-3. **Lock File System** (`lua/claudecode/lockfile.lua`) - Creates discovery files for Claude CLI at `~/.claude/ide/`. A lock is deleted on `VimLeavePre`, which a crash or `kill -9` never reaches, so `cleanup_stale()` sweeps the directory once per Neovim (from `setup`, before any server claims a port). That directory is shared with every other editor and user, so the sweep is deliberately timid: `uv.kill(pid, 0)` decides liveness, and **only an explicit `ESRCH` counts as dead** — `EPERM` means the process is alive but owned by someone else, and an unparseable or pid-less lock is always left alone. This matters because Windows recycles pids aggressively; erring toward "alive" only leaks a lock file, while erring the other way deletes a live editor's. Discovery reaches these files only when `CLAUDE_CODE_SSE_PORT` is unset — i.e. our server failed to start — in which case the CLI scans the directory and may attach to _another_ editor, which is why `terminal.lua` logs an error rather than launching silently in that state
-4. **Selection Tracking** (`lua/claudecode/selection.lua`) - Monitors text selections and sends updates to Claude
-5. **Diff Integration** (`lua/claudecode/diff.lua`) - Native Neovim diff support for Claude's file comparisons. The unified (inline) provider scrolls the change into view with `center_diff_region`: `_measure_diff_region` reads unified.nvim's extmarks to get the changed line span **plus the deleted lines**, which are virtual lines hung off those marks and therefore invisible to a plain `zz` (they scroll off the top). `_diff_scroll_position` then centers the whole change when it fits the window, and otherwise pins its first changed line — with the lines deleted above it, via `topfill` — to the top. Applied with `winrestview`, since `topfill` is the only way to keep leading virtual lines on screen. Shared with the live cursor's edit preview, which renders the same marks.
-6. **Terminal Integration** (`lua/claudecode/terminal.lua`) - Manages Claude CLI terminal sessions with support for internal Neovim terminals and external terminal applications
-7. **Live Cursor** (`lua/claudecode/live_cursor.lua`) - Opt-in "ride-along" view. Injects a Claude Code `PreToolUse` hook at launch (via `claude --settings`, so user settings are untouched) that reports `Read`/`Edit`/`Write` tool events back over Neovim's RPC socket. The hook is a small cross-platform Lua script (`scripts/live_cursor_hook.lua`) run as `nvim --headless -u NONE -l` — no shell or POSIX tools, so it works identically on macOS, Linux, and native Windows. It reads the event JSON from stdin, `sockconnect`s to the launching Neovim (`CLAUDECODE_NVIM_SERVER`), and forwards it to `live_cursor.ingest`, stamped with the launching tabpage via `CLAUDECODE_NVIM_TAB` so background-tab Claudes don't preview in the current tab — and, for an agents-mode launch, with `CLAUDECODE_AGENT_ID`, which names the _launch_ rather than the conversation (see 12: the conversation is the thing that moves). Reads highlight the read line range; edits render a real inline diff via unified.nvim (`show_diff` reconstructs the pre-edit file and calls `unified.diff.show_against_text`), falling back to a line highlight when unified.nvim is absent. `Write` is handled separately by `show_write`: the hook fires _before_ the tool runs, so a file Claude is creating does not exist yet — opening the path would show an empty buffer that never fills in (the write may only land once you answer the permission prompt, or never if you reject it). The payload already carries the whole file in `tool_input.content`, so that is rendered directly, diffed against the pre-write content — `""` for a new file, so every line reads as an addition; for an overwrite, the on-disk text **snapshotted synchronously in `dispatch`**, since the deferred preview would otherwise read a file the write had already replaced and diff it to nothing. Without unified.nvim it still shows the content, just undiffed. All snippet/content text goes through `split_lines`, which strips the CR of a CRLF file as well as the trailing empty element: every line we compare against comes from `readfile()`, which already removed it, so without this a Windows file's every line would mismatch and the whole file would read as changed. Reads and edits are suppressed when a review diff already owns the file (`diff.is_live_for_file`), and the diff calls `live_cursor.on_diff_opened` the instant it opens to dismiss any in-flight preview (closing the race where the preview opens just before the diff registers as pending). Without this coordination the preview and the diff fight over the same window — which can leave the diff's `acwrite` buffer in a state where accepting with `:w` fails (`E676`). `diff.find_main_editor_window` also skips the preview split (tagged with the `claudecode_live_preview` window var) so a diff never opens into it. Both modes resolve their target editor window via `diff.find_window_closest_to_terminal` (the same geometry-based finder the plan view uses), falling back to `find_main_editor_window`. Each previewed file is opened with `bufadd`/`bufload`, so to keep the buffer list from growing one entry per file Claude touches over a long session, the module tracks the buffers it created (`state.owned_bufs` — a file you already had open is never owned, gated on a pre-`bufadd` `bufexists` check) and reaps them via `reap_owned` once they leave the screen: on every `show`/`show_diff`/`show_write`, on idle-close, on `on_diff_opened`, and on `cleanup`. A still-displayed, currently-active (`last_buf`), or modified buffer is left alone (`force=false` so unsaved changes refuse deletion) and retried on a later pass — but `last_buf` is cleared when the inactivity timer fires (and in `on_diff_opened`), so the last file of a burst is reaped too instead of lingering forever as a loaded, **unlisted** buffer that no buffer picker shows. That leftover buffer is what made the preview marker haunt a later plain `:edit`: Neovim remembers window-local options **per (window, buffer) pair**, so a window that once wore the preview `winbar` re-applies it the next time that same buffer returns to it — no code of ours involved, long after the preview is over. Three things contain that. `apply_preview_marker` snapshots the window's own `winbar`/`winhighlight` before overwriting them (`state.marker`) and `strip_preview_marker` puts them back rather than blanking them — `winhighlight` is window-local only, never remembered per buffer, so blanking would silently drop a user's or plugin's setting. Every buffer swap we make goes through `swap_preview_buf`, which strips the marker _before_ `nvim_win_set_buf` so the options Neovim snapshots for the outgoing buffer are the window's own, and records `state.preview_buf` _before_ the swap because `BufWinEnter` fires synchronously inside it. And a `BufWinEnter`/`WinEnter`/`BufWinLeave` watcher (`ensure_preview_watcher`, armed from `setup`) notices anyone else putting a buffer in the preview window — a file picker, a `:edit`, a jump — and calls `release_preview_window`, which restores the options, drops the `claudecode_live_preview` tag, and forgets the window. The idle close does the same instead of leaving a focused preview window marked forever: it hands the window over (`handover = true` also unowns the buffer shown there and lists it, so it behaves like a file the user opened).
-8. **Plan View** (`lua/claudecode/plan_view.lua`) - Opt-in. Renders Claude's plan-mode plan in an editor split, like the VS Code extension. Claude presents a plan by calling its built-in `ExitPlanMode` tool (internal to the CLI — never sent over the MCP WebSocket), whose `tool_input.plan` carries the plan markdown. It rides the **same launch hook** as Live Cursor: `build_launch_injection` adds `ExitPlanMode` to the `PreToolUse` matcher (and a `PostToolUse` entry scoped to `ExitPlanMode`) whenever the plan view is enabled, even if Live Cursor is off. `live_cursor.dispatch` routes the event — `PreToolUse(ExitPlanMode)` (plan ready to read, before the user decides) → `plan_view.show`. Rather than opening its own split, the plan **takes over the editor window closest to the Claude terminal** (`diff.find_window_closest_to_terminal`, which reuses `find_main_editor_window` for suitability and picks by screen geometry via `_closest_rect_index`); it records the displaced buffer/cursor and restores them on resolve. The hosting window is tagged with the `claudecode_live_preview` var (cleared on restore) so review diffs skip it while the plan shows. Only when there is no editor window to reuse does it fall back to a created split (closed, not restored, on resolve). The plan is dismissed on resolution: `PostToolUse(ExitPlanMode)` (user accepted) or the next tool event of any kind (covers reject → replan and accept → execute), both → `plan_view.close`. Tab-aware via the same `CLAUDECODE_NVIM_TAB` stamp. Falls back to the longest string in `tool_input` if the `plan` field is ever renamed.
-9. **Terminal Links** (`lua/claudecode/terminal_links.lua`) - On by default. Click a file path in the Claude terminal to open it in the editor (VS Code parity) instead of the OS file explorer. Claude renders file references (`Read`/`Update`/`Write` headers, inline `path:line`) as OSC 8 hyperlinks carrying a `file://` URL, but inside Neovim's `:terminal` those clicks are forwarded to Claude, which shells out to the OS opener — and Neovim has no built-in "open hyperlink on click". So this module captures the OSC 8 URLs and intercepts the click itself. A `TermRequest` autocmd records the **set of linked file paths** for the terminal (`_url_to_path` handles absolute _and_ the relative `file://name` form Claude emits for cwd files shown by name). It deliberately does **not** track screen coordinates: Claude's TUI repaints/scrolls links to buffer rows that no longer match where the OSC 8 fired, so geometry-based lookup misses almost every real click (verified empirically). Instead a buffer-local `<LeftMouse>` map opens on **release** (opening on press races the trailing `<LeftRelease>`, which then starts a stray visual selection in the editor) and `_resolve_click` matches the **filename token under the cursor** against the captured paths — exact, `/<token>` suffix (basename or relative path → absolute), or a long substring (a wrapped multi-line path/filename's chunk); a bare word matching nothing is left for Claude. The file opens in the editor window closest to the terminal (`diff.find_window_closest_to_terminal`, the plan view's targeting), jumping to `:line` when shown; non-link clicks are re-fed so Claude's own mouse UI keeps working. A normal-mode `gf` keymap does the same for the path under the cursor. Enabling the feature also turns on `'mousemoveevent'` so Claude's own hover (link underline) works in `:terminal`. Config: `terminal_links = { enabled, click, key = "gf", mouse_motion }`.
+1. **WebSocket Server** (`lua/claudecode/server/`) — pure `vim.loop`, RFC 6455 compliant.
+2. **MCP Tool System** (`lua/claudecode/tools/`) — tools Claude can execute.
+3. **Lock File System** (`lua/claudecode/lockfile.lua`) — discovery files at `~/.claude/ide/`.
+4. **Selection Tracking** (`lua/claudecode/selection.lua`).
+5. **Diff Integration** (`lua/claudecode/diff.lua`).
+6. **Terminal Integration** (`lua/claudecode/terminal.lua`) — internal and external terminals.
+7. **Live Cursor** (`lua/claudecode/live_cursor.lua`) — opt-in ride-along view.
+8. **Plan View** (`lua/claudecode/plan_view.lua`) — opt-in plan-mode rendering.
+9. **Terminal Links** (`lua/claudecode/terminal_links.lua`) — on by default.
+10. **Session Persistence** (`lua/claudecode/session_state.lua`) — opt-in.
+11. **Per-Tab Status** (`lua/claudecode/status.lua`) — opt-in.
+12. **Agents Mode** (`lua/claudecode/agents_view.lua`, `lua/claudecode/agents/*.lua`) — opt-in.
+13. **Floating Windows** (`lua/claudecode/float.lua`).
 
-10. **Session Persistence** (`lua/claudecode/session_state.lua`) - Opt-in (`session_persistence = "off"|"global"|"external"`). Restores each tab's Claude _conversation_ when a saved Neovim session is loaded. Every launch is stamped with a conversation id we choose — `terminal.get_claude_command_and_env` appends `--session-id <uuid v4>` (`utils.random_bytes`, shared with the lockfile's auth token) — so the chat has a stable name instead of one we would have to discover; a later start asks for it back with `--resume <uuid>`. `launch_args` is idempotent per tab (every terminal toggle rebuilds the command, so a tab keeps its id) and stands down entirely when the command already picks a conversation (`-r`, `-c`, `--session-id`, `--fork-session`, `--from-pr` — checked against the whole command, so a `terminal_cmd = "claude --continue"` is respected). The id is corrected by the launch hook: session persistence adds a `SessionStart` entry to `live_cursor.build_launch_injection` (injected even when live cursor and plan view are both off — an empty `PreToolUse` matcher would match every tool, so that entry is omitted instead), and `live_cursor.dispatch` feeds every payload's `session_id` to `note_session_id`, which makes the reported id authoritative after a `/clear` or a manual resume. **The module does no file I/O**: `capture()`/`restore()` exchange a versioned plain table so whatever already persists the user's Neovim session carries the ids — `"global"` mirrors it into `g:CLAUDECODE_SESSION` (`:mksession` writes it when `'sessionoptions'` has `globals`; re-applied on `SessionLoadPost`), `"external"` leaves storage to auto-session's `save_extra_data`/`restore_extra_data` or the shipped resession extension (`lua/resession/extensions/claudecode.lua`). Tabs are keyed by **tab number**, not tabpage handle: handles are not stable across a restart and `:mksession` cannot save tab-local vars, so position is the only identity a restored session reproduces. Restore is **lazy** — it arms tabs (`pending`) and the CLI only starts on that tab's next terminal toggle, so N restored tabs are not N processes at startup (`open_pending`, behind `:ClaudeCodeSessionRestore!`, forces the eager path: it switches to each armed tab, calls `terminal.ensure_visible`, and restores the original tab/window). `:ClaudeCodeSessionRestore` re-reads the `"global"` payload unconditionally but never gates the rest on that call's result — in `"external"` mode the session manager has already armed the tabs, and an earlier version returned early there, making the command a silent no-op for resession/auto-session users. It reports `pending_count()` without `!`. Bound to `<leader>aR` (only when `session_persistence` is not `"off"`, so the key stays free otherwise). A pending id is dropped rather than resumed if the tab's cwd changed (a conversation belongs to the directory it started in) or if no transcript exists — checked by globbing `<CLAUDE_CONFIG_DIR|~/.claude>/projects/*/<id>.jsonl`, which sidesteps the CLI's undocumented path-to-slug rule since ids are unique on their own. A tab that already has a live record is never retargeted by a restore. **Only ids the CLI wrote a transcript for are ever persisted** (`persistable_id`, applied in `capture()`): a minted id is a _name_, not a conversation, until the first message — the CLI creates the `.jsonl` only then, and `--resume` on such an id fails. Persisting one anyway is what made restores rot in place, verified against a real saved session: every eager restore (`<leader>aR`) opens a Claude in each armed tab, the tabs the user does not talk in save an unresumable id, the next restore drops exactly those and mints fresh ones — so half the tabs resumed and half started new, run after run. A record therefore also carries `fallback`, the last id of that tab that did exist, so an unproven id never overwrites a real conversation (it is set wherever a record is replaced: a fresh mint in `launch_args`, and the hook's `note_session_id` after a `/clear` or manual resume). A tab with neither is left out of the payload entirely — it opens fresh rather than being armed with garbage. `forget()` deletes the whole record, fallback included, so this never resurrects a chat the user closed. **A conversation the user closed is not restored**: `forget(tab)` drops the record when Claude's process ends while Neovim is still running. The two kinds of "the terminal closed" are told apart by ordering, verified empirically — on exit Neovim fires `VimLeavePre`/`VimLeave` _before_ `TermClose`, so a `TermClose` arriving while `M.state.shutting_down` is unset is the user's doing. The watcher uses `TermClose` rather than the providers' own exit hooks because during shutdown the job's `on_exit` never runs at all (and snacks only registers its `TermClose` when `auto_close` is on). `TermClose` reports only a buffer, and a hidden terminal is in no window, so `terminal.tag_terminal_tab` stamps `b:claudecode_tab` right after `provider.open` — every provider keys its state by the current tabpage, so that is the terminal's tab by construction. Any exit counts, including a crash. The **external** terminal provider has no terminal buffer and therefore no `TermClose`, so a Claude closed in an external terminal is still restored.
+---
 
-11. **Per-Tab Status** (`lua/claudecode/status.lua`) - Opt-in (`status = { enabled }`). Publishes each tab's Claude as `busy` / `waiting` (on you) / `idle` / `none`, for tablines, statuslines and third-party plugins — the question "which of my tabs is working and which one wants an answer?" has no answer from outside the CLI, since the MCP WebSocket only carries the editor actions Claude asks for, never the conversation's own state. So it rides the **same launch hook** as Live Cursor and the Plan View and folds Claude Code's lifecycle events into a state machine (`note`): `UserPromptSubmit`/`PreToolUse`/`PostToolUse`/`PreCompact` → busy, `PreToolUse(ExitPlanMode)` → waiting (a plan is on screen for the user to accept), `Notification` → waiting with its message — _unless_ the message is the "waiting for your input" idle nudge, which is an idle timer, not a question — `Stop` → **done** or idle, `SessionStart`/`SessionEnd` → idle/none. `done` is "finished but unread": `finished_state` lands a turn in `idle` only when that tab was current _and_ Neovim had focus when the answer arrived, so an answer that landed on a background tab — or while the user was in another app — is marked unread until they actually arrive (`mark_read`, wired to `TabEnter`/`TabNewEntered` and to `FocusGained`, which is also where `set_focused` comes back; `FocusLost` clears it). Reading never clears `waiting`, since looking at a question is not answering it. `PostToolUse` is what makes `waiting` end: between answering a permission prompt and the tool's result **nothing else fires**, so without it a tab would read as waiting for the whole run. That is also why enabling this widens the injected `PreToolUse` matcher to `"*"` (and adds a `"*"` `PostToolUse`) instead of live-cursor's file-tool matcher: a `Bash` call must not read as idle. It is the one feature that costs a hook invocation (a headless `nvim`) per tool call — hence opt-in. State is keyed by **tabpage handle**, not tab number like `session_state`: nothing here outlives the Neovim session, and handles are never reused. `terminal.tag_terminal_tab` calls `note_launch` so a tab counts as having a Claude before its first hook event lands (never overriding a known state), and the `TermClose` watcher in `init.lua` — extended to arm for this feature too — clears the tab when Claude ends, on shutdown as well as on a user-closed chat. Changes emit `User ClaudeCodeStatusChanged` (`data = { tab, tabnr, state, prev, status }`) and, unless `auto_redraw = false`, a `redrawtabline`/`redrawstatus`; a repeat event that changes nothing user-visible is swallowed so a tabline is not redrawn per tool call. `since` marks when the _state_ was entered (a busy→busy tool change keeps it) so a consumer can age it. `get`/`all` hand out copies, so a consumer cannot corrupt the state. An icon may also be a **list of frames** (`M.SPINNER` reproduces the CLI's own spinner, read out of the shipped binary rather than approximated: six glyphs `· ✢ ✳ ✶ ✻ ✽` played forwards then backwards — the CLI builds `[...frames, ...frames.reverse()]`, so the turning points repeat and the motion breathes instead of jumping — advanced one frame per 120ms, which is our `spinner_ms` default, and with the last glyph swapped for `✻` when `$TERM` is `xterm-ghostty`, as the CLI does. All are single-width so a tabline does not jitter as they cycle — except on Windows and in Windows Terminal (`win32`, or `WT_SESSION`/`ConEmuANSI`, so WSL Neovim in that host counts too), where `✳` U+2733 — the one frame Unicode marks emoji-capable — is drawn with the colour emoji font, coloured and often double-width; there it becomes `✱` U+2731, the same asterisk with no emoji presentation); `icon()` then returns the current frame and a `spinner_ms` timer advances it. That timer is started/stopped by `sync_spinner` from every path that mutates `entries`, so it runs only while a tab actually shows an animated icon — it drives a repeating `redrawtabline`/`redrawstatus` of the whole UI, which must not outlive the work it depicts — and it never starts under `auto_redraw = false`, where the redraw is the consumer's to do. Animated views that a `redrawtabline` cannot reach register with `status.on_frame(name, fn)` and are called on the tick that _advances_ the frame, whichever timer that was — so the session list and the tabline change glyph together instead of each on its own timer's phase, and a tick that is not yet due redraws nothing at all. Stopping the timer no longer resets the frame: the counter is shared, and resetting it yanked the agents view's spinner back to its first glyph every time some tab's Claude happened to finish. The frame counter is **global, not per tab**, so every view showing a spinner shows the same one. **There is exactly one timer driving it, and `request_frames(name, interval_ms)` is how a view shares it** — a view that animates something a `redrawtabline` cannot reach (the agents view, whose rows are keyed by conversation, so no tab's state describes them) asks for the clock instead of running its own, and `sync_spinner` starts the timer when either some tab shows an animated icon or someone has asked. **It runs at `status.spinner_ms`**, the one setting for the one spinner; a requester may name a rate to override it, but does not do so by default. Taking the fastest of the requested rates was the first rule and it was wrong: with `status.spinner_ms = 250` and the agents view carrying its own default of 120, activating that tab silently sped the _tabline_ up to more than twice its configured pace (measured: 251ms → 119ms while the agents tab was current, 250ms again on leaving it). `agents.spinner_ms` therefore has no default at all now. That replaced a second timer in the agents view, which was a race over one counter held in check only by `_tick`'s interval guard — and it leaked: measured, leaving the agents tab and coming back left that timer armed _in addition to_ status's, doubling `_tick` calls from 10 to 20 per 1.2s, two repeating full-UI redraws for one animation. (The visible glyph rate survived, because the guard absorbed it, but nothing should depend on that.) `open()` now arms through `sync_timers` rather than `arm_poll` alone, which is why the leak was reachable at all: a freshly opened view never requested the clock, so the first `TabEnter` was what started it. `_tick(interval_ms)` still marks a timer-driven tick and only redraws when the frame has not already advanced within that interval, so a stray second ticker cannot double the beat; `_frame_requests()` says who is currently holding the clock open. `_tick()` with no interval is an unconditional manual step, which is what a test wants. **A turn the user cancelled with `<Esc>` is reported by no hook at all** — verified against the real CLI (2.1.221) by driving an interactive session through a pty with a hook registered on every event Claude Code defines: submitting a prompt fires `UserPromptSubmit` and the interrupt fires nothing, not `Stop` and not the `StopFailure` the binary also carries. So an interrupted tab stayed `busy` for ever and its spinner kept animating — kept driving a repeating `redrawtabline` of the whole UI — until the next prompt. What the CLI _does_ do is write `[Request interrupted by user]` into the conversation as a real `user` entry, so the transcript is the one place a cancel is reported: `agents.transcript` matches that marker (`INTERRUPT_MARKER`, prefix-matched because a tool interrupt appends `for tool use`; `_is_interrupt_line` then decodes the entry and checks the marker is the _whole_ message content, because `toolUseResult` entries are `type:"user"` too and a conversation whose tool output quotes the string — a transcript of writing this code does — otherwise reads as cancelled) and `agents.model` calls its own per-conversation `note_interrupt`. A tab-hosted Claude with agents disabled — the configuration the bug was reported in — is covered by **`lua/claudecode/interrupt_watch.lua`**, which tails a `busy` tab's transcript for the same marker and calls `status.note_interrupt`, dropping that tab to `idle` and leaving every other state alone. Its clock runs _only_ while some tab is `busy` (the one state an interrupt can end, and exactly when the spinner is already burning a repeating full-UI redraw), it is **armed at end-of-file** on the transition into `busy` — which is what makes any marker it goes on to see belong to the turn being watched, so it needs none of the timestamp bookkeeping the agents side does — and a tick is one `uv.fs_stat` per busy tab plus a read of only the appended bytes, capped at 256KB. The marker test is `transcript._is_interrupt_line` in both places, never a substring match. Detection rides a 500ms tick rather than firing on the keypress, which is inherent to reading a file instead of receiving an event. Two rules keep that from firing on the wrong turn, and the first version had neither: **the marker is stamped with its own timestamp and only ends a turn that started before it** — a transcript keeps every interrupt the conversation ever had, so its mere presence says nothing — and **"already acted on" is keyed by conversation, not stored on the row**, since `refresh_list` replaces every row table on its 2s timer. Missing both showed up as an agent's spinner freezing whenever its counts updated: a finished tool re-reads the transcript, an hour-old marker fired again, and `busy` fell back to `idle` until the next hook event. Reading the keypress instead was built and rejected: `<Esc>` means a dozen other things in Claude's TUI — dismissing a panel, clearing the input — and during a turn with no tool calls there is no later event to correct a wrong guess with, so a tab could read idle for minutes while Claude worked.
+### 3. Lock Files
 
-12. **Agents Mode** (`lua/claudecode/agents_view.lua`, `lua/claudecode/agents/*.lua`) - Opt-in (`agents = { enabled }`), bound to `<leader>aA` / `:ClaudeCodeAgents`. A dedicated tabpage running several Claudes on one project side by side: the selected agent's terminal in the centre, the project's sessions top-right, that agent's file activity bottom-right, and the files it touched on the left. **Every number comes from the CLI's own transcript store** (`<CLAUDE_CONFIG_DIR|~/.claude>/projects/<slug>/<id>.jsonl`), not from our own accounting, which is what makes them right even for a conversation that ran in another editor: `agents/transcript.lua` folds each file's `toolUseResult.structuredPatch` hunks — counting `+`/`-` prefixed lines — plus the session's name. That name is the user's own if they renamed the session (`{"type":"agent-name","agentName":…}`, last one wins), else the CLI's generated `ai-title`, else the first user message: a rename is the user saying the generated title was wrong, and it has to be read on its own because renaming only _sometimes_ rewrites `aiTitle` too (4 of 22 renamed transcripts here did). A `Write` that _creates_ a file records an empty patch (there is no "before" to diff), so the whole `content` is counted instead; without that every new file reads `+0`. Reading is cheap enough to run per tool call because of two things: a **substring prefilter** (`"toolUseResult"` and `"structuredPatch"`/`"file":`) skips ~99% of the bytes and every Bash result before `vim.json.decode` — one real 490KB transcript is 86 lines with a single 188KB line, of which only 9 matter — and the log is append-only, so `offset` (advanced only to the end of the last _complete_ line, so a scan caught mid-write re-reads that line rather than losing it) makes a live update cost only the new bytes. `(size, mtime, ino)` is the cache key: a shrink or a new inode means compaction rewrote the file, and the fold restarts. **Finding that directory is the whole feature on Windows**, and it went wrong there in two places at once: the slug is the cwd with every non-alphanumeric character replaced by a dash, and `fnamemodify(cwd, ":p")` appends a separator the CLI never slugifies — stripping only a trailing `/` left `D--proj-` against the CLI's `D--proj`, so every Windows project reported "no sessions for this project" (verified on a real Windows install). The fallback that exists for exactly this — scan every project directory for a transcript naming this cwd — could not save it, and not only on Windows: it asked the _asynchronous_ reader and treated "has not answered yet" as "no match", which the real reader never does answer in time, so a slug miss was always an empty list. It now reads through `_io.read_sync` (bounded, and only on the miss path) and matches the cwd both raw and with its separators escaped the way JSON writes them, case-folded on Windows. `slugify` also implements the CLI's second rule, read out of the shipped binary rather than guessed: past **200 characters** the slug is cut there and `-<hash>` appended, where the hash is `h = h * 31 + unit` over the path's **UTF-16 code units** kept to a signed 32-bit int, then `Math.abs(h).toString(36)`. Code units, not bytes: `replace(/[^a-zA-Z0-9]/g, "-")` in JavaScript substitutes one dash per unit, so a two-byte `ö` is one dash and an astral emoji is two — counting Lua's bytes would name a directory that does not exist. Both halves are checked against the CLI's own algorithm run in node, not against this implementation. The same "two spellings of one path" problem runs through the panes: `utils.normalize_path`/`path_key` (`/` separators, no trailing one, case-folded on Windows) is what `git.parse_status` keys by — git answers with `/` separators on every platform while the paths it is asked about are the CLI's `D:\Git\proj\x.lua`, so joining the two verbatim produced keys nothing could match and no file got a status letter — and what `render.relative_path` compares by; `render.shorten_path` splits on both separators, keeping a drive with the folder it names, since splitting on `/` alone left a Windows path as a single segment and sent it to the tail cut that function exists to avoid. Nothing blocks — reads go through `uv.fs_*` callbacks in `_chunk_size` slices, sessions are folded a `fold_batch` at a time newest-first, and a warm cache under `stdpath("cache")` means a reopen paints real numbers in frame one (unknown ones show `+· -·`, never blank, which would read as "changed nothing"). **Each agent gets its own MCP server** (`claudecode.start_agent_instance`) — own port, token and lock file — which is why `M.instances` is keyed by opaque instance id with `M.tab_instance` pointing at a tab's _own_ Claude, and why `_G._claudecode_active_tab_id` is gone in favour of `claudecode.request_context`: with N Claudes in one tab, "which tab" no longer identifies the sender. That granularity is load-bearing for `close_all_diffs`, which scopes by instance so one agent's routine `closeAllDiffTabs` cannot reject a sibling's pending diff (the same spurious-rejection bug tab scoping was written to fix, one level down). **A launch never enters a directory that is no longer there**: a row records the cwd its conversation _ran_ in, and renaming or moving a project leaves every one of its transcripts naming a path that is gone — `termopen` refuses such a cwd outright (`E475`), so those conversations could not be started at all ("could not start the Claude process") though they read perfectly well in every pane. An unusable recorded path is dropped for the directory the view is attached to, which for a moved project is where those transcripts now live anyway, and a failed spawn now reports the reason it was given rather than one sentence for every cause. Agents run through `agents/registry.lua` rather than the terminal providers, which hold one terminal per tabpage; `bufhidden = "hide"` is the single option that lets a hidden agent keep working, so switching is a buffer swap. `session_state.disown_tab` keeps the view's tab out of per-tab session bookkeeping, which could otherwise only ever name one of its agents. Every pane carries the `claudecode_live_preview` tag and the tab is marked `claudecode_agents`, so diffs, previews and the plan view never take one over, and the tab declares `t:claudecode_layout_owner = { forbids_split, host = "float", float_module, origin }` — the routing protocol every "where does this file go" decision reads (`diff.resolve_target_window`), so a split never carves up the layout and no shared module has to know this feature exists. `openFile` and a clicked terminal link used to have their own ladders ending in a `vsplit`, and since every pane is tagged not-an-editor that fallback fired every time: an agent's `openFile` now floats, while a **clicked** path goes to a real editor window in the origin tab and takes you there — deliberately different, one is the agent's idea and the other is yours. Diffs and file opens land in cascading **floats** (`agents/float.lua`, a thin wrapper over the feature-neutral `lua/claudecode/float.lua` — see 13), tagged and titled per agent so several are answerable at once, and wearing **the user's own display settings** rather than the pane's (see 13); a float records what it is _for_, so `float.close_all(session_id, "open")` dismisses the file a plan was shown in — on `PostToolUse(ExitPlanMode)`, one of the two narrowly-scoped hooks agents mode registers even under polling (the other being `SessionStart`, below) — without touching a pending diff, which is a question still waiting for an answer. The diff float hosts the existing unified inline provider, so `:w` acceptance and the blocking MCP response are unchanged — and the float is recorded on the diff state (`float_window`) so `_cleanup_diff_state` closes it on resolve, forced, since a rejected diff's buffer is still modified and a plain close would refuse. Without that the float outlived its diff: cleanup restored the displaced buffer into it, so the change vanished and an empty frame stayed on screen — `diff_opts.layout = "float"` needs unified.nvim, and warns once when it resolves to the native provider, which needs two real windows. **Live cursor and the plan view stand down for agents** (`live_cursor.from_agents_mode`, checked in `dispatch` after status/agents routing and before anything that opens a window): every window in the agents tab is a pane, so there is no editor window to ride along in — the preview would take one over, and with none suitable it landed wherever the cursor happened to be. Detected by the tab stamp _or_ `registry.is_live(session_id)`, since the stamp only says where the CLI launched. Live state is per **conversation**, not per tab (`status.classify` extracted so the rules stay shared). `done` — finished but unread — takes the same three conditions here as the tab-level rule: the conversation has to be the selected one (every pane follows the selection, so that is the only one on screen), the view's tab has to be current, and Neovim has to have focus (`status.is_focused`, exported so the two rules cannot drift). Testing only the selection was wrong in the direction that matters — the agent you are waiting on is usually the selected one, and its answer arriving while you work in another tab is exactly the case the unread dot exists for. Clearing it needs its own wiring, since nothing else ever revisits a status entry: `model.mark_read` (`done` → `idle`, `waiting` untouched — looking at a question is not answering it) is called by `model.select`, which covers `<CR>` on a row and `<C-n>`/`<C-p>` onto it in one place, and by `agents_view.mark_selected_read` on `TabEnter`/`FocusGained`, for the answer that arrived on a selection you had already made. `status`'s own pair of autocmds cannot help: its entries are keyed by tab, and several conversations share this one. `source = "auto"` rides the hooks `status` already pays for, else polls transcript mtimes — the hook cost is two headless `nvim` per tool call _per running agent_, which is why polling is the default when nothing else wants hooks. The Activity pane lists events **newest first** (`model.feed` reverses the store's oldest-first order and trims the oldest), so what an agent is doing now sits at the top edge instead of scrolling off the bottom; **It lists the calls that touch no file too** (`agents/tools.lua`, `agents/tool_view.lua`, `agents/ansi.lua`) — the shell commands, searches and subagents, which are most of what a busy agent does and which nothing in the view could see before: they produce no `filePath`, so the fold that builds every other row skipped them by construction. A call and its result are two entries joined by a `toolu_…` id, and the **row is built from the call**, not the result, so a command appears the moment the agent starts it rather than when it finishes — which is what lets one still running be shown as running at all. Only three of the five outcomes are drawn (`…` running, `✗` failed, `⊘` stopped by you): most calls simply work, and a pane of ticks carries no signal. **Failure is `is_error`, never stderr**, measured across this project's real store — one session has 3 `is_error` results against 55 with something on stderr, nearly all of it `git`/`rg` progress from commands that succeeded — and a **refusal is not a failure**, which is worth telling apart because 32 of the 379 `is_error` results here are the user declining the call, the one thing in the pane the agent did not do wrong. `"interrupted":true` is on the Bash result shape and is worth nothing: across 25 real transcripts it is `false` every single time. A turn the user cancelled is reported by the same `[Request interrupted by user]` marker section 11 exists for, so `_fold_line` closes out every call still pending when it sees one — without that an interrupted `sleep 300` keeps its "still running" marker for the rest of the conversation, the one thing in the pane that would be a lie rather than merely stale. **The row carries only what it draws** — the tool, a one-line label and the id — and `<CR>` re-reads the pair (`transcript.tool_call`): the payloads are the bulk of a transcript (one session's commands and their output measured 116KB here, and `Task` prompts and MCP results are larger), they would be held for every session in the list to answer a question asked once per keypress, and the id is an exceptionally good prefilter — exactly two lines contain it, so the scan decodes two lines whatever the file's size. Folding the calls costs what it should: on this project's largest transcript (11.9MB, 2628 lines) 451 lines carry a `tool_use` block, 1.26MB in total, and the full fold goes from 34ms to 47ms. What a row _says_ is per-tool knowledge (`tools.label`), because only `Bash` and `Task` carry a `description` — a `Grep` is named by its pattern, a `WebFetch` by its URL without the scheme, a `TodoWrite` by what is in progress and how many are done — with a field-order fallback so an MCP tool that does not exist yet still gets a readable row instead of its own name. So is what the float shows (`tools.body`): `Bash` puts the command above its output with stderr as a **named section rather than an error** (a command that succeeded may still have written there), a subagent shows the reply the parent conversation actually received, a file list shows one per line, and anything unrecognized is pretty-printed JSON — **valid JSON, commas and all**, since a reader copies it out of the float. Command output goes through `agents/ansi.lua` on the way into the buffer, which turns SGR codes into extmarks against `g:terminal_color_*` (256-colour and 24-bit resolved to their own hex) and drops everything a buffer cannot act on — cursor moves, erases, OSC titles. Its one subtlety is the parameter split: `gmatch("[^;]*")` yields an extra empty match at the end of the string, read as a trailing `0`, which reset every colour immediately after setting it and left nothing highlighted at all. **The float also names what it is showing** (`tools.detect_filetype`): a patch read as plain text is the wall of `+`/`-` lines the Changes pane exists to spare you, so the output is sniffed for one — `diff --git`, an `@@` hunk header, an `index <sha>..<sha>` line, or a `--- `/`+++ ` **pair**, a lone `--- ` opening a YAML document or closing Markdown front matter as readily as it names the old side — and gets `diff`, or `git` when it carries `commit <sha>` headers, that syntax embedding `diff` for the patch below them. Read from the **output** rather than from the command, because the command that produced a patch is routinely not `git diff`: `git diff | head`, a `--patch` anywhere in a `log`, a `.patch` a script wrote out. The command is asked only what it alone knows — a file being printed (`cat`/`bat`/`head`/`tail`/`less`, taken from the pipeline's **last** stage, which is what produced the output) is whatever `vim.filetype.match` calls that filename, and `jq` is JSON unless it was asked for raw text. Everything else gets no filetype at all, which is what it had before: a wrong syntax is worse than none, and only the first `SNIFF_LINES` are read, since a patch announces itself at the top and an `@@` a thousand lines down is a coincidence. From stdout alone: stderr is progress and warnings, and the `$ …` and `── stdout ──` lines are ours and match nothing. `.` and `gf` say a tool row is not a file rather than doing nothing, but a float stepping with `<C-n>`/`<C-p>` **lands on tool rows too** — the float is a view of one row, and a command has as much to show as a file — except a `.`-opened one, which skips them silently, since warning on every repeat of a held key is noise. `f` (`keymaps.filter`) cycles the pane between everything, files only and commands only, and the filter is applied while walking the events from the newest end rather than to a slice of them: with a filter on, the rows that fill the pane come from anywhere in the history, and slicing first would show a short list of whatever happened to be at the end. It lives on the view and dies with it, like the sort criterion. `feed_tools = false` folds none of them. `layout.sessions_height` defaults to `0.55` because the session list is what you steer from and Activity is a commentary you glance at. **Only the sidebars are `winfixwidth`/`winfixheight`; the centre absorbs** — fixing it too leaves Neovim no window to take space from, which made widening one sidebar shrink the other and healed a lost pane into a one-cell Changes column. `build_layout` also clears those flags on the window it splits from (a rebuild starts from a surviving pane that still carries them) and applies the sizes _last_, after the buffers, tags and winbars: sizing between the splits does not survive, and toggling `'equalalways'` around the construction is worse, since restoring it re-equalises every window. Widths default to `0.23`/`0.23`, the terminal taking the remaining `0.54`. **A split opened in the tab and then closed used to leave the panes redistributed**: the split has to take its space from somewhere, and `winfixheight` does not stop Neovim when there is no unfixed window in that column to take it from; closing it hands the freed space to whichever neighbour Neovim picks, and nothing put it back, because sizes were only ever asserted at build and on `VimResized`. Measured with the fix disabled: a `split` from Activity left sessions at 17 rows and Activity at 29 instead of 27/19, and a `vsplit` from either right-hand pane ballooned the column to 110 columns and collapsed the centre to 42. So `remember_sizes` snapshots the three sizes whenever the tab holds nothing but the four panes (floats excluded — they overlay rather than take space) and `restore_sizes` puts that snapshot back after any window in the tab closes. A snapshot rather than the configured fractions, so a size the user dragged survives a split too; `sizes_locked` is set the moment a window closes and cleared by the restore, because the layout is already "clean" by then and a redraw landing in that gap would otherwise snapshot the damage and the restore would faithfully reinstate it. The snapshot is taken on `WinResized`, on `WinEnter`/`WinLeave`, and from `redraw` — deliberately not on `WinNew`, which measurement shows fires _after_ Neovim has already taken the space (sessions read 27 inside it, having been 34 the line before); a focus change is the last moment the layout is reliably intact, and you must focus a window before you split from it. **The panes fade** (`agents/fade.lua`, which owns these defaults **alone** — `config.defaults` deliberately carries no `fade` table, because `fade.opts()` merges the applied config over its own and a second copy silently wins: two rounds of retuning the timings changed nothing visible until the duplicate was removed): a new Activity row is drawn **lifted above** its own colour (`fade.boost`) and **bold** (`fade.bold`) for `fade.hold_ms` (3s) and then walks down through that colour into the pane background over `(steps - 1) × step_ms` (~3s) — one continuous ramp from `lit` to `rest`, which passes through the base colour as arithmetic rather than as a special case, and collapses to exactly the pre-boost formula when `boost = 0`. **That lift is intensity and weight, never brightness**, and it took two goes to learn the same lesson the counts had already taught: scaling a colour's channels towards their peak has nothing to scale when the colour is already there, so `Directory` `#82aaff` in tokyonight-moon (saturation 1.00, lightness 0.75) came back `#a1bfff` — a pale wash of the scheme's blue rather than the blue, which is what "a fresh row uses off colours" means when it is reported. `intensify` therefore saturates towards 1 (all of the lift for a muted `Comment`, none of it for a vivid `Directory`) and moves lightness towards a colourful band **only away from the pane background and only if the colour is on the wrong side of it**, so a light colour on a dark pane is left exactly where the scheme put it — and `bold` is then the whole of the lift, weight being the one axis a saturated colour still has. It is dropped when the ramp starts, so a row un-bolds and begins to fade in one movement rather than two. Saturation can also _cost_ legibility, since the eye weights blue at a fourteenth of green: `#636da6` saturated lands on `#4b60d7`, measurably harder to read (3.11:1 → 2.88:1 on that pane), so the result is walked back up in lightness at its new hue until it is at least as legible as the colour it came from (3.17:1) — a fresh row is the one most likely to be being read. Without the lift, "fresh" meant only "not yet dimmed", and two of the three columns draw in `Comment`, so a new row announced itself hardly at all, so what an agent is doing _now_ stands out from what it has already done; a `+N`/`-N` that just moved is drawn lit and ramps back within `flash_ms` (3s in total) — set to one step more than the ramp, so unlike an Activity row it has no flat hold and spends essentially all of its time fading. `step_ms` matches `spinner_ms` because that clock is what samples the ramp — a shorter step would simply never be drawn — so the ramp's length is set by the step _count_, and 25 of them is what makes a 3s fade a fade rather than a slideshow. The ramp is a set of pre-computed groups rather than a per-frame `nvim_set_hl`, since redefining a group is global and would repaint every other use of it, and it needs no timer of its own — the view already repaints on `status.on_frame`, which samples it. **That clock is held only while something actually moves**: `redraw` asks `anything_moving` of the rows it just drew — an animated status icon (`status.is_animated`) or a fade still on its ramp (`fade.animating`) — and releases the frame request otherwise, rather than driving a repeating redraw of every tabline and statusline to paint the identical picture. Worth knowing when reading that code: the shipped `busy` icon is a **single glyph**, the CLI's spinner being opt-in (`icons = { busy = status.SPINNER }`), so in the default configuration nothing here animates and the clock stays stopped. The Activity pane also draws only what it can show — `model.feed(visible)` takes the pane height plus a little slack, since the pane repaints wholesale and anything below the fold is unreachable (measured: 240 rows 1.31ms/paint → 24 rows 0.17ms, and it no longer grows with the conversation) — and `model.feed` returns `events, ages` as parallel arrays rather than copying every event to hang an age on it, because those are the transcript's own tables and they are cached to disk. Ages come from `model`, not from the event's own timestamp: `stamp_feed` keys a weak table by the event table itself (the transcript hands out its own stored tables, so identity is exact and the store trimming its oldest events drops the stamps with them) and the first batch after a selection change is a backfill of history rather than news, so it is aged from **each event's own timestamp** instead of being declared old wholesale — declaring it old made the pane read as permanently dim, since switching session and back re-backfills and an edit from a second ago went grey the moment you looked away and returned; `stamp_counts` only calls a count changed when it moved from one already shown, so opening the view does not flash every number in it. Brightening — now only the fallback for a colour with no hue to intensify — preserves hue by scaling channels to lift the largest, with the part of the ramp that scaling cannot spend going towards white instead: a colour already at peak (`DiffDelete` = `#ffc0b9` here) cannot be scaled at all and came back byte-identical, so the lift was invisible. **A count block is one hue at four strengths** (`fade.count_group`, which answers for every state a count can be in). The theme owns exactly one answer to "what colour is an addition", and the number at rest is that colour at `count_sat` (0.25) dimmed `count_dim` (0.60) of the way towards its own block; the block is `count_bg_sat` (0.22) of it, `count_bg_lift` from the pane in lightness; and a count that has just moved goes to the colour _itself_ on a block at `flash_level` (0.50). So the pair always reads as one colour rather than as a number pasted onto a highlight, and "it changed" is that colour turned up rather than a different one. Both moves are needed on the resting number, which took a preview across eight schemes to settle: at equal lightness a desaturated green and a full one read as the same green, so saturation alone left rest and peak indistinguishable, and the dim alone only darkens the same colour. The hue is taken in the order of how much the theme meant it: the group's own foreground when it is an actual colour (kanagawa paints `DiffDelete` red on salmon and is not second-guessed), else `Added`/`Removed` — which Neovim ships, so this is never a guess about what a scheme defines — else the block's own hue; nothing at all is derived when even that is neutral. **The block follows the number, not the theme's `DiffAdd` background**, which is frequently a different hue from the diff text the same scheme ships — tokyonight-moon pairs a green `Added` with a _blue_ `#2a4556` block, which is why the older flash, built by intensifying the block, turned a `+N` blue. It also means a group with a foreground and no background gets a block built for it, so `+12` and `-3` match. Every one of the four is then walked in lightness, at its own hue, until it clears `count_contrast` (4.5:1) on whatever it sits on — a colour picked to sit on the pane is not automatically legible on a coloured block, and kanagawa's own red-on-salmon measures 1.99:1. That floor is also the limit on how quiet `count_dim` can make a number: past a point the walk gives back exactly what the dim took, and only saturation still separates rest from peak (measured on tokyonight-moon: rest `#a9c5ae` at 4.61:1 against a peak of `#b3f6c0`, a grey-green against the scheme's green). "Is this a colour" is decided by the spread between the channels, not by HSL saturation, which runs away at both ends — Neovim's own `DiffAdd` foreground `#eef1f8` reports s = 0.42 while carrying four percent of spread, and a beige `#a89984` reports 0.14 of spread while looking exactly like grey text; both have to read as "no colour was chosen here" or the count keeps the drab foreground this replaces. Verified across eight schemes, light and dark. A count that changed lights up **both halves of its block, by intensity rather than by brightness**: the block is pushed towards its own hue in HSL — saturation towards 1 and lightness towards the point of maximum chroma, by `flash_level` — so a `+N` turns emphatically green and a `-N` emphatically red, and the text follows it `flash_text_lift` (0.25) of lightness up at the same hue and saturation, then both walk back to the group's own colours (`#33ff86` on `#00b349` → `#eef1f8` on `#005523` here). Lifting brightness instead was the previous version and it worked against the colour: a block near peak can only go pale, so the loudest a count could get was the _least_ green it had been. A near-grey has no hue to intensify — hue 0 is red, so saturating a neutral count would flash it pink — and is brightened instead, the one direction left. The two halves still have to differ: giving them the same colour put `#04de5d` on `#005523`, green on green, so a count that had just changed was _less_ legible than one at rest — the mirror of the older bug where a foreground used as a background made the number vanish. The two settings trade against each other, which is not obvious from their names: the more saturated the block, the less lightness the text has left to climb, so a **lower** `flash_level` buys a more legible number rather than a quieter effect — measured on a `#005523` DiffAdd, `0.8`/`0.1` gives 1.36:1 and `0.55`/`0.25` gives 2.09:1, which is why the defaults sit where they do. A group with no background is text rather than a block, so there only the text brightens and none is invented. Every span of an Activity row carries a group — the `read`/`edit` column had none, so it fell through to `Normal`, the brightest thing in the pane and the one span the fade could not reach, leaving a settled row with a white label on it; it now follows the clock (`ClaudeCodeAgentsKind`, default-linked to `Comment`), since both are metadata and the path is the content. The sessions cursor is anchored to its **conversation** across a repaint, not to its line: a re-sort or a new session sorted in above it moves the row under the cursor, and `<CR>`/`x`/`dd` would act on whichever row took its place — `cursorline` also paints that line exactly like the selection, which is what made a merely-busy session look selected. **A session's bullet is dimmed when it is _not_ running**, which is the reverse of what `status` says: `status` dims `idle`, right for a tabline, where a tab with no Claude draws nothing at all — here the stopped conversations are rows on screen too, so they were the ones at full strength while a live agent waiting for work was the faint one. `model.rows` therefore paints a not-running row in `ClaudeCodeAgentsStopped` (`agents.highlights.stopped`, default-linked to `Comment`) and drops the group entirely from a live `idle` one, leaving it the pane's own colour; the other states keep the groups `status` gives them. The selected row also carries `❯` in the gutter (`SELECTED_MARK`), since a line highlight alone cannot distinguish itself from the cursor's. That band is a **character range ending where the counts start**, not a `line_hl_group`: a line highlight composes _over_ the background of every character highlight on its line whatever the priorities say, so the selected row's `+N`/`-N` lost their coloured blocks and came out in the selection colour — on the one row you most want to read them. Ending the band at the counts leaves those blocks to paint themselves, and covers everything to their left exactly as before, since the line is already padded to the full pane width and there is no past-the-end region a line highlight would have added. **A conversation id names the chat, not the agent, and `/clear` swaps one for the other underneath a running terminal** — verified against the CLI (2.1.226) by driving an interactive session through a pty with hooks on every event: `/clear` fires `SessionEnd(reason="clear")` for the old id and then `SessionStart(source="clear")` carrying a **brand new** one, in the same process, same terminal, same socket. Everything here is keyed by conversation, so until the registry follows that the view describes a chat that has been abandoned: the old row keeps its running bullet, and the new conversation turns up minutes later — whenever the CLI first writes its transcript — as a row that looks stopped and, if picked, would `--resume` a transcript the running CLI is already writing to. That is the reported bug ("a new session appeared and it is not active"), and `--fork-session` had the same shape from launch, since a fork resumes into a new id. Nothing on disk attributes the new conversation to a particular agent, so no amount of polling can see it; the CLI has to say so. So a **launch** gets a name of its own (`agent_key`, handed to the hook as `CLAUDECODE_AGENT_ID` — the registry's second index, since the first one moves), `SessionStart` is injected whenever agents mode is enabled **even under polling** (one headless Neovim per session start, a different order of cost from the `"*"` tool matcher that makes hooks opt-in), and `registry.rekey` moves the agent: this index, its server instance (`claudecode.rekey_agent_instance` renames rather than replaces — the client is still connected to that port, and `request_context.session_id()` reads the instance) and any float already on screen (`float.retag`, or an ending agent would not take its own windows with it). The selection follows the terminal, but only when it was on the conversation being left: the centre pane is showing that terminal, and a selection parked on another agent is the user's. An agent never **drifts back** onto a conversation it has left (`term.retired`): the two events describing a `/clear` are separate hook processes and the injection runs them `async`, so the CLI's order is not the order they arrive in, and a late `SessionEnd` would otherwise point the agent at the chat it had just abandoned. A `SessionStart` is exempt (`reclaim`), since that is the CLI stating which conversation it is having now — a `/resume` back to an earlier one in the same terminal is followed rather than refused. The old conversation's per-agent state is dropped rather than kept (`model.note_session_change`): it is not mid-tool any more, and leaving the entry alone left a spinner on a row nothing would ever report about again. **A conversation started here is listed before it exists on disk**: the CLI writes the transcript on the first message, so a new agent is in no enumeration for as long as the user takes to type into it — and a row is the only way back to a conversation, so moving the selection off it lost it entirely: still running, still holding a port and a terminal buffer, and unreachable. So `refresh_list` lists what the registry is running as well as what the directory holds (`registry.live_ids`, one synthetic row per live conversation the enumeration did not return), from the only three things known about such a session — its id, the directory it runs in, and that it is running. Its counts are `0`/`0` rather than the unknown-count placeholder, which would claim they are still being read; it is titled `New session`, since the id prefix `rows()` otherwise falls back to names nothing a user would recognise, and `refresh_list` carries a row's previous title across a rebuild so the moment the transcript appears — listed but not yet folded — the name does not flicker back to that prefix. The row is named with `transcript.session_path`, which applies the CLI's slug rule directly when `project_dir` finds nothing, because the project this matters most in is the one the CLI has never run in, whose directory the new session is about to create; nothing depends on the file being there, but naming it lets the panes fill in the moment it appears rather than on the next scan. The synthetic row goes away by itself: it is rebuilt from `live_ids` on every pass, so a session that writes a transcript is taken over by the enumeration and one that stops before saying anything simply drops out — which is also why `M.select` resumes only a conversation that has a row (`--resume` needs a transcript to read; an id that never got one is claimed with `--session-id` instead, as it was the first time). The anchoring above is overridden for one paint whenever the selection has moved since the cursor was last placed on it (`state.cursor_selection`), so the cursor lands on the new row the moment it turns up. Without that the row appeared unmarked and the highlight stayed on the previously selected session until the list was cycled off it and back on. **Every pane line begins with a blank cell**: a word-highlight plugin (mini.cursorword, vim-illuminate) paints every other occurrence of the word under the cursor, and with the cursor parked in column 1 of a list that lit up every row sharing a timestamp or a status letter. All of them stand down over whitespace, so a gutter fixes it for plugins we have never heard of; `create_buf` also sets `b:minicursorword_disable`, the exact opt-out for the one that does have a switch. The Changes pane already opened with a blank cell and was left alone. **A path too long for its pane is cut from the inside** (`render.shorten_path`): a tail cut throws away the one part the row is read for — `lua/claudecode/agents/render.lua` became `lua/claudecod…`, so every file in a directory looked alike — so interior directories are dropped instead, and only as many as the width demands: `first/…/parent/name`, then `first/…/name`, then `…/name`, then the name alone, and only then the name itself cut with its **extension kept** (`render.lua` and `render.md` are two files and `render…` is neither). The first folder outranks the parent because it is the coarser answer: `lua/…/init.lua` and `tests/…/init.lua` are told apart by it while their parents are often the same word. The Changes pane takes its `+N/-N` from the transcript and only its `M`/`A`/`D`/`?` letter from git (`agents/git.lua`, pathspec-restricted and single-flight, newline-delimited rather than `-z` because `jobstart` renders NUL as `\n`), so that pane and the session row can never contradict each other. **A row in either pane is a record of work, not a file reference**, so `<CR>` shows what the session did to that file rather than the file itself (`agents/file_view.lua`): today's content with the session's changes rendered inline by unified.nvim — the same view the live cursor gives while an edit happens, only cumulative — and, for an Activity row that is a read, the lines that read covered, highlighted with live-cursor's own group. The baseline that diff needs does not exist in the store: `originalFile` is on only some edits (179 of 402 in one real transcript), so `agents/patch.lua` reconstructs it by **reverse-applying the session's own hunks** to the file on disk, newest first. A hunk is located by content nearest its recorded line rather than at it, because the file moves on afterwards; one that is nowhere in the file any more was overwritten later, so it is skipped and the float's title says how much of the session's work is still present (253 of 349 hunks located across six real transcripts; all of them for a session that ran recently). When nothing can be located, the file is gone, or unified.nvim is absent, the hunks themselves are shown as diff text — the CLI's own record, which cannot be stale — rather than a plain file, which would answer a question neither pane asked. `.` (`keymaps.git_diff`) answers the neighbouring question — **what is uncommitted in this file**, whoever changed it — via `file_view.open_against_head`: same float, same inline renderer, `git show HEAD:./<name>` as the baseline (run with `-C <the file's own directory>`, so the repo root never has to be found). A non-zero exit means the file is not in HEAD and every line reads as an addition; a file identical to HEAD says so rather than opening an empty diff; and without unified.nvim it falls back to `vim.diff` text, so the answer stays a diff. That read deliberately bypasses `git.run`, which drops empty lines — right for status output, wrong for file content. `gf` (`keymaps.goto_file`) is the third question, and the only one that is not about the row: it opens **the file itself, on disk, in a new tab** — the other two are for reading what happened to it, this one is for working in it, which neither a float (a reading frame `q` throws away) nor the origin tab (a layout arranged for something else) is. A new tab carries none of the agents tab's vars, so diffs, previews and the plan view treat it as the ordinary editor tab it is. A path that is no longer readable is refused with a log line rather than opened: a row records work, that work may have been a delete, and `tabnew` on a missing path opens an empty buffer whose first `:w` resurrects the file. The history is read on demand (`transcript.file_history`, prefiltered on the file's basename, ~21ms for a session's whole file list) instead of folded into the summary, which is held per session and mirrored to the warm cache; unlike `summary` it answers through `vim.schedule`, since its reads land in a libuv fast context where opening a window is `E5560`. `<C-n>`/`<C-p>` (`keymaps.next_session`/`prev_session`) move the selection through the session list from **any** pane and from inside the agent's terminal, in terminal mode as well as normal. A live conversation is swapped into the centre pane at once; a stopped one is **selected but never started** — cycling is how you read what the sessions did, and every pane follows the selection, so passing over a row must not cost a CLI. The centre pane shows a notice naming the conversation and the key that starts it (`show_start_prompt`, recorded as `state.pending_start`), and `focus_terminal` — `keymaps.focus_term`, `i`, the same key that puts you in a running agent — resumes it first and then lands in it, so "put me in this session" is one intent whether the CLI is running or not. That notice is one reused scratch buffer (`state.notice_buf`), not one per keypress, and it is also what a dead agent's pane shows, since a conversation outlives its CLI. **The view opens already pointed at a session** (`offer_initial_session`, armed by `state.await_initial` and fired from the model's change callback as well as from `open`, since the list is folded asynchronously): the centre otherwise holds the blank, _modifiable_ buffer `tabnew` left, where `i` starts editing a scratch file rather than a conversation. It offers the selected session or the newest — what a first `<C-n>` would land on — starts nothing, and stands down the moment a terminal or an earlier offer owns the pane; `refresh_start_prompt` repaints it when the transcript fold replaces the placeholder title with the real one, and `focus_terminal` falls back to it so the key works even if it is pressed before the list arrives. A conversation running in another tab is offered as a jump rather than a start: resuming it twice would put two CLIs on one transcript. **A project Claude has never run in gets a screen of its own** (`show_empty_notice`, painted by `sync_empty_notice`): the offer bails on an empty list and waits for the next model change, which in such a project never comes, so the centre kept "Reading this project's sessions…" for ever. Enumeration is synchronous (`transcript.list` is stat-only), so an empty list is known on `open` and is answered there and then — it says there are no conversations yet and names the key that starts one, and since that key (`keymaps.new`, `a`) is a sessions-pane key everywhere else, it is bound on the notice buffer for as long as that screen is what the buffer holds and taken off again when it becomes an offer to resume a particular conversation (the buffer is reused, and a stale `a` there would start a _second_ one). `focus_terminal` starts a new agent instead of doing nothing when there is neither an offer nor a session to make one from, so `i` means "put me in a session" here too. The same screen comes back when a project _becomes_ empty — deleting the last conversation would otherwise leave the centre offering to resume one that no longer exists — and re-arms `state.await_initial`, so a session that turns up later is offered as it would have been on open. **Inside a file float those same keys step through the pane's rows instead** (`bind_float_nav`): the float _is_ a view of one row, so the keys walk the rows one level down, wrapping at both ends, skipping rows with no file on them, moving the pane's own cursor along and keeping the baseline the float was opened with (`<CR>`'s session diff or `.`'s git HEAD). Stepping **swaps the content of the float in place** (`float.create`'s `reuse`, threaded through `file_view`) rather than closing it and opening another: `file_view.open` reads the file's history asynchronously, so a close-then-open leaves focus in the _pane_ for as long as that takes, and a held `<C-n>` lands several repeats there, where the same keys change the session — measured as "sometimes it suddenly switches the session". Reuse also keeps the cascade from walking a new float down the screen per file. Repeats are **coalesced**: the aim moves on the keypress and only one open is ever in flight, so holding the key walks the list at key-repeat speed and opens the row it settles on, instead of firing one asynchronous read per press and letting them land out of order. Bound only on a scratch buffer we made — `float.open_file` shows the real file buffer, where a buffer-local `<C-n>` would follow that file out into the editor. Rows are ordered by `summary.last_ts`, which is **the newest `"timestamp"` anywhere in the transcript**, matched out of the raw line rather than decoded (the prefilter's whole point) and taken from any entry type: dating a session from its tool results alone leaves a Bash-only conversation at epoch 0 and sorted last, and using the file's mtime instead is worse still — the CLI appends untimestamped bookkeeping (`last-prompt`) long after the last message, measured 7 days out on one transcript here and 30 hours on another, which is what made the list reshuffle when a session was resumed. **That order is then frozen** (`model.apply_order`): every criterion worth sorting by moves on its own — one background agent finishing a tool call bumps its `last_ts` and its counts — so with several agents running the rows shuffled continuously and the session you were reaching for was somewhere else by the time you got there. Anchoring the cursor to its conversation stops the _selection_ being wrong; it cannot make a moving list readable. So `state.order` records the ids in the order the list is already showing, rows keep those places, and a session that appears afterwards is **sorted in once** at the position the active criterion gives it and pinned like the rest (appending instead would file every new agent at the bottom of a list sorted by recency). `state.order` is rebuilt from the rows actually present, so a deleted conversation drops out of it without its own cleanup. Only two things re-sort: `r`, which is an explicit "re-read everything", and `gs` (`keymaps.sort`) → `agents/sort_menu.lua`, a single-key float built like the help window (`snacks.win`, else `nvim_open_win`, our own rendered buffer either way) offering `recent`/`name`/`changes`/`status` from `model.SORTS`, with the active one re-picked meaning **reverse**. It is also the only place the order is stated, which is why it names the direction in the criterion's own words ("newest first", "A → Z") rather than with an arrow, and why it answers exactly once however many of its buffer-local keys are pressed after it closes. The choice lives on `state` and dies with `detach`, so it lasts as long as the view is open and the next open starts from `agents.sessions.sort` — whose old values `added`/`title` are still accepted as aliases for `changes`/`name`. `dd` (`keymaps.delete`) **deletes a conversation** — `transcript.delete` removes the `.jsonl` _and_ the sidecar directory of tool results the CLI parks beside it (`<dir>/<id>/`), which would otherwise be stranded — and the row goes away because `refresh_list` re-enumerates the directory, not because anything removed it locally. It is irreversible (the transcript _is_ the conversation; `--resume` has nothing to read afterwards), so it asks first through `agents/confirm.lua`: a small centred `snacks.win` float when snacks is present, `vim.fn.confirm` otherwise, and every path answers exactly once — closing the window counts as "no", which is why the confirm callback is guarded and deferred out of the closing keymap. It takes a **count** and a **visual range** (`3dd`, or `d` over a selection — `_visual_lhs` binds a doubled key under its single form, since over a selection the range _is_ the selection and a second press would only extend it), and a batch asks **once**: the dialog names the first `DELETE_LIST_MAX` rows and counts the rest, and `model.delete_sessions` re-enumerates the store once for the whole batch rather than once per transcript. A session whose agent is still running is refused rather than asked about: the CLI has the file open and would write it back. Inside a range that one row is _set aside_ instead of vetoing the gesture — the user pointed at a stretch of the list, not at a row, so the dialog reports how many were left alone and which key stops them, and only a range with nothing deletable in it merely warns. That is also why `stop` moved to `x` — `map` binds with `nowait`, so a `d` binding makes `dd` unreachable. `gf` (`keymaps.search`) **searches the conversations** (`agents/search.lua`): the list answers "what has run here" and cannot answer "which of these was the one about the websocket handshake", which is in the transcripts. Same key as `goto_file` and a different meaning, which is only possible because no pane is offered both — a session row is not a file. It searches **what was said** (`user`/`assistant` `text` blocks), the **paths the session touched** (`toolUseResult.filePath`, the Changes pane's own source), **what the turn ran** (`tool_use` block inputs) and **what it was reasoning about** (`thinking` blocks), plus the **title**. Deliberately not tool _output_, and the difference is not small: "handshake" appears 133 times in this project's store and **not once in a message** — 96 of those in `attachment` entries and 30 in tool results — so searching output would return every session that ever read the file, which is what the Changes pane already says. A `tool_use` input skips the path fields (`file_path` and friends), since the call's own `toolUseResult` reports that path as a `file` match and reading both would spend a session's whole cap saying it twice; its remaining string fields are read in `TOOL_FIELDS` order and then alphabetically, because `pairs` order is not stable and a result list that reorders itself between identical queries is worse than one in a dull order. **Which matches a session's few rows are spent on is decided over the whole file** (`SEARCH_KINDS`: said, then the file, then what it ran, then what it thought), not within an entry, and that ordering is load-bearing rather than tidy: measured on this store, "windows" matches 26 thinking lines and 6 message lines, so with per-entry ranking the reasoning simply arrived first and took every row — the sentence the user actually wrote was never shown. With the global order it is 5 thinking to 24 message. That is also why the scan collects into a **bag keyed by kind** rather than a flat list: it can stop as soon as the top tiers are full (`bag_done`), and otherwise at `limit * 3` of anything, so a thinking-heavy transcript is not read to the end for rows that would never be displayed. Matching is **literal and smartcase** (`transcript.compile_query`), and case-insensitivity is compiled into a Lua pattern (`[aA]`) rather than done by lowering the haystack, which would be an allocation per line of every transcript for nothing. **There is no index**: each query past the debounce re-reads the store and is cancelled by the next keystroke. That is affordable only because the prefilter runs on the **raw JSON line** — a line not containing the query is never decoded — and because a scan stops at the match cap for its session (`max_per_session`, 3). Measured on this project's real store, 32 transcripts and 88.9MB: a query matching nothing (the worst case, since nothing stops early) sweeps everything in ~830ms, and results stream in as each file finishes, so the first rows land in milliseconds. The cost of prefiltering the raw line is JSON's own escaping — a query containing a quote, a backslash or a newline is spelled differently in the file than in the message, and will not be found; ordinary words, paths and identifiers are spelled the same either way. A line over `SEARCH_LINE_LIMIT` (256KB) is skipped rather than decoded, and walked over a slice at a time rather than held: at that size it is tool output, which is out of scope anyway. Scans run four at a time but results are stored **by session position**, so the list is in the sessions pane's own order however the reads finish, and the cursor is anchored to its **session** across those repaints for the reason the sessions pane anchors its own. The picker is **two windows**: the query is a real buffer, so every editing key the user knows works in it, and the list is `focusable = false` and never entered — `<C-n>`/`<C-j>`/`<Down>` and `<C-p>`/`<C-k>`/`<Up>` drive its cursor from the input, which is also why leaving the input is cancelling. Moving **previews** (`agents_view.preview_session`, which is `cycle_session`'s body reached from an id — the panes follow, nothing is started), so `<Esc>` has to put back the selection the picker opened with or browsing would leave the panes wherever you stopped. `<CR>` is `focus_terminal`'s intent rather than `<CR>`'s (`agents_view.enter_session`): it selects, resumes a stopped conversation and lands you in it, because searching for a conversation is looking for one to work in. The query outlives the picker and dies with the view, like the sort criterion. `?` (`keymaps.help`) opens a **help window** (`agents/help.lua`) listing the keys that reach the pane the cursor is in, grouped "this pane" then "anywhere in the view" — a float via `snacks.win`, else `nvim_open_win`, into a scratch buffer we render and highlight ourselves so both paths look the same inside the border; a second `?` toggles it shut. Its contents come from `KEY_SPECS`, the **same table `bind_keys` binds from**, filtered by pane and by what the user left bound — the one thing that keeps a help screen from describing keys that do not exist. Headers and keys are drawn in `ClaudeCodeAgentsHelpHeader`/`ClaudeCodeAgentsKey` (default-linked to `Title`/`Special`, overridable through `agents.highlights.header`/`key` like every other group).
+- Lock deleted on `VimLeavePre`; a crash never reaches it, so `cleanup_stale()` sweeps once per Neovim (from `setup`, before any server claims a port).
+- The directory is shared with other editors and users, so the sweep is deliberately timid: `uv.kill(pid, 0)`, and **only an explicit `ESRCH` counts as dead**. `EPERM` = alive but owned by someone else. Unparseable or pid-less locks are left alone. (Erring toward "alive" leaks a file; erring the other way deletes a live editor's lock.)
+- Discovery reaches these files only when `CLAUDE_CODE_SSE_PORT` is unset (our server failed to start), in which case the CLI may attach to _another_ editor — hence `terminal.lua` logs an error rather than launching silently in that state.
 
-13. **Floating Windows** (`lua/claudecode/float.lua`) - Where a diff or a file goes when there is no editor window to put it in. Two situations, one problem: in the agents tab every window is a pane and all of them are excluded from being diff targets, and `diff_opts.layout = "float"` is the user saying they would rather read a diff over their layout than have it split. Floats **cascade** — each offset from the last, newest on top, its title in the border, the stack clamped so it never walks off the screen — because several agents work at once and a burst of diffs arrives faster than you answer them; queueing would leave one blocked while the CLI that asked for it waits. Each carries `claudecode_live_preview` and `claudecode_float` so a second diff never targets the window the first is showing in, and **the user's own display settings**, which is not the same as leaving them alone: a float copies its window-local options from the _current_ window, and these are usually opened from an agents pane, which turns `wrap`, `number`, `list` and the rest off because it draws fixed-width list rows — so a diff inherited a list pane's settings and a long line ran off the right edge with nothing to be done about it. `style = "minimal"` then wipes most of the same options again, so `apply_user_options` runs after the window is open and puts the globals (`vim.go.*`, the values the user set in their config) back on top; `fillchars` is left to `minimal`, being the frame's chrome rather than a reading preference. **Every window option this plugin sets on its own windows goes through `utils.set_win_option`, which passes `scope = "local"`**, and that is load-bearing rather than tidy: `vim.wo[win].x = v` and `nvim_set_option_value(…, {win = w})` behave like `:set` and not `:setlocal` **when `w` is the current window**, so they write the user's global too. Measured — a pane is current while it is being built, so opening the agents view left the user's global `wrap=false number=false list=false`, and every file they opened afterwards for the rest of the session wore a list pane's settings. A float, created with `enter = true`, did the same one option at a time. Geometry comes from the **top-level `float` block**, which a feature's own table overrides — `agents.float` for agent-opened floats. That split is the point of the extraction: the machinery used to live in `agents/float.lua`, so `layout = "float"` silently took its width, height and border from `agents.float`, and a user with `agents = { enabled = false }` was configuring floats through a feature they had turned off. `config.validate_float` is shared by both blocks so their key lists cannot drift. `agents/float.lua` is now a thin wrapper supplying the session id, the agents geometry and the `claudecode_agents_float` tag; **the stack is shared**, so an agent's float and a plain diff float cascade past each other rather than landing on top of one another, and `diff.lua`'s cleanup closes a float through this module whichever door it came in by. A float that opened over a terminal the user was **typing in** puts that terminal back into insert mode when it closes: entering the float leaves terminal-mode, so answering a diff and dismissing it handed focus back in normal mode and cost an `i` nobody asked to press. The mode is read in `create` _before_ `nvim_open_win` (afterwards there is nothing left to notice), and **the current window is only taken as the answer when it actually holds a terminal** (`terminal_mode_window`): a diff float is opened from inside `nvim_win_call` — `diff.in_owning_tab` scopes the work to the tab that owns the message — which makes another window current for the duration while leaving the mode alone, so `mode()` still says `t` while `nvim_get_current_win()` names a pane the user is not in. Recording that window is why the restore did nothing in agents mode: it never matched the window focus came back to. `_setup_blocking_diff_unified` therefore reads the terminal _before_ entering `in_owning_tab` and hands it to the float as `term_win`, which is validated the same way. Restored from a `WinClosed` autocmd rather than from `M.close`, since a float also goes away by `:w`-acceptance, `:q` and a closing tab — then from a `vim.schedule`, because focus has not moved yet inside `WinClosed` and with floats stacked it may well land on another one; only a close that actually returns to that same terminal window restores anything. `bind_close` gives a float `q` and `<Tab>`, and both of its rules exist because **a float can hold a real file buffer** (`open_file` puts one there): a buffer-local mapping outlives the window it was made for, so a mapping somebody else made is left alone, and ours are deleted on `WinClosed` — tied to the window rather than to our own `close`, since `:q`, `<C-w>c` and a closing tab never reach it. Without that, every file Claude ever showed you would carry a `q` that closes a window, in every window, for the rest of the session.
+### 5. Diff Integration
+
+- The unified (inline) provider scrolls the change into view with `center_diff_region`.
+- `_measure_diff_region` reads unified.nvim's extmarks for the changed line span **plus deleted lines**, which are virtual lines and therefore invisible to a plain `zz`.
+- `_diff_scroll_position` centers the change when it fits the window, else pins its first changed line — with deleted lines above it, via `topfill` — to the top. Applied with `winrestview`; `topfill` is the only way to keep leading virtual lines on screen.
+- Shared with the live cursor's edit preview, which renders the same marks.
+
+### 7. Live Cursor
+
+- Injects a `PreToolUse` hook at launch via `claude --settings` (user settings untouched). Hook is `scripts/live_cursor_hook.lua` run as `nvim --headless -u NONE -l` — no shell or POSIX tools, so macOS/Linux/native Windows behave identically.
+- Hook reads event JSON from stdin, `sockconnect`s to `CLAUDECODE_NVIM_SERVER`, forwards to `live_cursor.ingest`, stamped with `CLAUDECODE_NVIM_TAB` (launching tabpage, so background-tab Claudes don't preview in the current tab) and, for agents-mode launches, `CLAUDECODE_AGENT_ID` (names the **launch**, not the conversation — see 12).
+- `Read` → highlight the read line range. `Edit` → real inline diff via unified.nvim (`show_diff` reconstructs the pre-edit file, calls `unified.diff.show_against_text`); falls back to a line highlight without unified.nvim.
+- `Write` → `show_write`. The hook fires _before_ the tool runs, so a file being created does not exist yet; opening the path would show an empty buffer that never fills in. Render `tool_input.content` directly, diffed against the pre-write content: `""` for a new file, else the on-disk text **snapshotted synchronously in `dispatch`** (a deferred read would see the already-written file). Without unified.nvim the content is shown undiffed.
+- All snippet/content text goes through `split_lines`, which strips the CR of a CRLF file and the trailing empty element — baselines come from `readfile()`, which already dropped them, so otherwise every line of a Windows file mismatches.
+- Suppressed when a review diff owns the file (`diff.is_live_for_file`); the diff calls `live_cursor.on_diff_opened` the instant it opens, dismissing any in-flight preview. Without this the preview and diff fight over one window and can leave the diff's `acwrite` buffer unable to accept with `:w` (`E676`). `diff.find_main_editor_window` skips the preview split (`claudecode_live_preview` window var).
+- Target window: `diff.find_window_closest_to_terminal`, falling back to `find_main_editor_window`.
+- **Buffer hygiene**: previewed files opened with `bufadd`/`bufload`; buffers we created are tracked in `state.owned_bufs` (gated on a pre-`bufadd` `bufexists` check, so a file you already had open is never owned) and reaped by `reap_owned` on every `show`/`show_diff`/`show_write`, on idle-close, on `on_diff_opened`, and on `cleanup`. Displayed, currently-active (`last_buf`), or modified buffers are left alone (`force=false`) and retried later; `last_buf` is cleared when the inactivity timer fires and in `on_diff_opened`, so the last file of a burst is reaped too.
+- **Preview marker leakage**: Neovim remembers window-local options per (window, buffer) pair, so a window that once wore the preview `winbar` re-applies it when that buffer returns. Three guards:
+  - `apply_preview_marker` snapshots the window's own `winbar`/`winhighlight` (`state.marker`); `strip_preview_marker` restores rather than blanks them (`winhighlight` is window-local only and never remembered per buffer, so blanking would drop a user's setting).
+  - `swap_preview_buf` strips the marker _before_ `nvim_win_set_buf`, and records `state.preview_buf` _before_ the swap (`BufWinEnter` fires synchronously inside it).
+  - `ensure_preview_watcher` (`BufWinEnter`/`WinEnter`/`BufWinLeave`, armed from `setup`) notices anyone else putting a buffer in the preview window and calls `release_preview_window` (restore options, drop the tag, forget the window). Idle close does the same with `handover = true`, which also unowns and lists the buffer shown there.
+
+### 8. Plan View
+
+- Renders Claude's plan-mode plan in an editor split, like the VS Code extension. Claude presents plans via its built-in `ExitPlanMode` tool (internal to the CLI, never sent over MCP); `tool_input.plan` carries the markdown.
+- Rides the **same launch hook** as Live Cursor: `build_launch_injection` adds `ExitPlanMode` to the `PreToolUse` matcher and a `PostToolUse` entry scoped to it whenever the plan view is enabled, even if Live Cursor is off.
+- `live_cursor.dispatch` routes `PreToolUse(ExitPlanMode)` → `plan_view.show`.
+- Takes over the editor window closest to the Claude terminal (`diff.find_window_closest_to_terminal`, which uses `find_main_editor_window` for suitability and `_closest_rect_index` for geometry), recording the displaced buffer/cursor and restoring on resolve. The host window is tagged `claudecode_live_preview` so review diffs skip it. Only with no reusable editor window does it create a split (closed, not restored, on resolve).
+- Dismissed on `PostToolUse(ExitPlanMode)` (accepted) or the next tool event of any kind (covers reject → replan and accept → execute) → `plan_view.close`.
+- Tab-aware via `CLAUDECODE_NVIM_TAB`. Falls back to the longest string in `tool_input` if `plan` is renamed.
+
+### 9. Terminal Links
+
+Click a file path in the Claude terminal to open it in the editor (VS Code parity) instead of the OS file explorer.
+
+- Claude renders file references as OSC 8 hyperlinks with `file://` URLs, but inside `:terminal` clicks go to Claude, which shells out to the OS opener; Neovim has no built-in "open hyperlink on click".
+- A `TermRequest` autocmd records the **set of linked file paths** for the terminal (`_url_to_path` handles absolute and the relative `file://name` form Claude emits for cwd files).
+- **No screen coordinates are tracked**: Claude's TUI repaints/scrolls links to rows that no longer match where the OSC 8 fired, so geometry lookup misses almost every real click (verified empirically).
+- A buffer-local `<LeftMouse>` map opens on **release** (opening on press races the trailing `<LeftRelease>`, which then starts a stray visual selection). `_resolve_click` matches the filename token under the cursor against captured paths — exact, `/<token>` suffix, or a long substring (wrapped path chunks). A bare word matching nothing is left for Claude; non-link clicks are re-fed so Claude's mouse UI keeps working.
+- Opens in the window closest to the terminal (`diff.find_window_closest_to_terminal`), jumping to `:line`. Normal-mode `gf` does the same for the path under the cursor.
+- Enabling also sets `'mousemoveevent'` so Claude's hover underline works.
+- Config: `terminal_links = { enabled, click, key = "gf", mouse_motion }`.
+
+### 10. Session Persistence
+
+`session_persistence = "off"|"global"|"external"`. Restores each tab's Claude _conversation_ when a saved Neovim session loads.
+
+- Every launch is stamped with a conversation id we choose: `terminal.get_claude_command_and_env` appends `--session-id <uuid v4>` (`utils.random_bytes`, shared with the lockfile token). Later starts use `--resume <uuid>`.
+- `launch_args` is idempotent per tab (terminal toggles rebuild the command) and stands down when the command already picks a conversation (`-r`, `-c`, `--session-id`, `--fork-session`, `--from-pr` — checked against the whole command, so `terminal_cmd = "claude --continue"` is respected).
+- The id is corrected by the launch hook: a `SessionStart` entry is added to `build_launch_injection` even when live cursor and plan view are off (an empty `PreToolUse` matcher would match every tool, so that entry is omitted instead). `dispatch` feeds every payload's `session_id` to `note_session_id`, making the reported id authoritative after `/clear` or a manual resume.
+- **The module does no file I/O.** `capture()`/`restore()` exchange a versioned plain table:
+  - `"global"` mirrors it into `g:CLAUDECODE_SESSION` (`:mksession` writes it when `'sessionoptions'` has `globals`; re-applied on `SessionLoadPost`).
+  - `"external"` leaves storage to auto-session's `save_extra_data`/`restore_extra_data` or the shipped resession extension (`lua/resession/extensions/claudecode.lua`).
+- Tabs are keyed by **tab number**, not tabpage handle: handles are not stable across restarts and `:mksession` cannot save tab-local vars.
+- Restore is **lazy** — tabs are armed (`pending`) and the CLI starts on that tab's next terminal toggle, so N restored tabs are not N processes at startup. `open_pending` (`:ClaudeCodeSessionRestore!`) forces the eager path.
+- `:ClaudeCodeSessionRestore` re-reads the `"global"` payload unconditionally but never gates the rest on that result — in `"external"` mode the session manager has already armed the tabs. Reports `pending_count()` without `!`. Bound to `<leader>aR` only when persistence is not `"off"`.
+- A pending id is dropped rather than resumed if the tab's cwd changed, or if no transcript exists — globbed as `<CLAUDE_CONFIG_DIR|~/.claude>/projects/*/<id>.jsonl`, which sidesteps the CLI's undocumented slug rule since ids are unique. A tab with a live record is never retargeted.
+- **Only ids the CLI wrote a transcript for are persisted** (`persistable_id`, applied in `capture()`): a minted id is a name, not a conversation, and `--resume` on it fails. A record also carries `fallback`, the tab's last id that did exist, set wherever a record is replaced (a fresh mint in `launch_args`, `note_session_id` after `/clear` or manual resume). A tab with neither is left out of the payload entirely.
+- `forget()` deletes the whole record, fallback included. It is called when Claude's process ends while Neovim is still running, so a conversation the user closed is not restored.
+- Telling "user closed it" from "Neovim exited": on exit Neovim fires `VimLeavePre`/`VimLeave` **before** `TermClose`, so a `TermClose` while `M.state.shutting_down` is unset is the user's doing. `TermClose` is used rather than provider exit hooks because during shutdown the job's `on_exit` never runs (and snacks only registers `TermClose` when `auto_close` is on). `TermClose` reports only a buffer and a hidden terminal is in no window, so `terminal.tag_terminal_tab` stamps `b:claudecode_tab` right after `provider.open`.
+- The **external** terminal provider has no terminal buffer and therefore no `TermClose`, so those Claudes are still restored.
+
+### 11. Per-Tab Status
+
+`status = { enabled }`. Publishes each tab's Claude as `busy` / `waiting` / `idle` / `none` for tablines, statuslines and third-party plugins. The MCP WebSocket only carries editor actions, never conversation state, so this rides the **same launch hook** and folds lifecycle events into a state machine (`note`):
+
+- `UserPromptSubmit`/`PreToolUse`/`PostToolUse`/`PreCompact` → busy
+- `PreToolUse(ExitPlanMode)` → waiting (a plan is on screen)
+- `Notification` → waiting with its message, **unless** it is the "waiting for your input" idle nudge (that is a timer, not a question)
+- `Stop` → done or idle; `SessionStart`/`SessionEnd` → idle/none
+
+Rules:
+
+- `done` = "finished but unread". `finished_state` lands a turn in `idle` only when that tab was current **and** Neovim had focus. Otherwise it stays unread until `mark_read` (wired to `TabEnter`/`TabNewEntered` and `FocusGained`, which also restores `set_focused`; `FocusLost` clears it). Reading never clears `waiting`.
+- `PostToolUse` is what ends `waiting`: between answering a permission prompt and the tool's result nothing else fires. That is why this feature widens the injected `PreToolUse` matcher to `"*"` and adds a `"*"` `PostToolUse` — a `Bash` call must not read as idle. Cost: one hook invocation (headless `nvim`) per tool call, hence opt-in.
+- State is keyed by **tabpage handle** (nothing here outlives the session; handles are never reused), unlike `session_state`.
+- `terminal.tag_terminal_tab` calls `note_launch` so a tab counts as having a Claude before its first hook event (never overriding a known state). The `TermClose` watcher in `init.lua` clears the tab when Claude ends.
+- Changes emit `User ClaudeCodeStatusChanged` (`data = { tab, tabnr, state, prev, status }`) and, unless `auto_redraw = false`, `redrawtabline`/`redrawstatus`. Repeat events that change nothing user-visible are swallowed. `since` marks when the _state_ was entered (busy→busy tool changes keep it). `get`/`all` hand out copies.
+
+**Spinner / frame clock**
+
+- An icon may be a **list of frames**. `M.SPINNER` reproduces the CLI's spinner, read out of the shipped binary: six glyphs `· ✢ ✳ ✶ ✻ ✽` played forwards then backwards (the CLI builds `[...frames, ...frames.reverse()]`, so turning points repeat), one frame per 120ms (`spinner_ms` default), with the last glyph swapped for `✻` when `$TERM` is `xterm-ghostty`. On Windows and in Windows Terminal (`win32`, or `WT_SESSION`/`ConEmuANSI`) `✳` U+2733 is replaced by `✱` U+2731 — U+2733 is emoji-capable and renders coloured/double-width there.
+- `icon()` returns the current frame; a `spinner_ms` timer advances it. `sync_spinner` starts/stops that timer from every path that mutates `entries`, so it runs only while something animates, and never under `auto_redraw = false`.
+- **There is exactly one timer.** Views a `redrawtabline` cannot reach (the agents view) call `request_frames(name, interval_ms)` to share it, and `status.on_frame(name, fn)` to be called on the tick that _advances_ the frame. It runs at `status.spinner_ms`; a requester may override the rate but does not by default (`agents.spinner_ms` has no default — taking the fastest requested rate silently sped up the tabline).
+- Stopping the timer does not reset the frame counter; the counter is **global, not per tab**, so every view shows the same glyph.
+- `_tick(interval_ms)` marks a timer-driven tick and redraws only when the frame has not already advanced within that interval. `_tick()` with no interval is an unconditional manual step (for tests). `_frame_requests()` reports who holds the clock. `open()` arms through `sync_timers`, not `arm_poll` alone.
+
+**Interrupts**
+
+- **A turn cancelled with `<Esc>` is reported by no hook at all** — verified against CLI 2.1.221 with hooks on every event: the interrupt fires nothing, not `Stop`, not `StopFailure`. So an interrupted tab stayed `busy` forever.
+- The CLI does write `[Request interrupted by user]` into the conversation as a real `user` entry. `agents.transcript` matches it (`INTERRUPT_MARKER`, prefix-matched because tool interrupts append `for tool use`); `_is_interrupt_line` decodes the entry and requires the marker to be the _whole_ message content, because `toolUseResult` entries are `type:"user"` too and a conversation quoting the string would otherwise read as cancelled. `agents.model` calls `note_interrupt` per conversation.
+- Tab-hosted Claude with agents disabled is covered by `lua/claudecode/interrupt_watch.lua`, which tails a `busy` tab's transcript for the same marker and calls `status.note_interrupt` (dropping to `idle`, leaving other states alone). Its clock runs only while some tab is `busy`, it is **armed at end-of-file** on the transition into `busy` (so any marker it sees belongs to the watched turn, needing no timestamp bookkeeping), and a tick is one `uv.fs_stat` per busy tab plus a read of only the appended bytes, capped at 256KB. 500ms tick.
+- The agents-side equivalent needs two extra rules: the marker is **stamped with its own timestamp** and only ends a turn that started before it (a transcript keeps every interrupt the conversation ever had), and "already acted on" is keyed by **conversation, not the row** (`refresh_list` replaces row tables every 2s).
+- Reading the keypress instead was built and rejected: `<Esc>` means a dozen other things in Claude's TUI, and in a turn with no tool calls there is no later event to correct a wrong guess.
+
+### 12. Agents Mode
+
+`agents = { enabled }`, `<leader>aA` / `:ClaudeCodeAgents`. A dedicated tabpage running several Claudes on one project: selected agent's terminal centre, project sessions top-right, that agent's file activity bottom-right, files it touched left.
+
+**Transcript store is the source of truth**
+
+- All numbers come from the CLI's own store (`<CLAUDE_CONFIG_DIR|~/.claude>/projects/<slug>/<id>.jsonl`), not our accounting — so they are right even for conversations that ran in another editor.
+- `agents/transcript.lua` folds `toolUseResult.structuredPatch` hunks (counting `+`/`-` lines) plus the session name. Name priority: user rename (`{"type":"agent-name","agentName":…}`, last wins) → generated `ai-title` → first user message. The rename must be read on its own: renaming only sometimes rewrites `aiTitle`.
+- A `Write` that _creates_ a file records an empty patch, so the whole `content` is counted instead; otherwise every new file reads `+0`.
+- Cheap enough to run per tool call because of a **substring prefilter** (`"toolUseResult"` and `"structuredPatch"`/`"file":`) that skips ~99% of bytes before `vim.json.decode`, and because the log is append-only: `offset` (advanced only to the end of the last _complete_ line, so a scan caught mid-write re-reads it) makes an update cost only the new bytes. Cache key is `(size, mtime, ino)` — a shrink or new inode means compaction, and the fold restarts.
+
+**Slug rule (Windows-critical)**
+
+- The slug is the cwd with every non-alphanumeric character replaced by `-`. Do **not** use `fnamemodify(cwd, ":p")`: its trailing separator gets slugified (`D--proj-` vs the CLI's `D--proj`), which broke every Windows project.
+- Past **200 characters** the slug is cut there and `-<hash>` appended, where `h = h * 31 + unit` over the path's **UTF-16 code units** kept to a signed 32-bit int, then `Math.abs(h).toString(36)`. Code units, not bytes — JS `replace(/[^a-zA-Z0-9]/g, "-")` substitutes one dash per unit, so a two-byte `ö` is one dash and an astral emoji is two. Both halves were checked against the CLI's algorithm run in node.
+- Fallback on a slug miss: scan every project directory for a transcript naming this cwd. It must use `_io.read_sync` (bounded, miss-path only) — the asynchronous reader never answers in time, and treating "hasn't answered" as "no match" made a slug miss always return an empty list. Match the cwd both raw and with separators escaped the way JSON writes them, case-folded on Windows.
+
+**Path handling**
+
+- `utils.normalize_path`/`path_key` (`/` separators, no trailing one, case-folded on Windows) is the key for `git.parse_status` (git answers with `/` separators on every platform while the CLI supplies `D:\Git\proj\x.lua`) and the comparison basis for `render.relative_path`.
+- `render.shorten_path` splits on **both** separators, keeping a drive with the folder it names.
+
+**Concurrency and instances**
+
+- Nothing blocks: reads go through `uv.fs_*` callbacks in `_chunk_size` slices, sessions are folded a `fold_batch` at a time newest-first, and a warm cache under `stdpath("cache")` paints real numbers in frame one. Unknown counts show `+· -·`, never blank.
+- **Each agent gets its own MCP server** (`claudecode.start_agent_instance`) — own port, token, lock file. `M.instances` is keyed by opaque instance id, `M.tab_instance` points at a tab's own Claude, and `_G._claudecode_active_tab_id` is replaced by `claudecode.request_context` (with N Claudes per tab, "which tab" no longer identifies the sender). `close_all_diffs` scopes by instance so one agent's routine `closeAllDiffTabs` cannot reject a sibling's pending diff.
+- Agents run through `agents/registry.lua`, not the terminal providers (which hold one terminal per tabpage). `bufhidden = "hide"` is what lets a hidden agent keep working; switching is a buffer swap.
+- `session_state.disown_tab` keeps the view's tab out of per-tab session bookkeeping.
+- **A launch never enters a directory that is gone**: a row records the cwd its conversation ran in, and a moved project leaves transcripts naming a missing path — `termopen` refuses such a cwd (`E475`). An unusable recorded path is dropped for the directory the view is attached to. A failed spawn reports the reason it was given.
+
+**Layout and routing**
+
+- Every pane carries `claudecode_live_preview` and the tab is marked `claudecode_agents`, so diffs, previews and the plan view never take one over. The tab declares `t:claudecode_layout_owner = { forbids_split, host = "float", float_module, origin }` — the routing protocol every "where does this file go" decision reads (`diff.resolve_target_window`).
+- `agents.tab_name` names the tab, plus `tab_name_var` for which tab-local variable to write (tablines disagree: `t:name`, tabby's `tab_name`, taboo's `taboo_tab_name`), or a function form handed the tabpage for tablines that rename via a command. Nothing undoes it on close.
+- **The view stands down for a Neovim session write** (`close_for_session`, via `session_state.prepare_save`): `:mksession` would record four pane buffers and, with `'sessionoptions'` carrying `terminal`, a `term://` buffer per live agent that Neovim restores by re-running the command. It must happen in the manager's **pre-save** hook (auto-session order is `pre_save` → `mksession` → `save_extra_data`), and a `VimLeavePre` autocmd of ours loses the race (the session manager loads at startup, claudecode is lazy-loaded, same-event autocmds run in registration order). The record is therefore taken _before_ the close and held in `pending_capture`, consumed by the first later `capture()`. Only on exit: `v:exiting` is the test (`v:null` normally, an exit code from `VimLeavePre` on); `M.state.shutting_down` cannot help, being set by an autocmd registered after the session manager's.
+- `M.close({ keep_tab = true })` takes only our own windows, emptying rather than closing the last one, when the tab holds a window of the user's.
+- `openFile` from an agent **floats**; a **clicked** terminal link goes to a real editor window in the origin tab and takes you there. Deliberately different: one is the agent's idea, the other is yours.
+
+**Floats in agents mode**
+
+- Diffs and file opens land in cascading floats (`agents/float.lua`, a thin wrapper over `lua/claudecode/float.lua` — see 13), tagged and titled per agent so several are answerable at once.
+- A float records what it is _for_, so `float.close_all(session_id, "open")` dismisses the file a plan was shown in (on `PostToolUse(ExitPlanMode)`) without touching a pending diff.
+- The diff float hosts the unified inline provider, so `:w` acceptance and the blocking MCP response are unchanged. The float is recorded on the diff state (`float_window`) so `_cleanup_diff_state` closes it on resolve, **forced** (a rejected diff's buffer is still modified).
+- `diff_opts.layout = "float"` needs unified.nvim and warns once when it resolves to the native provider, which needs two real windows.
+- **Live cursor and the plan view stand down for agents** (`live_cursor.from_agents_mode`, checked in `dispatch` after status/agents routing and before anything opens a window): every window in the agents tab is a pane. Detected by the tab stamp _or_ `registry.is_live(session_id)`, since the stamp only says where the CLI launched.
+
+**Hooks, status and read-state**
+
+- `source = "auto"` rides the hooks `status` already pays for, else polls transcript mtimes. Hook cost is two headless `nvim` per tool call _per running agent_, so polling is the default.
+- Two hooks are registered even under polling: `PostToolUse(ExitPlanMode)` and `SessionStart`.
+- Live state is per **conversation**, not per tab (`status.classify` is extracted so the rules stay shared). `done` takes the same three conditions as the tab rule: the conversation is the selected one, the view's tab is current, and Neovim has focus (`status.is_focused`, exported so the rules cannot drift).
+- Clearing `done` needs its own wiring: `model.mark_read` (`done` → `idle`; `waiting` untouched) is called by `model.select` (covers `<CR>` and `<C-n>`/`<C-p>`) and by `agents_view.mark_selected_read` on `TabEnter`/`FocusGained`. `status`'s own autocmds cannot help — its entries are keyed by tab and several conversations share this one.
+
+**Activity pane**
+
+- Lists events **newest first** (`model.feed` reverses the store's order and trims the oldest).
+- **Includes calls that touch no file** (`agents/tools.lua`, `agents/tool_view.lua`, `agents/ansi.lua`) — shell commands, searches, subagents. They produce no `filePath`, so the file fold skips them by construction.
+- A call and its result are two entries joined by a `toolu_…` id, and the **row is built from the call**, so a command appears when it starts, which is what allows showing it as running.
+- Only three of five outcomes are drawn (`…` running, `✗` failed, `⊘` stopped by you); most calls simply work.
+- **Failure is `is_error`, never stderr** (measured: one session had 3 `is_error` against 55 with stderr output, nearly all `git`/`rg` progress). A **refusal is not a failure** (32 of 379 `is_error` results here are the user declining). `"interrupted":true` on the Bash result shape is worthless — `false` in all 25 transcripts checked.
+- `_fold_line` closes out every still-pending call when it sees the `[Request interrupted by user]` marker (see 11), else an interrupted `sleep 300` keeps a "still running" marker forever.
+- **The row carries only what it draws** — tool, one-line label, id — and `<CR>` re-reads the pair (`transcript.tool_call`). Payloads are the bulk of a transcript (~116KB of commands and output in one session here), and the id is an excellent prefilter: exactly two lines contain it. Fold cost on this project's largest transcript (11.9MB, 2628 lines, 451 with a `tool_use` block, 1.26MB): 34ms → 47ms.
+- Row labels are per-tool knowledge (`tools.label`): only `Bash` and `Task` carry a `description`; `Grep` is named by its pattern, `WebFetch` by its URL without the scheme, `TodoWrite` by what is in progress and how many are done — with a field-order fallback so unknown MCP tools still get a readable row.
+- Float bodies are too (`tools.body`): `Bash` puts the command above its output with stderr as a **named section rather than an error**; a subagent shows the reply the parent received; a file list shows one per line; anything unrecognized is pretty-printed **valid** JSON (commas and all — readers copy it out).
+- Command output goes through `agents/ansi.lua`, which turns SGR codes into extmarks against `g:terminal_color_*` (256-colour and 24-bit resolved to hex) and drops what a buffer cannot act on (cursor moves, erases, OSC titles). Subtlety: `gmatch("[^;]*")` yields a trailing empty match read as `0`, which resets every colour immediately after setting it — must be handled.
+- **The float names what it shows** (`tools.detect_filetype`). Sniff the **output** (not the command — patches come from `git diff | head`, `log --patch`, a written `.patch`) for `diff --git`, an `@@` hunk header, an `index <sha>..<sha>` line, or a `--- `/`+++ ` **pair** (a lone `--- ` opens a YAML document or closes Markdown front matter) → `diff`, or `git` when `commit <sha>` headers are present. The command is asked only what it alone knows: a file being printed (`cat`/`bat`/`head`/`tail`/`less`, taken from the pipeline's **last** stage) is whatever `vim.filetype.match` says, and `jq` is JSON unless asked for raw text. Everything else gets no filetype — a wrong syntax is worse than none. Only the first `SNIFF_LINES` are read, and only stdout (stderr is progress; the `$ …` and `── stdout ──` lines are ours).
+- `.` and `gf` say a tool row is not a file rather than doing nothing, but a float stepping with `<C-n>`/`<C-p>` lands on tool rows too — except a `.`-opened one, which skips them silently.
+- `f` (`keymaps.filter`) cycles everything / files only / commands only. The filter is applied while walking events from the newest end, not to a slice (with a filter on, visible rows come from anywhere in history). It lives on the view and dies with it, like the sort criterion. `feed_tools = false` folds none of them.
+- `model.feed(visible)` takes the pane height plus slack, since the pane repaints wholesale (240 rows 1.31ms/paint → 24 rows 0.17ms) and it no longer grows with the conversation.
+- `model.feed` returns `events, ages` as parallel arrays rather than copying events (those are the transcript's own cached tables). Ages come from `model`: `stamp_feed` keys a weak table by the event table itself; the first batch after a selection change is a backfill, so it is aged from **each event's own timestamp** rather than declared old wholesale. `stamp_counts` only calls a count changed when it moved from one already shown.
+
+**Layout sizing**
+
+- `layout.sessions_height` defaults to `0.55`; widths default to `0.23`/`0.23` with the terminal taking `0.54`.
+- **Only the sidebars are `winfixwidth`/`winfixheight`; the centre absorbs.** Fixing the centre too leaves Neovim no window to take space from (widening one sidebar shrank the other).
+- `build_layout` clears those flags on the window it splits from (a rebuild starts from a surviving pane that still carries them) and applies sizes **last**, after buffers, tags and winbars. Do not toggle `'equalalways'` around construction — restoring it re-equalises every window.
+- **A split opened in the tab and then closed redistributes the panes** (`winfixheight` does not stop Neovim when no unfixed window is available in that column). `remember_sizes` snapshots the three sizes whenever the tab holds nothing but the four panes (floats excluded), and `restore_sizes` puts the snapshot back after any window in the tab closes. A snapshot, not the configured fractions, so a dragged size survives. `sizes_locked` is set the moment a window closes and cleared by the restore, so a redraw landing in that gap does not snapshot the damage.
+- Snapshots are taken on `WinResized`, `WinEnter`/`WinLeave`, and from `redraw` — deliberately **not** `WinNew`, which fires after Neovim has already taken the space. A focus change is the last moment the layout is reliably intact.
+
+**Fade (`agents/fade.lua`)**
+
+- `fade.lua` owns its defaults **alone**; `config.defaults` deliberately carries no `fade` table, because `fade.opts()` merges applied config over its own and a second copy silently wins.
+- A new Activity row is drawn lifted above its own colour (`fade.boost`) and **bold** (`fade.bold`) for `fade.hold_ms` (3s), then walks down through that colour into the pane background over `(steps - 1) × step_ms` (~3s) — one continuous ramp from `lit` to `rest`, collapsing to the pre-boost formula when `boost = 0`. Bold is dropped when the ramp starts.
+- **The lift is intensity and weight, never brightness.** `intensify` saturates towards 1 (all the lift for a muted `Comment`, none for a vivid `Directory`) and moves lightness towards a colourful band **only away from the pane background and only if the colour is on the wrong side of it**. Scaling channels towards peak does nothing for a colour already there (`#82aaff` at s=1.00 came back a pale wash). Brightening (scale channels to lift the largest, spending the remainder towards white) survives only as the fallback for a hueless colour.
+- Saturation can cost legibility (the eye weights blue at a fourteenth of green): the result is walked back up in lightness at its new hue until it is at least as legible as the colour it came from.
+- A `+N`/`-N` that moved is drawn lit and ramps back within `flash_ms` (3s), set one step longer than the ramp so it has no flat hold.
+- `step_ms` matches `spinner_ms` because that clock samples the ramp; ramp length is set by the step _count_, and 25 steps is what makes a 3s fade a fade.
+- The ramp is pre-computed highlight groups, not per-frame `nvim_set_hl` (redefining a group is global). It needs no timer: `redraw` asks `anything_moving` of the rows it drew — an animated status icon (`status.is_animated`) or a fade still ramping (`fade.animating`) — and **releases the frame request otherwise**. The shipped `busy` icon is a single glyph (the spinner is opt-in via `icons = { busy = status.SPINNER }`), so by default nothing animates.
+- **A count block is one hue at four strengths** (`fade.count_group`). Rest = the theme's colour at `count_sat` (0.25) dimmed `count_dim` (0.60) towards its own block; block = `count_bg_sat` (0.22) of it, `count_bg_lift` from the pane in lightness; flash = the colour itself on a block at `flash_level` (0.50), text following `flash_text_lift` (0.25) of lightness up at the same hue and saturation. Both the dim and the desaturation are needed on the resting number: at equal lightness a desaturated green and a full one read alike.
+- Hue priority: the group's own foreground when it is an actual colour → `Added`/`Removed` (Neovim ships these) → the block's own hue → nothing derived. **The block follows the number, not the theme's `DiffAdd` background**, which is often a different hue (tokyonight-moon pairs a green `Added` with a blue block).
+- All four colours are walked in lightness at their own hue until they clear `count_contrast` (4.5:1) on whatever they sit on. That floor also limits how quiet `count_dim` can make a number.
+- "Is this a colour" is decided by **channel spread**, not HSL saturation, which runs away at both ends (`#eef1f8` reports s = 0.42 with 4% spread; `#a89984` reports 0.14 of spread and looks grey).
+- A near-grey has no hue to intensify (hue 0 is red — saturating would flash it pink) and is brightened instead. The two halves must differ, or a flashed count is _less_ legible than one at rest. `flash_level` and `flash_text_lift` trade against each other: a **lower** `flash_level` buys a more legible number (on a `#005523` DiffAdd, `0.8`/`0.1` gives 1.36:1 vs `0.55`/`0.25` at 2.09:1).
+- Every span of an Activity row must carry a group — the `read`/`edit` column had none and fell through to `Normal`, the one span the fade could not reach. It uses `ClaudeCodeAgentsKind` (default-linked to `Comment`).
+
+**Sessions pane**
+
+- The cursor is anchored to its **conversation** across repaints, not its line (a re-sort or a new session moves rows under it, and `<CR>`/`x`/`dd` would act on the wrong one). `cursorline` painting a line like the selection is why a merely-busy session looked selected.
+- **A session's bullet is dimmed when it is _not_ running** — the reverse of `status`, which dims `idle` (right for a tabline, where a tab with no Claude draws nothing). `model.rows` paints a not-running row in `ClaudeCodeAgentsStopped` (`agents.highlights.stopped`, linked to `Comment`) and drops the group entirely from a live `idle` one. Other states keep `status`'s groups.
+- The selected row carries `❯` in the gutter (`SELECTED_MARK`). Its highlight band is a **character range ending where the counts start**, not a `line_hl_group`: a line highlight composes over character-highlight backgrounds whatever the priorities, which stripped the coloured count blocks on exactly the row you most want to read.
+- **`/clear` swaps the conversation id under a running terminal** — verified against CLI 2.1.226: `SessionEnd(reason="clear")` for the old id, then `SessionStart(source="clear")` with a brand new one, same process, terminal and socket. `--fork-session` has the same shape. Nothing on disk attributes the new conversation to an agent, so the CLI has to say so:
+  - A **launch** gets its own name (`agent_key`, passed as `CLAUDECODE_AGENT_ID`) — the registry's second index, since the first one moves.
+  - `SessionStart` is injected whenever agents mode is enabled, even under polling.
+  - `registry.rekey` moves the agent: this index, its server instance (`claudecode.rekey_agent_instance` **renames rather than replaces** — the client is still connected to that port and `request_context.session_id()` reads the instance), and any float on screen (`float.retag`).
+  - The selection follows the terminal only when it was on the conversation being left.
+  - `term.retired` stops an agent drifting back onto a conversation it left: the two events are separate async hook processes, so arrival order is not the CLI's order. `SessionStart` is exempt (`reclaim`) — that is the CLI stating which conversation it is having now.
+  - `model.note_session_change` drops the old conversation's per-agent state (otherwise a spinner sits on a row nothing will report about again).
+- **A conversation started here is listed before it exists on disk** (the CLI writes the transcript on the first message). `refresh_list` lists what the registry is running as well as what the directory holds (`registry.live_ids`, one synthetic row per live conversation the enumeration missed), built from the only three known things: id, directory, running. Counts are `0`/`0` (not the unknown placeholder, which would claim they are still being read); titled `New session`; `refresh_list` carries a row's previous title across a rebuild so the name does not flicker back to the id prefix. It is rebuilt from `live_ids` every pass, so it is taken over by the enumeration or drops out.
+- `M.select` resumes only a conversation that has a row; an id that never got a transcript is claimed with `--session-id` as it was the first time.
+- The row is named with `transcript.session_path`, which applies the slug rule directly when `project_dir` finds nothing (the project that matters most is the one the CLI has never run in).
+- Cursor anchoring is overridden for one paint whenever the selection moved since the cursor was last placed (`state.cursor_selection`), so the cursor lands on a new row when it appears.
+- **Every pane line begins with a blank cell**: word-highlight plugins (mini.cursorword, vim-illuminate) lit up every row sharing a timestamp or status letter with the cursor's column-1 word. All of them stand down over whitespace. `create_buf` also sets `b:minicursorword_disable`.
+- **A path too long for its pane is cut from the inside** (`render.shorten_path`), never the tail: `first/…/parent/name` → `first/…/name` → `…/name` → `name` → the name cut with its **extension kept**. The first folder outranks the parent because it is the coarser answer (`lua/…/init.lua` vs `tests/…/init.lua`).
+- Rows are ordered by `summary.last_ts` — **the newest `"timestamp"` anywhere in the transcript**, matched out of the raw line rather than decoded, from any entry type. Dating from tool results alone leaves a Bash-only conversation at epoch 0; the file's mtime is worse (the CLI appends untimestamped `last-prompt` bookkeeping days later).
+- **The order is then frozen** (`model.apply_order`): every criterion moves on its own, so with several agents running the list shuffled continuously. `state.order` records the ids in shown order, rows keep their places, and a new session is **sorted in once** at the position the active criterion gives it and then pinned (appending would file every new agent at the bottom of a recency sort). `state.order` is rebuilt from the rows present, so deletions need no cleanup.
+- Only two things re-sort: `r` (explicit re-read) and `gs` (`keymaps.sort`) → `agents/sort_menu.lua`, a single-key float (`snacks.win`, else `nvim_open_win`, our own rendered buffer either way) offering `recent`/`name`/`changes`/`status` from `model.SORTS`, with re-picking the active one meaning **reverse**. It is the only place the order is stated, so it names the direction in the criterion's own words ("newest first", "A → Z"), and it answers exactly once however many buffer-local keys are pressed after it closes. The choice lives on `state` and dies with `detach`; the next open starts from `agents.sessions.sort` (old values `added`/`title` are aliases for `changes`/`name`).
+
+**Deleting conversations**
+
+- `dd` (`keymaps.delete`) → `transcript.delete` removes the `.jsonl` **and** the sidecar directory of tool results (`<dir>/<id>/`). The row disappears because `refresh_list` re-enumerates, not because anything removed it locally.
+- Irreversible (the transcript _is_ the conversation), so it asks first through `agents/confirm.lua`: a centred `snacks.win` float, else `vim.fn.confirm`. Every path answers exactly once; closing the window counts as "no" (the callback is guarded and deferred out of the closing keymap).
+- Takes a **count** and a **visual range** (`3dd`, or `d` over a selection — `_visual_lhs` binds a doubled key under its single form, since over a selection the range _is_ the selection). A batch asks **once**: the dialog names the first `DELETE_LIST_MAX` rows and counts the rest, and `model.delete_sessions` re-enumerates once for the whole batch.
+- A session whose agent is still running is refused (the CLI has the file open). Inside a range it is _set aside_ rather than vetoing the gesture; the dialog reports how many were left alone. Only a range with nothing deletable merely warns.
+- `stop` moved to `x` because `map` binds with `nowait`, so a `d` binding makes `dd` unreachable.
+
+**Row actions**
+
+- **A row in either pane is a record of work, not a file reference.** `<CR>` shows what the session did to that file (`agents/file_view.lua`): today's content with the session's changes rendered inline by unified.nvim; for a read row, the lines that read covered, in live-cursor's own highlight group.
+- The baseline is not in the store (`originalFile` is on only some edits — 179 of 402 in one transcript), so `agents/patch.lua` reconstructs it by **reverse-applying the session's own hunks** to the file on disk, newest first. A hunk is located by content nearest its recorded line (the file moves on afterwards); one that is nowhere any more was overwritten later and is skipped, and the float's title says how much of the session's work is still present (253/349 hunks located across six real transcripts). When nothing can be located, the file is gone, or unified.nvim is absent, the hunks themselves are shown as diff text — the CLI's own record, which cannot be stale.
+- `.` (`keymaps.git_diff`) → `file_view.open_against_head`: same float and renderer, `git show HEAD:./<name>` as the baseline, run with `-C <the file's own directory>` so the repo root never has to be found. Non-zero exit = not in HEAD, so every line is an addition; a file identical to HEAD says so instead of opening an empty diff; without unified.nvim it falls back to `vim.diff` text. This read bypasses `git.run`, which drops empty lines (right for status, wrong for file content).
+- `gf` (`keymaps.goto_file`) opens **the file itself, on disk, in a new tab** — the other two are for reading what happened, this one is for working. A new tab carries none of the agents tab's vars. A path that is no longer readable is refused with a log line (`tabnew` on a missing path opens a buffer whose first `:w` resurrects the file).
+- File history is read on demand (`transcript.file_history`, prefiltered on the basename, ~21ms for a session's whole file list) rather than folded into the summary, and answers through `vim.schedule` — its reads land in a libuv fast context where opening a window is `E5560`.
+- The Changes pane takes `+N/-N` from the transcript and only its `M`/`A`/`D`/`?` letter from git (`agents/git.lua`, pathspec-restricted, single-flight, newline-delimited rather than `-z` because `jobstart` renders NUL as `\n`), so the pane and the session row cannot contradict each other.
+
+**Navigation**
+
+- `<C-n>`/`<C-p>` (`keymaps.next_session`/`prev_session`) move the selection from **any** pane and from inside the terminal, in terminal mode as well as normal.
+- A live conversation is swapped into the centre at once. A **stopped one is selected but never started** — cycling is how you read what sessions did, and every pane follows the selection. The centre shows a notice naming the conversation and the key that starts it (`show_start_prompt`, recorded as `state.pending_start`); the notice is one reused scratch buffer (`state.notice_buf`), which is also what a dead agent's pane shows.
+- `focus_terminal` (`keymaps.focus_term`, `i`) resumes a stopped conversation and then lands in it — "put me in this session" is one intent either way. It falls back to the offer if pressed before the list arrives, and starts a new agent when there is neither an offer nor a session.
+- **The view opens already pointed at a session** (`offer_initial_session`, armed by `state.await_initial`, fired from the model's change callback as well as `open`, since the list folds asynchronously). Otherwise the centre holds `tabnew`'s blank _modifiable_ buffer where `i` edits a scratch file. It offers the selected or newest session, starts nothing, and stands down once a terminal or earlier offer owns the pane. `refresh_start_prompt` repaints it when the fold replaces the placeholder title.
+- A conversation running in another tab is offered as a **jump**, not a start (two CLIs on one transcript).
+- **A project Claude has never run in gets its own screen** (`show_empty_notice`, painted by `sync_empty_notice`): the offer bails on an empty list and waits for a model change that never comes. Enumeration is synchronous (`transcript.list` is stat-only), so `open` answers immediately: no conversations yet, plus the key that starts one. That key (`keymaps.new`, `a`) is a sessions-pane key elsewhere, so it is bound on the notice buffer only while that screen is what it holds, and removed when it becomes a resume offer (the buffer is reused; a stale `a` would start a second agent). The same screen returns when a project _becomes_ empty and re-arms `state.await_initial`.
+- **Inside a file float those keys step through the pane's rows** (`bind_float_nav`): the float is a view of one row, so they walk the rows one level down, wrapping at both ends, skipping rows with no file, moving the pane's cursor along and keeping the baseline the float was opened with.
+- Stepping **swaps the float's content in place** (`float.create`'s `reuse`, threaded through `file_view`) rather than close-then-open: `file_view.open` reads history asynchronously, so a close-then-open leaves focus in the _pane_, where the same keys change the session. Reuse also stops the cascade walking down the screen per file.
+- Repeats are **coalesced**: the aim moves on the keypress and only one open is in flight, so holding the key walks at key-repeat speed and opens the row it settles on.
+- Bound only on scratch buffers we made — `float.open_file` shows the real file buffer, where a buffer-local `<C-n>` would follow that file into the editor.
+
+**Search (`agents/search.lua`, `gf` in the sessions pane / `keymaps.search`)**
+
+Same key as `goto_file`, different meaning; possible because no pane is offered both.
+
+- Searches **what was said** (`user`/`assistant` `text` blocks), the **paths touched** (`toolUseResult.filePath`), **what the turn ran** (`tool_use` block inputs), **what it was reasoning about** (`thinking` blocks), and the title.
+- Deliberately **not** tool output: "handshake" appears 133 times in this store and not once in a message (96 in `attachment` entries, 30 in tool results), so searching output returns every session that ever read the file.
+- A `tool_use` input skips path fields (`file_path` and friends), since the call's `toolUseResult` already reports that path as a `file` match. Remaining string fields are read in `TOOL_FIELDS` order then alphabetically (`pairs` order is not stable, and a result list that reorders itself between identical queries is worse than a dull order).
+- **Match priority is decided over the whole file** (`SEARCH_KINDS`: said → file → ran → thought), not within an entry. Per-entry ranking let reasoning take every row ("windows": 26 thinking vs 6 message lines per-entry; 5 vs 24 globally). The scan collects into a **bag keyed by kind**, stopping when the top tiers are full (`bag_done`) or at `limit * 3` of anything.
+- Matching is **literal and smartcase** (`transcript.compile_query`); case-insensitivity is compiled into a Lua pattern (`[aA]`) rather than lowering the haystack.
+- **There is no index.** Each query past the debounce re-reads the store and is cancelled by the next keystroke. Affordable because the prefilter runs on the **raw JSON line** (non-matching lines are never decoded) and a scan stops at `max_per_session` (3). Measured on 32 transcripts / 88.9MB: a query matching nothing sweeps everything in ~830ms, with results streaming as each file finishes.
+- Cost of raw-line prefiltering: a query containing a quote, backslash or newline is spelled differently in the file and will not be found. Ordinary words, paths and identifiers are fine.
+- A line over `SEARCH_LINE_LIMIT` (256KB) is skipped rather than decoded, and walked a slice at a time.
+- Scans run four at a time but results are stored **by session position**, so the list is in the sessions pane's order however reads finish. The cursor is anchored to its session across repaints.
+- **Two windows**: the query is a real buffer (every editing key works), the list is `focusable = false` and never entered. `<C-n>`/`<C-j>`/`<Down>` and `<C-p>`/`<C-k>`/`<Up>` drive its cursor from the input; leaving the input cancels.
+- Moving **previews** (`agents_view.preview_session` — `cycle_session`'s body reached from an id; panes follow, nothing starts), so `<Esc>` restores the selection the picker opened with.
+- `<CR>` is `focus_terminal`'s intent (`agents_view.enter_session`): select, resume if stopped, land in it. The query outlives the picker and dies with the view.
+
+**Help (`?` / `keymaps.help`, `agents/help.lua`)**
+
+- Lists the keys reaching the pane the cursor is in, grouped "this pane" then "anywhere in the view". A float via `snacks.win`, else `nvim_open_win`, into a scratch buffer we render and highlight ourselves so both paths match. A second `?` toggles it shut.
+- Contents come from `KEY_SPECS`, the **same table `bind_keys` binds from**, filtered by pane and by what the user left bound.
+- Headers/keys use `ClaudeCodeAgentsHelpHeader`/`ClaudeCodeAgentsKey` (linked to `Title`/`Special`, overridable via `agents.highlights.header`/`key`).
+
+### 13. Floating Windows
+
+Where a diff or file goes when there is no editor window: the agents tab (every window is an excluded pane) and `diff_opts.layout = "float"`.
+
+- Floats **cascade** — each offset from the last, newest on top, title in the border, stack clamped so it never walks off screen. Several agents work at once and diffs arrive faster than you answer them; queueing would block a waiting CLI.
+- Each carries `claudecode_live_preview` and `claudecode_float` so a second diff never targets the first's window.
+- **The user's own display settings are applied, not inherited.** A float copies window-local options from the _current_ window, usually an agents pane with `wrap`/`number`/`list` off for fixed-width rows, and `style = "minimal"` wipes them again. `apply_user_options` runs after the window opens and puts the globals (`vim.go.*`) back on top. `fillchars` is left to `minimal` (frame chrome, not a reading preference).
+- **Every window option this plugin sets goes through `utils.set_win_option`, which passes `scope = "local"`.** `vim.wo[win].x = v` and `nvim_set_option_value(…, {win = w})` behave like `:set`, not `:setlocal`, when `w` is the current window — so they write the user's global. A pane is current while being built, so this leaked `wrap=false number=false list=false` into the user's globals for the rest of the session.
+- Geometry comes from the **top-level `float` block**, overridden by a feature's own table (`agents.float`). That split is why the module was extracted from `agents/float.lua`: `layout = "float"` used to take its geometry from a feature the user may have disabled. `config.validate_float` is shared by both blocks so key lists cannot drift.
+- `agents/float.lua` is now a thin wrapper supplying the session id, agents geometry and the `claudecode_agents_float` tag. **The stack is shared**, so agent floats and plain diff floats cascade past each other, and `diff.lua`'s cleanup closes a float through this module whichever door it came in by.
+- **Terminal insert mode is restored**: entering a float leaves terminal-mode, so dismissing a diff handed focus back in normal mode. The mode is read in `create` _before_ `nvim_open_win`, and the current window is only taken as the answer when it actually holds a terminal (`terminal_mode_window`) — a diff float is opened inside `nvim_win_call` (`diff.in_owning_tab`), which makes another window current while `mode()` still says `t`. `_setup_blocking_diff_unified` therefore reads the terminal _before_ entering `in_owning_tab` and passes it as `term_win`. Restore happens from a `WinClosed` autocmd (a float also goes away by `:w`, `:q` and a closing tab), then from `vim.schedule` (focus has not moved yet inside `WinClosed`), and only when the close actually returns to that terminal window.
+- `bind_close` gives a float `q` and `<Tab>`. Because a float can hold a **real file buffer** (`open_file`), a mapping somebody else made is left alone, and ours are deleted on `WinClosed` — tied to the window, not to `M.close`, since `:q`, `<C-w>c` and a closing tab never reach it. Otherwise every file Claude showed you would carry a window-closing `q` forever.
+
+---
 
 ### WebSocket Server Implementation
 
-- **TCP Server**: `server/tcp.lua` handles port binding and connections. Port selection has two non-obvious constraints, both learned from a real `EADDRINUSE` on startup. First, **`bind()` does not prove a port is free**: libuv sets `SO_REUSEADDR` on every TCP bind, and on macOS that bind succeeds even when another _process_ is already listening there — only `listen()` reports the conflict. So `_port_is_free` binds _and_ listens, and `create_server` skips the probe entirely, binding and listening on the real socket and moving to the next candidate (up to `MAX_BIND_ATTEMPTS`) when a port turns out to be taken, rather than failing the whole start. Second, the shuffle that picks a candidate is seeded in `server/utils.lua`: `os.time()` alone has one-second resolution, so two Neovim instances started in the same second seeded identically, shuffled identically, and picked the _same_ port out of 55000 — the seed now mixes in the pid and `vim.loop.hrtime()`
-- **Handshake**: `server/handshake.lua` processes HTTP upgrade requests with authentication
-- **Frame Processing**: `server/frame.lua` implements RFC 6455 WebSocket frames
-- **Client Management**: `server/client.lua` manages individual connections
-- **Utils**: `server/utils.lua` provides base64, SHA-1, XOR operations in pure Lua
+- **TCP Server**: `server/tcp.lua`. Port selection has two non-obvious constraints:
+  - **`bind()` does not prove a port is free**: libuv sets `SO_REUSEADDR` on every TCP bind, and on macOS the bind succeeds even when another process is listening — only `listen()` reports the conflict. `_port_is_free` binds _and_ listens; `create_server` skips the probe entirely, binding and listening on the real socket and moving to the next candidate (up to `MAX_BIND_ATTEMPTS`) rather than failing the start.
+  - The candidate shuffle is seeded in `server/utils.lua` mixing pid and `vim.loop.hrtime()` — `os.time()` alone has one-second resolution, so two Neovims started in the same second picked the same port.
+- **Handshake**: `server/handshake.lua` — HTTP upgrade with authentication.
+- **Frame Processing**: `server/frame.lua` — RFC 6455 frames.
+- **Client Management**: `server/client.lua`.
+- **Utils**: `server/utils.lua` — base64, SHA-1, XOR in pure Lua.
 
-#### Authentication System
+#### Authentication
 
-The WebSocket server implements secure authentication using:
+- **128-bit tokens**: 32-char lowercase hex from the OS CSPRNG, per session.
+- **Header**: `x-claude-code-ide-authorization`.
+- **Discovery**: tokens stored in `~/.claude/ide/[port].lock`.
+- Server accepts only local connections (127.0.0.1).
 
-- **128-bit Tokens**: 32-char lowercase hex from the OS CSPRNG, generated per session
-- **Header-based Auth**: Uses `x-claude-code-ide-authorization` header
-- **Lock File Discovery**: Tokens stored in `~/.claude/ide/[port].lock` for Claude CLI
-- **MCP Compliance**: Follows official Claude Code IDE authentication protocol
+### MCP Tools
 
-### MCP Tools Architecture (✅ FULLY COMPLIANT)
+All tools return MCP-compliant `{content: [{type: "text", text: "JSON-stringified-data"}]}` and match the VS Code extension's behaviour and output.
 
-**Complete VS Code Extension Compatibility**: All tools now implement identical behavior and output formats as the official VS Code extension.
+**MCP-exposed** (with JSON schemas): `openFile` (optional startLine/endLine, preview mode, text pattern matching, makeFrontmost), `getCurrentSelection`, `getLatestSelection`, `getOpenEditors` (VS Code-compatible `tabs` structure), `openDiff`, `checkDocumentDirty`, `saveDocument`, `getWorkspaceFolders`, `closeAllDiffTabs`, `getDiagnostics`.
 
-**MCP-Exposed Tools** (with JSON schemas):
+**Internal** (not exposed): `close_tab`.
 
-- `openFile` - Opens files with optional line/text selection (startLine/endLine), preview mode, text pattern matching, and makeFrontmost flag
-- `getCurrentSelection` - Gets current text selection from active editor
-- `getLatestSelection` - Gets most recent text selection (even from inactive editors)
-- `getOpenEditors` - Lists currently open files with VS Code-compatible `tabs` structure
-- `openDiff` - Opens native Neovim diff views
-- `checkDocumentDirty` - Checks if document has unsaved changes
-- `saveDocument` - Saves document with detailed success/failure reporting
-- `getWorkspaceFolders` - Gets workspace folder information
-- `closeAllDiffTabs` - Closes all diff-related tabs and windows
-- `getDiagnostics` - Gets language diagnostics (errors, warnings) from the editor
+Tools with `schema = nil` are internal-only; see `lua/claudecode/tools/init.lua` for registration.
 
-**Internal Tools** (not exposed via MCP):
+### Terminal Integration
 
-- `close_tab` - Internal-only tool for tab management (hardcoded in Claude Code)
-
-**Format Compliance**: All tools return MCP-compliant format: `{content: [{type: "text", text: "JSON-stringified-data"}]}`
-
-### Terminal Integration Options
-
-**Internal Terminals** (within Neovim):
-
-- **Snacks.nvim**: `terminal/snacks.lua` - Advanced terminal with floating windows
-- **Native**: `terminal/native.lua` - Built-in Neovim terminal as fallback
-
-**External Terminals** (separate applications):
-
-- **External Provider**: `terminal/external.lua` - Launches Claude in external terminal apps
-
-**Configuration Example**:
+- **Snacks.nvim**: `terminal/snacks.lua`
+- **Native**: `terminal/native.lua`
+- **External**: `terminal/external.lua`
 
 ```lua
 opts = {
   terminal = {
-    provider = "external",  -- "auto", "snacks", "native", or "external"
-    external_terminal_cmd = "alacritty -e %s"  -- Required for external provider
+    provider = "external",  -- "auto", "snacks", "native", "external"
+    external_terminal_cmd = "alacritty -e %s"  -- required for external
   }
 }
 ```
 
 ### Key File Locations
 
-- `lua/claudecode/init.lua` - Main entry point and setup
-- `lua/claudecode/config.lua` - Configuration management
-- `plugin/claudecode.lua` - Plugin loader with version checks
-- `tests/` - Comprehensive test suite with unit, component, and integration tests
+- `lua/claudecode/init.lua` — entry point and setup
+- `lua/claudecode/config.lua` — configuration
+- `plugin/claudecode.lua` — plugin loader with version checks
+- `tests/` — unit, component, integration suites
 
-## MCP Protocol Compliance
+## Configuration Options
 
-### Protocol Implementation Status
+### Diff Options
 
-- ✅ **WebSocket Server**: RFC 6455 compliant with MCP message format
-- ✅ **Tool Registration**: JSON Schema-based tool definitions
-- ✅ **Authentication**: 128-bit token-based secure handshake (32-char lowercase hex from the OS CSPRNG)
-- ✅ **Message Format**: JSON-RPC 2.0 with MCP content structure
-- ✅ **Error Handling**: Comprehensive JSON-RPC error responses
+- `layout` (`"vertical"`|`"horizontal"`, default `"vertical"`) — split direction.
+- `keep_terminal_focus` (default `false`) — keep focus in the terminal when a diff opens, so terminal keybindings like `<CR>` still accept/reject.
+- `open_in_new_tab` (default `false`).
+- `hide_terminal_in_new_tab` (default `false`) — in the new tab, do not show the Claude terminal split.
+- `on_new_file_reject` (`"keep_empty"`|`"close_window"`, default `"keep_empty"`).
+- Legacy aliases: `vertical_split` (→ `layout`), `open_in_current_tab` (inverse of `open_in_new_tab`).
 
-### VS Code Extension Compatibility
-
-claudecode.nvim implements **100% feature parity** with Anthropic's official VS Code extension:
-
-- **Identical Tool Set**: All 10 VS Code tools implemented
-- **Compatible Formats**: Output structures match VS Code extension exactly
-- **Behavioral Consistency**: Same parameter handling and response patterns
-- **Error Compatibility**: Matching error codes and messages
-
-### Protocol Validation
-
-Run `mise run test` to verify MCP compliance:
-
-- **Tool Format Validation**: All tools return proper MCP structure
-- **Schema Compliance**: JSON schemas validated against VS Code specs
-- **Integration Testing**: End-to-end MCP message flow verification
+```lua
+require("claudecode").setup({
+  log_level = "debug",
+  diff_opts = {
+    layout = "vertical",
+    keep_terminal_focus = true,
+    open_in_new_tab = true,
+    hide_terminal_in_new_tab = true,
+    on_new_file_reject = "keep_empty",
+  },
+})
+```
 
 ## Testing Architecture
 
-Tests are organized in three layers:
+Three layers:
 
-- **Unit tests** (`tests/unit/`) - Test individual functions in isolation
-- **Component tests** (`tests/component/`) - Test subsystems with controlled environment
-- **Integration tests** (`tests/integration/`) - End-to-end functionality with mock Claude client
+- **Unit** (`tests/unit/`) — individual functions in isolation
+- **Component** (`tests/component/`) — subsystems with a controlled environment
+- **Integration** (`tests/integration/`) — end-to-end with a mock Claude client
 
-Test files follow the pattern `*_spec.lua` or `*_test.lua` and use the busted framework.
+Files match `*_spec.lua` / `*_test.lua`, busted framework. Custom JSON encoder/decoder in `tests/busted_setup.lua` handles nested structures, Lua keywords as keys (`["end"]`), and MCP message validation.
 
-### Test Infrastructure
+Principles: isolation (no external state), comprehensive vim-API mocking, positive/negative/edge cases, fast execution, descriptive names.
 
-**JSON Handling**: Custom JSON encoder/decoder with support for:
-
-- Nested objects and arrays
-- Special Lua keywords as object keys (`["end"]`)
-- MCP message format validation
-- VS Code extension output compatibility
-
-**Test Pattern**: Run specific test files during development:
-
-```bash
-# Run a specific test file (mise sets LUA_PATH automatically)
-busted tests/unit/tools/specific_tool_spec.lua --verbose
-
-# Or run the whole suite
-mise run test  # Recommended for complete validation
-```
-
-**Coverage Metrics**:
-
-- **320+ tests** covering all MCP tools and core functionality
-- **Unit Tests**: Individual tool behavior and error cases
-- **Integration Tests**: End-to-end MCP protocol flow
-- **Format Tests**: MCP compliance and VS Code compatibility
-
-### Test Organization Principles
-
-- **Isolation**: Each test should be independent and not rely on external state
-- **Mocking**: Use comprehensive mocking for vim APIs and external dependencies
-- **Coverage**: Aim for both positive and negative test cases, edge cases included
-- **Performance**: Tests should run quickly to encourage frequent execution
-- **Clarity**: Test names should clearly describe what behavior is being verified
-
-## Authentication Testing
-
-The plugin implements authentication using 128-bit tokens (32-char lowercase hex) from the OS CSPRNG that are generated for each server session and stored in lock files. This ensures secure connections between Claude CLI and the Neovim WebSocket server.
-
-### Testing Authentication Features
-
-**Lock File Authentication Tests** (`tests/lockfile_test.lua`):
-
-- Auth token generation and uniqueness validation
-- Lock file creation with authentication tokens
-- Reading auth tokens from existing lock files
-- Error handling for missing or invalid tokens
-
-**WebSocket Handshake Authentication Tests** (`tests/unit/server/handshake_spec.lua`):
-
-- Valid authentication token acceptance
-- Invalid/missing token rejection
-- Edge cases (empty tokens, malformed headers, length limits)
-- Case-insensitive header handling
-
-**Server Integration Tests** (`tests/unit/server_spec.lua`):
-
-- Server startup with authentication tokens
-- Auth token state management during server lifecycle
-- Token validation throughout server operations
-
-**End-to-End Authentication Tests** (`tests/integration/mcp_tools_spec.lua`):
-
-- Complete authentication flow from server start to tool execution
-- Authentication state persistence across operations
-- Concurrent operations with authentication enabled
-
-### Manual Authentication Testing
-
-**Test Script Authentication Support**:
-
-```bash
-# Test scripts automatically detect and use authentication tokens
-cd scripts/
-./claude_interactive.sh  # Automatically reads auth token from lock file
-```
-
-**Authentication Flow Testing**:
-
-1. Start the plugin: `:ClaudeCodeStart`
-2. Check lock file contains `authToken`: `cat ~/.claude/ide/*.lock | jq .authToken`
-3. Test WebSocket connection with auth: Use test scripts in `scripts/` directory
-4. Verify authentication in logs: Set `log_level = "debug"` in config
-
-**Testing Authentication Failures**:
-
-```bash
-# Test invalid auth token (should fail)
-websocat ws://localhost:PORT --header "x-claude-code-ide-authorization: invalid-token"
-
-# Test missing auth header (should fail)
-websocat ws://localhost:PORT
-
-# Test valid auth token (should succeed)
-websocat ws://localhost:PORT --header "x-claude-code-ide-authorization: $(cat ~/.claude/ide/*.lock | jq -r .authToken)"
-```
-
-### Authentication Logging
-
-Enable detailed authentication logging by setting:
+**Tool test pattern**:
 
 ```lua
-require("claudecode").setup({
-  log_level = "debug",  -- Shows auth token generation, validation, and failures
-  diff_opts = {
-    keep_terminal_focus = true,  -- If true, moves focus back to terminal after diff opens
-  },
-})
-```
-
-### Configuration Options
-
-#### Diff Options
-
-The `diff_opts` configuration allows you to customize diff behavior:
-
-- `layout` ("vertical"|"horizontal", default: `"vertical"`) - Whether the diff panes open in a vertical or horizontal split.
-- `keep_terminal_focus` (boolean, default: `false`) - When enabled, keeps focus in the Claude Code terminal when a diff opens instead of moving focus to the diff buffer. This allows you to continue using terminal keybindings like `<CR>` for accepting/rejecting diffs without accidentally triggering other mappings.
-- `open_in_new_tab` (boolean, default: `false`) - Open diffs in a new tab instead of the current tab.
-- `hide_terminal_in_new_tab` (boolean, default: `false`) - When opening diffs in a new tab, do not show the Claude terminal split in that new tab. The terminal remains in the original tab, giving maximum screen estate for reviewing the diff.
-- `on_new_file_reject` ("keep_empty"|"close_window", default: `"keep_empty"`) - Behavior when rejecting a diff for a new file (where the old file did not exist).
-- Legacy aliases (still supported): `vertical_split` (maps to `layout`) and `open_in_current_tab` (inverse of `open_in_new_tab`).
-
-**Example use case**: If you frequently use `<CR>` or arrow keys in the Claude Code terminal to accept/reject diffs, enable this option to prevent focus from moving to the diff buffer where `<CR>` might trigger unintended actions.
-
-```lua
-require("claudecode").setup({
-  diff_opts = {
-    layout = "vertical", -- "vertical" or "horizontal"
-    keep_terminal_focus = true, -- If true, moves focus back to terminal after diff opens
-    open_in_new_tab = true, -- Open diff in a separate tab
-    hide_terminal_in_new_tab = true, -- In the new tab, do not show Claude terminal
-    on_new_file_reject = "keep_empty", -- "keep_empty" or "close_window"
-
-    -- Legacy aliases (still supported):
-    -- vertical_split = true,
-    -- open_in_current_tab = true,
-  },
-})
-```
-
-Log levels for authentication events:
-
-- **DEBUG**: Server startup authentication state, client connections, handshake processing, auth token details
-- **WARN**: Authentication failures during handshake
-- **ERROR**: Auth token generation failures, handshake response errors
-
-### Logging Best Practices
-
-- **Connection Events**: Use DEBUG level for routine connection establishment/teardown
-- **Authentication Flow**: Use DEBUG for successful auth, WARN for failures
-- **User-Facing Events**: Use INFO sparingly for events users need to know about
-- **System Errors**: Use ERROR for failures that require user attention
-
-## Development Notes
-
-### Technical Requirements
-
-- Plugin requires Neovim >= 0.8.0
-- Uses only Neovim built-ins for WebSocket implementation (vim.loop, vim.json, vim.schedule)
-- Zero external dependencies for core functionality
-
-### Security Considerations
-
-- WebSocket server only accepts local connections (127.0.0.1) for security
-- Authentication tokens are 128-bit tokens (32-char lowercase hex) from the OS CSPRNG
-- Lock files created at `~/.claude/ide/[port].lock` for Claude CLI discovery
-- All authentication events are logged for security auditing
-
-### Performance Optimizations
-
-- Selection tracking is debounced to reduce overhead
-- WebSocket frame processing optimized for JSON-RPC payload sizes
-- Connection pooling and cleanup to prevent resource leaks
-
-### Integration Support
-
-- Terminal integration supports both snacks.nvim and native Neovim terminal
-- Compatible with popular file explorers (nvim-tree, oil.nvim, neo-tree, mini.files)
-- Visual selection tracking across different selection modes
-
-## Release Process
-
-### Version Updates
-
-When updating the version number for a new release, you must update **ALL** of these files:
-
-1. **`lua/claudecode/init.lua`** - Main version table:
-
-   ```lua
-   M.version = {
-     major = 0,
-     minor = 2,  -- Update this
-     patch = 0,  -- Update this
-     prerelease = nil,  -- Remove for stable releases
-   }
-   ```
-
-2. **`scripts/claude_interactive.sh`** - Multiple client version references:
-   - Line ~52: `"version": "0.2.0"` (handshake)
-   - Line ~223: `"version": "0.2.0"` (initialize)
-   - Line ~309: `"version": "0.2.0"` (reconnect)
-
-3. **`scripts/lib_claude.sh`** - ClaudeCodeNvim version:
-   - Line ~120: `"version": "0.2.0"` (init message)
-
-4. **`CHANGELOG.md`** - Add new release section with:
-   - Release date
-   - Features with PR references
-   - Bug fixes with PR references
-   - Development improvements
-
-### Release Commands
-
-```bash
-# Get merged PRs since last version
-gh pr list --state merged --base main --json number,title,mergedAt,url --jq 'sort_by(.mergedAt) | reverse'
-
-# Get commit history
-git log --oneline v0.1.0..HEAD
-
-# Always run before committing
-mise run all
-
-# Verify no old version references remain
-rg "0\.1\.0" .  # Should only show CHANGELOG.md historical entries
-```
-
-## Development Workflow
-
-### Pre-commit Requirements
-
-**ALWAYS run `mise run all` before committing any changes.** This runs code quality checks and formatting that must pass for CI to succeed. Never skip this step - many PRs fail CI because contributors don't run the build commands before committing.
-
-### Recommended Development Flow
-
-1. **Start Development**: Use existing tests and documentation to understand the system
-2. **Make Changes**: Follow existing patterns and conventions in the codebase
-3. **Validate Work**: Run `mise run all` to ensure formatting, linting, and tests pass
-4. **Document Changes**: Update relevant documentation (this file, PROTOCOL.md, etc.)
-5. **Commit**: Only commit after successful `mise run all` execution
-
-### Integration Development Guidelines
-
-**Adding New Integrations** (file explorers, terminals, etc.):
-
-1. **Implement Integration**: Add support in relevant modules (e.g., `lua/claudecode/tools/`)
-2. **Create Fixture Configuration**: **REQUIRED** - Add a complete Neovim config in `fixtures/[integration-name]/`
-3. **Test Integration**: Use fixture to verify functionality with `vv [integration-name]`
-4. **Update Documentation**: Add integration to fixtures list and relevant tool documentation
-5. **Run Full Test Suite**: Ensure `mise run all` passes with new integration
-
-**Fixture Requirements**:
-
-- Complete Neovim configuration with plugin dependencies
-- Include `dev-claudecode.lua` with development keybindings
-- Test all relevant claudecode.nvim features with the integration
-- Document any integration-specific behaviors or limitations
-
-### MCP Tool Development Guidelines
-
-**Adding New Tools**:
-
-1. **Study Existing Patterns**: Review `lua/claudecode/tools/` for consistent structure
-2. **Implement Handler**: Return MCP format: `{content: [{type: "text", text: JSON}]}`
-3. **Add JSON Schema**: Define parameters and expose via MCP (if needed)
-4. **Create Tests**: Both unit tests and integration tests required
-5. **Update Documentation**: Add to this file's MCP tools list
-
-**Tool Testing Pattern**:
-
-```lua
--- All tools should return MCP-compliant format
 local result = tool_handler(params)
 expect(result).to_be_table()
 expect(result.content).to_be_table()
 expect(result.content[1].type).to_be("text")
 local parsed = json_decode(result.content[1].text)
--- Validate parsed structure matches VS Code extension
 ```
 
-**Error Handling Standard**:
+**Error format**:
 
 ```lua
--- Use consistent JSON-RPC error format
 error({
   code = -32602,  -- Invalid params
   message = "Description of the issue",
@@ -478,49 +454,84 @@ error({
 })
 ```
 
-### Code Quality Standards
+### Authentication Testing
 
-- **Test Coverage**: Maintain comprehensive test coverage (currently **320+ tests**, 100% success rate)
-- **Zero Warnings**: All code must pass luacheck with 0 warnings/errors
-- **MCP Compliance**: All tools must return proper MCP format with JSON-stringified content
-- **VS Code Compatibility**: New tools must match VS Code extension behavior exactly
-- **Consistent Formatting**: Use `mise run format` (treefmt) for consistent code style
-- **Documentation**: Update CLAUDE.md for architectural changes, PROTOCOL.md for protocol changes
+- `tests/lockfile_test.lua` — token generation/uniqueness, lock file creation, reading tokens, missing/invalid token handling
+- `tests/unit/server/handshake_spec.lua` — valid/invalid/missing tokens, empty tokens, malformed headers, length limits, case-insensitive headers
+- `tests/unit/server_spec.lua` — startup with tokens, token state across lifecycle
+- `tests/integration/mcp_tools_spec.lua` — full auth flow, persistence across operations, concurrent operations
 
-### Development Quality Gates
-
-1. **`mise run check`** - Syntax and linting (0 warnings required)
-2. **`mise run test`** - All tests passing (320/320 success rate required)
-3. **`mise run format`** - Consistent code formatting
-4. **MCP Validation** - Tools return proper format structure
-5. **Integration Test** - End-to-end protocol flow verification
-
-## Development Troubleshooting
-
-### Common Issues
-
-**Test Failures with LUA_PATH**:
-
-`mise` sets `LUA_PATH`/`LUA_CPATH` automatically (see `mise.toml` `[env]`), so prefer `mise run test` or run `busted` through the activated mise environment (`mise exec -- busted ...`). If a module still can't be found, you're likely running `busted` outside the mise environment.
-
-**JSON Format Issues**:
-
-- Ensure all tools return: `{content: [{type: "text", text: "JSON-string"}]}`
-- Use `vim.json.encode()` for proper JSON stringification
-- Test JSON parsing with custom test decoder in `tests/busted_setup.lua`
-
-**MCP Tool Registration**:
-
-- Tools with `schema = nil` are internal-only
-- Tools with schema are exposed via MCP
-- Check `lua/claudecode/tools/init.lua` for registration patterns
-
-**Authentication Testing**:
+Manual checks:
 
 ```bash
-# Verify auth token generation
-cat ~/.claude/ide/*.lock | jq .authToken
+# Auth token from lock file
+cat ~/.claude/ide/*.lock | jq -r .authToken
 
-# Test WebSocket connection
+# Should succeed
 websocat ws://localhost:PORT --header "x-claude-code-ide-authorization: $(cat ~/.claude/ide/*.lock | jq -r .authToken)"
+
+# Should fail
+websocat ws://localhost:PORT --header "x-claude-code-ide-authorization: invalid-token"
+websocat ws://localhost:PORT
+
+# Interactive script reads the token automatically
+cd scripts/ && ./claude_interactive.sh
 ```
+
+Log levels: DEBUG for successful auth/connection/handshake detail, WARN for handshake auth failures, ERROR for token generation and handshake response errors. Use INFO sparingly, only for events users need to know about.
+
+## Development Notes
+
+- Requires Neovim >= 0.8.0; only built-ins (`vim.loop`, `vim.json`, `vim.schedule`); zero external dependencies for core functionality.
+- Selection tracking is debounced; WebSocket frames optimized for JSON-RPC payload sizes; connections pooled and cleaned up.
+- Compatible with nvim-tree, oil.nvim, neo-tree, mini.files.
+
+## Release Process
+
+Update the version in **all** of these:
+
+1. `lua/claudecode/init.lua` — `M.version = { major, minor, patch, prerelease }` (remove `prerelease` for stable)
+2. `scripts/claude_interactive.sh` — three client version references (~line 52 handshake, ~223 initialize, ~309 reconnect)
+3. `scripts/lib_claude.sh` — ClaudeCodeNvim version (~line 120, init message)
+4. `CHANGELOG.md` — date, features and fixes with PR references, development improvements
+
+```bash
+gh pr list --state merged --base main --json number,title,mergedAt,url --jq 'sort_by(.mergedAt) | reverse'
+git log --oneline v0.1.0..HEAD
+mise run all
+rg "0\.1\.0" .  # only CHANGELOG.md historical entries should remain
+```
+
+## Development Workflow
+
+**Always run `mise run all` before committing.** Many PRs fail CI because this was skipped.
+
+1. Read existing tests and docs to understand the system
+2. Follow existing patterns and conventions
+3. `mise run all`
+4. Update docs (this file, PROTOCOL.md)
+5. Commit
+
+### Adding an Integration (file explorer, terminal)
+
+1. Implement support in the relevant modules
+2. **Required**: add a complete fixture config in `fixtures/[integration-name]/`, including `dev-claudecode.lua` with dev keybindings
+3. Verify with `vv [integration-name]`
+4. Document the integration and any integration-specific behaviour
+5. `mise run all`
+
+### Adding an MCP Tool
+
+1. Follow the structure in `lua/claudecode/tools/`
+2. Return `{content: [{type: "text", text: JSON}]}`
+3. Add a JSON schema if the tool should be MCP-exposed
+4. Unit **and** integration tests required
+5. Add it to the MCP tools list above
+
+### Quality Gates
+
+1. `mise run check` — 0 warnings
+2. `mise run test` — all passing (320+ tests)
+3. `mise run format`
+4. MCP format validation
+5. End-to-end protocol flow verification
