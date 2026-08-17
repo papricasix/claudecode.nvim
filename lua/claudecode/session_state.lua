@@ -439,6 +439,31 @@ function M.capture()
   return { version = PAYLOAD_VERSION, tabs = tabs, agents = agents }
 end
 
+---Get Neovim's own session ready to be written.
+---
+---For a session manager's **pre-save** hook -- auto-session's `pre_save_cmds`,
+---resession's `pre_save` -- which is the only point that lands before
+---`:mksession` runs (auto-session's order is pre_save -> mksession ->
+---save_extra_data, so `capture` is already too late, and a `VimLeavePre` autocmd
+---of ours loses to the session manager's, which loaded first).
+---
+---Today that means one thing: the agents view stands down, so its tab of panes --
+---and, with 'sessionoptions' carrying `terminal`, its agents' `term://` buffers,
+---which Neovim restores by running the command again -- is not written into the
+---session. The view still travels in `capture`'s payload, and reopens from there.
+---
+---Only on the way out, unless forced: a mid-work save (a `cd`, `:AutoSession
+---save`) must not tear down a view the user is in.
+---@param opts { force: boolean? }|nil
+function M.prepare_save(opts)
+  -- Deliberately returns nothing: auto-session reads a `false` from a pre-save
+  -- hook as "abandon the save".
+  local ok, agents_view = pcall(require, "claudecode.agents_view")
+  if ok and agents_view.close_for_session then
+    agents_view.close_for_session(opts and opts.force)
+  end
+end
+
 ---Apply a snapshot from `capture()` to the tabs that exist right now.
 ---
 ---Call it after the tabs are back (auto-session's `restore_extra_data`,

@@ -96,6 +96,11 @@ local state = {
 --- next opens: { tabnr, cwd, sessions }.
 local restored = nil
 
+--- What the view looked like when it stood down for a session write, held for
+--- the `capture` that the session manager asks for afterwards (see
+--- `close_for_session`). Consumed once.
+local pending_capture = nil
+
 local PANES = { "center", "sessions", "feed", "changes" }
 
 --- How often `redraw` re-snapshots the pane sizes. The autocmds are what
@@ -111,6 +116,34 @@ local FEED_OVERDRAW = 5
 ---@return table
 local function opts()
   return config or {}
+end
+
+---Name the tabpage the view lives in, if the user asked for one.
+---
+---Neovim has no tab names of its own, so this is a question only the tabline can
+---answer. Nearly all of them read a tab-local variable and disagree about which
+---(`t:name`, tabby's `tab_name`, taboo's `taboo_tab_name`), hence a name plus the
+---variable it goes in; a function is handed the tabpage instead, for a tabline
+---that renames through a command. Nothing here has to be undone on close: the
+---tab is ours from `tabnew` and goes with the view.
+---@param tab integer
+local function apply_tab_name(tab)
+  local name = opts().tab_name
+  if not name then
+    return
+  end
+  if type(name) == "function" then
+    local ok, err = pcall(name, tab)
+    if not ok then
+      logger.warn("agents", "agents.tab_name failed: " .. tostring(err))
+    end
+    return
+  end
+  local var = opts().tab_name_var
+  if type(var) ~= "string" or var == "" then
+    var = "name"
+  end
+  pcall(vim.api.nvim_tabpage_set_var, tab, var, name)
 end
 
 ---@return table
@@ -1102,6 +1135,9 @@ function M.open()
   end
 
   state.origin_tab = vim.api.nvim_get_current_tabpage()
+  -- A live view answers for itself; the snapshot a previous stand-down left is
+  -- stale from here on.
+  pending_capture = nil
 
   local ok_tab = pcall(vim.cmd, "tabnew")
   if not ok_tab then
@@ -1109,6 +1145,7 @@ function M.open()
   end
   state.tab = vim.api.nvim_get_current_tabpage()
   pcall(vim.api.nvim_tabpage_set_var, state.tab, "claudecode_agents", true)
+  apply_tab_name(state.tab)
   -- The routing protocol, read by `diff.resolve_target_window` and by nothing
   -- that knows this feature exists. A tab that builds a fixed arrangement of
   -- windows declares three things: that an automatic split would carve it up,
@@ -1178,12 +1215,17 @@ function M.open()
 end
 
 ---Close the view, leaving its agents running unless told otherwise.
-function M.close()
+---@param close_opts { keep_tab: boolean? }|nil `keep_tab` takes only our own
+---       windows out of the tab, for a tab that holds something of the user's too.
+function M.close(close_opts)
   if not state.tab then
     return
   end
   local tab = state.tab
   local origin = M.origin_tab()
+  local keep_tab = close_opts and close_opts.keep_tab or false
+  --- The pane windows, collected before `forget` drops them.
+  local pane_wins = {}
 
   -- Floats belong to the view, not the agents: they sit over this tab's layout,
   -- so they go with it even when the agents themselves keep running.
@@ -1214,6 +1256,7 @@ function M.close()
   for _, pane in ipairs(PANES) do
     local win = state.wins[pane]
     if win and vim.api.nvim_win_is_valid(win) then
+      pane_wins[#pane_wins + 1] = win
       pcall(function()
         vim.w[win].claudecode_live_preview = nil
         vim.w[win].claudecode_agents = nil
@@ -1229,7 +1272,23 @@ function M.close()
 
   if vim.api.nvim_tabpage_is_valid(tab) then
     local current = vim.api.nvim_get_current_tabpage()
-    if current == tab then
+    if keep_tab then
+      -- Our windows only. Neovim refuses to close the last window of a tab, so
+      -- the survivor — there is one whenever nothing of the user's is left to
+      -- keep the tab alive — is emptied instead of closed, leaving what a bare
+      -- `tabnew` would have left.
+      for _, win in ipairs(pane_wins) do
+        if vim.api.nvim_win_is_valid(win) then
+          if #vim.api.nvim_tabpage_list_wins(tab) <= 1 then
+            pcall(vim.api.nvim_win_call, win, function()
+              vim.cmd("enew")
+            end)
+          else
+            pcall(vim.api.nvim_win_close, win, true)
+          end
+        end
+      end
+    elseif current == tab then
       pcall(vim.cmd, "tabclose")
     else
       for _, win in ipairs(vim.api.nvim_tabpage_list_wins(tab)) do
@@ -2823,7 +2882,15 @@ end
 ---@return table|nil
 function M.capture()
   if not M.is_open() then
-    return nil
+    -- A view that stood down for the session write still has to describe itself.
+    -- The manager asks for this payload *after* `:mksession` (auto-session runs
+    -- pre_save → mksession → save_extra_data), by which time `close_for_session`
+    -- has taken the view away, so what it snapshotted on the way out is the
+    -- answer. Consumed once: a later save must not resurrect a view that is
+    -- genuinely gone.
+    local pending = pending_capture
+    pending_capture = nil
+    return pending
   end
   local ok, tabnr = pcall(vim.api.nvim_tabpage_get_number, state.tab)
   if not ok then
@@ -2836,6 +2903,91 @@ function M.capture()
     -- the registry's ids are proven by definition, since they have been talked to.
     sessions = registry.live_ids(),
   }
+end
+
+---Whether Neovim is on its way out.
+---
+---`v:exiting` is `v:null` until it is, and an exit code from `VimLeavePre`
+---onwards (measured) — which is where a session manager's save runs, so it is the
+---one thing that tells a quit from a `:AutoSession save` typed mid-work. Our own
+---`shutting_down` flag cannot answer it: that is set by an autocmd registered
+---when claudecode loads, which for a lazily-loaded plugin is *after* the session
+---manager's own `VimLeavePre`, so it is still unset while the save runs. It is
+---read anyway, as a second opinion for a caller that has one.
+---@return boolean
+local function neovim_is_exiting()
+  -- An exit code once it is set, `v:null` (a userdata, not `nil`) before that,
+  -- so the type is the test.
+  if type(vim.v and vim.v.exiting) == "number" then
+    return true
+  end
+  local ok, main = pcall(require, "claudecode")
+  return (ok and main.state and main.state.shutting_down) == true
+end
+
+---Whether every window in the tab is one of ours.
+---
+---A weaker question than `layout_clean`, which also wants all four panes present:
+---a tab missing a pane still holds nothing of the user's, and is still ours to
+---take away.
+---@return boolean
+local function tab_is_ours()
+  if not M.is_open() then
+    return false
+  end
+  local ok, wins = pcall(vim.api.nvim_tabpage_list_wins, state.tab)
+  if not ok then
+    return false
+  end
+  for _, win in ipairs(wins) do
+    local ok_cfg, cfg = pcall(vim.api.nvim_win_get_config, win)
+    local floating = ok_cfg and type(cfg) == "table" and cfg.relative ~= nil and cfg.relative ~= ""
+    if not floating and not pane_of(win) then
+      return false
+    end
+  end
+  return true
+end
+
+---Take the view out of the Neovim session that is about to be written.
+---
+---`:mksession` records this tab like any other — four windows holding buffers
+---named `Claude agents: changes` and friends, and, with 'sessionoptions' carrying
+---`terminal` (the default), each live agent as a `term://` buffer that Neovim
+---restores by *running the command again*. None of that is worth keeping: the
+---view already describes itself through `capture`, and reopening rebuilds the
+---panes from scratch.
+---
+---Call it from a session manager's pre-save hook — auto-session's
+---`pre_save_cmds`, resession's `pre_save` — which is the only point that lands
+---before the write (auto-session runs pre_save → mksession → save_extra_data, so
+---closing from `capture` would already be too late). A plain `VimLeavePre`
+---autocmd of ours cannot do it either: the session manager loads first and so
+---saves first.
+---
+---Only on the way out, unless forced: a save can also be a `cd` or a
+---`:AutoSession save` typed mid-work, and neither is a reason to tear down a view
+---the user is in.
+---
+---A tab holding something of the user's as well keeps the tab — only our own
+---windows go, and the session records what is left.
+---@param force boolean|nil Stand down whether or not Neovim is exiting.
+---@return "closed"|"panes"|nil what it did — never `false`, which auto-session
+---        reads from a pre-save hook as "abandon the save"
+function M.close_for_session(force)
+  if not M.is_open() then
+    return nil
+  end
+  if not force and not neovim_is_exiting() then
+    logger.debug("agents", "session save is not a quit; leaving the view open")
+    return nil
+  end
+  -- Before the close, while there is still a view to describe.
+  pending_capture = M.capture()
+  local ours = tab_is_ours()
+  M.close({ keep_tab = not ours })
+  logger.debug("agents", ours and "agents view closed for the session write" or "agents panes closed, tab left alone")
+  return ours and "closed" or "panes"
 end
 
 ---Take a snapshot back.

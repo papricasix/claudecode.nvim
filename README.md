@@ -444,6 +444,14 @@ opts = {
     kill_on_close = false,        -- stop running agents when the view closes
     focus = "center",             -- "center" | "sessions"
     resume_mode = "resume",       -- "resume" | "fork" (--fork-session)
+    -- Name the tab the view opens in. Neovim has no tab names of its own, so
+    -- only your tabline can answer this: nearly all of them read a tab-local
+    -- variable and disagree about which one -- `name` for a hand-rolled
+    -- tabline, `tab_name` for tabby.nvim, `taboo_tab_name` for taboo.vim.
+    -- A function is handed the tabpage instead, for a tabline that renames
+    -- through a command: tab_name = function(tab) vim.cmd("TabRename agents") end
+    tab_name = false,             -- e.g. "agents" (string | false | fun(tab))
+    tab_name_var = "name",        -- the tab-local variable a string goes in
     -- Overrides the top-level `float` block for agent-opened floats only.
     float = { width = 0.7, height = 0.7, border = "rounded", cascade_offset = 2 },
     -- `gf` in the sessions pane: read the transcripts for what was said in them.
@@ -782,6 +790,22 @@ require("auto-session").setup({
 ```lua
 require("resession").setup({ extensions = { claudecode = {} } })
 ```
+
+**Keeping the agents view out of the session.** If you use [agents mode](#agents-mode), its tabpage is four scratch panes — and, with `'sessionoptions'` carrying `terminal` (the default), a `term://` buffer per running agent, which Neovim restores by _running the command again_. `:mksession` records all of it. `prepare_save()` takes the view out of the way first; it still describes itself in the payload above and reopens from there:
+
+```lua
+require("auto-session").setup({
+  -- The only hook that lands before :mksession (pre_save → mksession →
+  -- save_extra_data), so `capture()` would already be too late.
+  pre_save_cmds = { function() require("claudecode.session_state").prepare_save() end },
+})
+
+-- resession: require("resession").add_hook("pre_save", function()
+--   require("claudecode.session_state").prepare_save()
+-- end)
+```
+
+It stands down **only while Neovim is exiting**, so a `cd` or a `:AutoSession save` typed mid-work never closes a view you are in (`prepare_save({ force = true })` overrides that). A tab that also holds a window of yours keeps the tab — only the panes go.
 
 Notes:
 
