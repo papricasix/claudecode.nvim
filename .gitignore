@@ -67,3 +67,7 @@ luacov.stats.out
 .claude/*
 !.claude/settings.json
 !.claude/hooks/
+
+# Local working notes and scratch output
+/.notes/
+/out.txt
