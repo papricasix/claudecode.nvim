@@ -147,6 +147,153 @@ describe("agents_view", function()
     end)
   end)
 
+  describe("standing down for a session write", function()
+    after_each(function()
+      vim.v.exiting = nil
+      if agents_view.is_open() then
+        agents_view.close()
+      end
+    end)
+
+    it("leaves a view alone when the save is not a quit", function()
+      -- A `cd` or a `:AutoSession save` typed mid-work saves too, and neither is
+      -- a reason to tear down the view the user is in.
+      agents_view.setup(base_config({ enabled = true }))
+      expect(agents_view.open()).to_be_true()
+      expect(agents_view.close_for_session()).to_be(nil)
+      expect(agents_view.is_open()).to_be_true()
+    end)
+
+    it("closes the tab while Neovim is exiting", function()
+      agents_view.setup(base_config({ enabled = true }))
+      expect(agents_view.open()).to_be_true()
+      local tab = agents_view._state().tab
+      vim.v.exiting = 0 -- what VimLeavePre sees; v:null otherwise
+      expect(agents_view.close_for_session()).to_be("closed")
+      expect(agents_view.is_open()).to_be(false)
+      expect(vim.api.nvim_tabpage_is_valid(tab)).to_be(false)
+    end)
+
+    it("still describes itself afterwards, once", function()
+      -- The session manager asks for the payload *after* :mksession, by which
+      -- time there is no view left to look at.
+      agents_view.setup(base_config({ enabled = true }))
+      expect(agents_view.open()).to_be_true()
+      local live = agents_view.capture()
+      expect(live).to_be_table()
+
+      expect(agents_view.close_for_session(true)).to_be("closed")
+      local saved = agents_view.capture()
+      expect(saved).to_be_table()
+      expect(saved.tabnr).to_be(live.tabnr)
+      expect(saved.cwd).to_be(live.cwd)
+      -- Consumed: a later save must not resurrect a view that is genuinely gone.
+      expect(agents_view.capture()).to_be(nil)
+    end)
+
+    it("keeps a tab that holds something of the user's", function()
+      agents_view.setup(base_config({ enabled = true }))
+      expect(agents_view.open()).to_be_true()
+      local tab = agents_view._state().tab
+      local wins = agents_view._state().wins
+      local intruder = vim.api.nvim_open_win(vim.api.nvim_create_buf(false, true), false, {})
+
+      expect(agents_view.close_for_session(true)).to_be("panes")
+      expect(agents_view.is_open()).to_be(false)
+      expect(vim.api.nvim_tabpage_is_valid(tab)).to_be_true()
+      expect(vim.api.nvim_win_is_valid(intruder)).to_be_true()
+      for _, win in pairs(wins) do
+        expect(vim.api.nvim_win_is_valid(win)).to_be(false)
+      end
+    end)
+
+    it("does nothing while the view is closed", function()
+      agents_view.setup(base_config({ enabled = true }))
+      expect(agents_view.close_for_session(true)).to_be(nil)
+    end)
+
+    it("is reached through session_state.prepare_save, which answers nothing", function()
+      -- auto-session reads a `false` from a pre-save hook as "abandon the save".
+      package.loaded["claudecode.session_state"] = nil
+      local session_state = require("claudecode.session_state")
+      agents_view.setup(base_config({ enabled = true }))
+      expect(agents_view.open()).to_be_true()
+
+      expect(session_state.prepare_save()).to_be(nil) -- not a quit: view stays
+      expect(agents_view.is_open()).to_be_true()
+
+      expect(session_state.prepare_save({ force = true })).to_be(nil)
+      expect(agents_view.is_open()).to_be(false)
+    end)
+  end)
+
+  describe("naming the tab", function()
+    ---@return any
+    local function tab_var(tab, name)
+      local ok, value = pcall(vim.api.nvim_tabpage_get_var, tab, name)
+      return ok and value or nil
+    end
+
+    it("leaves the tab unnamed by default", function()
+      agents_view.setup(base_config({ enabled = true }))
+      expect(agents_view.open()).to_be_true()
+      expect(tab_var(agents_view._state().tab, "name")).to_be(nil)
+      agents_view.close()
+    end)
+
+    it("writes the name to the variable the tabline reads", function()
+      agents_view.setup(base_config({ enabled = true, tab_name = "agents" }))
+      expect(agents_view.open()).to_be_true()
+      expect(tab_var(agents_view._state().tab, "name")).to_be("agents")
+      agents_view.close()
+    end)
+
+    it("takes the variable's name from the config", function()
+      -- Every tabline spells it differently; only the user knows which.
+      agents_view.setup(base_config({ enabled = true, tab_name = "agents", tab_name_var = "taboo_tab_name" }))
+      expect(agents_view.open()).to_be_true()
+      local tab = agents_view._state().tab
+      expect(tab_var(tab, "taboo_tab_name")).to_be("agents")
+      expect(tab_var(tab, "name")).to_be(nil)
+      agents_view.close()
+    end)
+
+    it("hands the tab to a function, for a tabline that renames by command", function()
+      local seen
+      agents_view.setup(base_config({
+        enabled = true,
+        tab_name = function(tab)
+          seen = tab
+        end,
+      }))
+      expect(agents_view.open()).to_be_true()
+      expect(seen).to_be(agents_view._state().tab)
+      agents_view.close()
+    end)
+
+    it("survives a function that throws", function()
+      agents_view.setup(base_config({
+        enabled = true,
+        tab_name = function()
+          error("no such command")
+        end,
+      }))
+      expect(agents_view.open()).to_be_true()
+      agents_view.close()
+    end)
+
+    it("rejects a name that is neither a string, a function, nor false", function()
+      package.loaded["claudecode.config"] = nil
+      local config = require("claudecode.config")
+      expect((pcall(config.validate, base_config({ tab_name = "agents" })))).to_be_true()
+      expect((pcall(config.validate, base_config({ tab_name = false })))).to_be_true()
+      expect((pcall(config.validate, base_config({ tab_name = 42 })))).to_be(false)
+      expect((pcall(config.validate, base_config({ tab_name = "" })))).to_be(false)
+      expect((pcall(config.validate, base_config({ tab_name_var = "" })))).to_be(false)
+      expect((pcall(config.validate, base_config({ tab_name_var = "tab_name" })))).to_be_true()
+    end)
+  end)
+
   describe("arriving at the view", function()
     -- The state transition itself is `model.mark_read`'s (see model_spec); what
     -- this pins is *when* the view asks for it. `TabEnter` and `FocusGained` are

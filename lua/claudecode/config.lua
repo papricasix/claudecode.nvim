@@ -145,6 +145,15 @@ M.defaults = {
     kill_on_close = false, -- stop running agents when the view closes
     focus = "center", -- "center" | "sessions": where the cursor lands on open
     resume_mode = "resume", -- "resume" | "fork" (--fork-session) for an existing conversation
+    -- Name the tabpage the view opens in. Neovim has no tab names of its own, so
+    -- this is a question only your tabline can answer: nearly all of them read a
+    -- tab-local variable, and which one differs per plugin — `t:name` for a
+    -- hand-rolled tabline, `tab_name` for tabby.nvim, `taboo_tab_name` for
+    -- taboo.vim. Hence a name plus the variable it is written to. A function is
+    -- called with the tabpage handle instead, for a tabline that renames through
+    -- a command of its own.
+    tab_name = false, -- string | false | fun(tab: integer)
+    tab_name_var = "name", -- the tab-local variable a string name is written to
     float = {
       width = 0.7,
       height = 0.7,
@@ -568,6 +577,12 @@ function M.validate(config)
     check("focus", one_of({ "center", "sessions" }), 'must be "center" or "sessions"')
     check("resume_mode", one_of({ "resume", "fork" }), 'must be "resume" or "fork"')
     check("auto_redraw", is_boolean, "must be a boolean")
+    check("tab_name", function(v)
+      return v == false or (type(v) == "string" and v ~= "") or type(v) == "function"
+    end, "must be a non-empty string, a function, or false")
+    check("tab_name_var", function(v)
+      return type(v) == "string" and v ~= ""
+    end, "must be a non-empty string")
 
     if ag.layout ~= nil then
       assert(type(ag.layout) == "table", "agents.layout must be a table")
