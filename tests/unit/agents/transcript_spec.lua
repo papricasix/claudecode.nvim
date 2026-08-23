@@ -926,6 +926,39 @@ describe("agents.transcript", function()
       expect(transcript.project_dir("D:\\proj\\")).to_be("/home/user/.claude/projects/opaque")
     end)
 
+    it("enumerates every project's transcripts, newest first", function()
+      -- What the search reads in its widest scope: the list a project shows is a
+      -- window on recent work, and the conversation being looked for is very often
+      -- the one that fell out of it — or out of another project entirely.
+      vim._mock.add_dir("/home/user/.claude/projects")
+      for _, name in ipairs({ "-proj", "-other" }) do
+        vim._mock.add_dir("/home/user/.claude/projects/" .. name)
+      end
+      dirs["/home/user/.claude/projects"] = { "-proj", "-other" }
+      dirs["/home/user/.claude/projects/-proj"] = { "a.jsonl", "notes.txt" }
+      dirs["/home/user/.claude/projects/-other"] = { "b.jsonl" }
+      put("/home/user/.claude/projects/-proj/a.jsonl", { edit_line("/proj/x.lua", 1, 0) }, { mtime = 10 })
+      put("/home/user/.claude/projects/-other/b.jsonl", { edit_line("/other/y.lua", 1, 0) }, { mtime = 20 })
+
+      local rows = transcript.list_all()
+      expect(#rows).to_be(2) -- the `.txt` is not a conversation
+      expect(rows[1].id).to_be("b")
+      expect(rows[1].dir).to_be("/home/user/.claude/projects/-other")
+      expect(rows[2].id).to_be("a")
+    end)
+
+    it("reads the directory a conversation ran in out of the transcript", function()
+      -- Slugification is not reversible, so the directory a foreign hit is resumed
+      -- in has to come from the file. JSON escapes a Windows separator.
+      fs["/store/a.jsonl"] = { data = '{"type":"user","cwd":"/proj/sub"}\n', mtime = 1, ino = 1 }
+      fs["/store/b.jsonl"] = { data = '{"type":"user","cwd":"D:\\\\Git\\\\proj"}\n', mtime = 1, ino = 1 }
+      fs["/store/c.jsonl"] = { data = '{"type":"summary"}\n', mtime = 1, ino = 1 }
+
+      expect(transcript.cwd_of("/store/a.jsonl")).to_be("/proj/sub")
+      expect(transcript.cwd_of("/store/b.jsonl")).to_be("D:\\Git\\proj")
+      expect(transcript.cwd_of("/store/c.jsonl")).to_be_nil()
+    end)
+
     it("names a transcript inside the directory it found", function()
       vim._mock.add_dir("/home/user/.claude/projects")
       vim._mock.add_dir("/home/user/.claude/projects/-proj")

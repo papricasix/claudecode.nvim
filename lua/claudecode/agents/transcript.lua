@@ -1152,6 +1152,87 @@ function M.list(cwd)
   return rows
 end
 
+---Enumerate **every** project's transcripts, newest first.
+---
+---What the search picker reads in its widest scope. Stat-only like `M.list`, one
+---`scandir` per project directory plus one `stat` per transcript, so a store of
+---several hundred conversations costs a few hundred syscalls and no file is
+---opened until something actually matches.
+---
+---Rows carry the directory they came from as well as the path: a conversation
+---from another project can be resumed, but only in the directory it ran in, and
+---that directory is read from the transcript itself (`M.cwd_of`) rather than
+---guessed back out of the slug — slugification is not reversible.
+---@return { id: string, path: string, size: integer, mtime: integer, dir: string, summary: ClaudeCodeAgentsSummary|nil }[]
+function M.list_all()
+  local root = M.config_dir() .. "/projects"
+  local dirs = M._io.scandir(root)
+  if not dirs then
+    return {}
+  end
+
+  local rows = {}
+  for _, name in ipairs(dirs) do
+    local dir = root .. "/" .. name
+    for _, entry in ipairs(M._io.scandir(dir) or {}) do
+      if entry:sub(-6) == ".jsonl" then
+        local path = dir .. "/" .. entry
+        local st = M._io.stat(path)
+        if st then
+          rows[#rows + 1] = {
+            id = entry:sub(1, -7),
+            path = path,
+            size = st.size,
+            mtime = st.mtime,
+            dir = dir,
+            summary = cache[path],
+          }
+        end
+      end
+    end
+  end
+  table.sort(rows, function(a, b)
+    return a.mtime > b.mtime
+  end)
+  return rows
+end
+
+--- Directories already read out of a transcript. Keyed by path: the answer is a
+--- property of the file, which never changes its cwd once written.
+---@type table<string, string|false>
+local cwd_cache = {}
+
+---The directory a conversation ran in, read from the transcript itself.
+---
+---Every message entry carries `"cwd"`, so the head of the file is enough — the
+---same bounded synchronous read `_dir_matches_cwd` uses, for the same reason: the
+---caller needs the answer in the tick it asks, and only asks about a transcript
+---that has already matched a search. Memoised so a picker repainting does not
+---re-read one file per frame.
+---@param path string
+---@return string|nil cwd
+function M.cwd_of(path)
+  local hit = cwd_cache[path]
+  if hit ~= nil then
+    return hit or nil
+  end
+
+  local read_sync = M._io.read_sync
+  local data = type(read_sync) == "function" and read_sync(path, 64 * 1024) or nil
+  local found = nil
+  if type(data) == "string" then
+    -- Matched raw rather than decoded: the head of the file is very likely a
+    -- partial line, which no JSON decoder will take.
+    local raw = data:match('"cwd":"(.-[^\\])"')
+    if raw then
+      -- JSON escapes a Windows separator; nothing else in a path needs undoing.
+      found = raw:gsub("\\\\", "\\")
+    end
+  end
+  cwd_cache[path] = found or false
+  return found
+end
+
 ---The cached summary for a path, if one has been folded.
 ---@param path string
 ---@return ClaudeCodeAgentsSummary|nil
@@ -1948,6 +2029,7 @@ function M.reset()
   M.cancel_all()
   cache = {}
   history_cache = {}
+  cwd_cache = {}
 end
 
 --------------------------------------------------------------------------------

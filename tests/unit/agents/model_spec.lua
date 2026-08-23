@@ -36,7 +36,10 @@ describe("agents.model", function()
       list = function()
         local rows = {}
         for _, sum in pairs(summaries) do
-          rows[#rows + 1] = { id = sum.id, path = sum.path, size = 1, mtime = sum.last_ts, summary = sum }
+          -- Written just now unless the test says otherwise: the list reaches back
+          -- a fortnight by default, and these summaries carry a token `last_ts`
+          -- that is not meant to say when the file was touched.
+          rows[#rows + 1] = { id = sum.id, path = sum.path, size = 1, mtime = sum.mtime or os.time(), summary = sum }
         end
         table.sort(rows, function(a, b)
           return a.id < b.id
@@ -320,6 +323,128 @@ describe("agents.model", function()
       model.attach(1, "/proj")
       expect(model.sort_mode().key).to_be("name")
       expect(model.sort_mode().desc).to_be(false)
+    end)
+  end)
+
+  describe("how far back the list reaches", function()
+    local DAY = 24 * 60 * 60
+    local NOW = 1700000000
+
+    local function ids_now()
+      local out = {}
+      for _, row in ipairs(model.rows()) do
+        out[row.session_id] = true
+      end
+      return out
+    end
+
+    before_each(function()
+      model._set_epoch_clock(function()
+        return NOW
+      end)
+      summaries.fresh = summary_for("fresh", { mtime = NOW - 2 * DAY })
+      summaries.stale = summary_for("stale", { mtime = NOW - 30 * DAY })
+    end)
+
+    it("reads a count, a span, or everything", function()
+      expect(model.parse_limit(30).count).to_be(30)
+      expect(model.parse_limit("3d").seconds).to_be(3 * DAY)
+      expect(model.parse_limit("2w").seconds).to_be(14 * DAY)
+      -- A month is thirty days: the window says "about this far back", and a
+      -- calendar month would mean a different span depending on when it was asked.
+      expect(model.parse_limit("1m").seconds).to_be(30 * DAY)
+      expect(model.parse_limit("all").seconds).to_be_nil()
+      expect(model.parse_limit("all").count).to_be_nil()
+      -- Anything unparseable falls back rather than erroring: this runs on a timer,
+      -- and `config.validate` is where a wrong value is reported.
+      expect(model.parse_limit("last tuesday").seconds).to_be(14 * DAY)
+    end)
+
+    it("lists the last fortnight by default, and counts what it left out", function()
+      model.attach(1, "/proj")
+      expect(ids_now().fresh).to_be_true()
+      expect(ids_now().stale).to_be_nil()
+      expect(model.hidden_count()).to_be(1)
+    end)
+
+    it("takes a count instead, when the config asks for one", function()
+      model.setup({ agents = { enabled = true, sessions = { limit = 1 } } })
+      model.attach(1, "/proj")
+      -- Newest first, so the old one is what a count of one leaves out — by
+      -- position rather than by age.
+      expect(ids_now().fresh).to_be_true()
+      expect(ids_now().stale).to_be_nil()
+    end)
+
+    it("never lets a window past the cap", function()
+      model.setup({ agents = { enabled = true, sessions = { limit = "all", max = 1 } } })
+      model.attach(1, "/proj")
+      expect(model.hidden_count()).to_be(1)
+    end)
+
+    it("keeps a running agent listed however old its conversation is", function()
+      -- The window is about finding work again, and work that is running has been
+      -- found: dropping it would take away the only way back to a live terminal.
+      live.stale = true
+      model.attach(1, "/proj")
+      expect(ids_now().stale).to_be_true()
+    end)
+
+    it("keeps the selected conversation listed", function()
+      model.setup({ agents = { enabled = true, sessions = { limit = "all" } } })
+      model.attach(1, "/proj")
+      model.select("stale")
+      model.setup({ agents = { enabled = true, sessions = { limit = "2w" } } })
+      model.refresh_list()
+      expect(model.selected()).to_be("stale")
+      expect(ids_now().stale).to_be_true()
+    end)
+
+    it("widens and narrows on request, for as long as the view is open", function()
+      model.attach(1, "/proj")
+      expect(ids_now().stale).to_be_nil()
+
+      expect(model.set_window("1m").key).to_be("1m")
+      expect(ids_now().stale).to_be_true()
+
+      expect(model.set_window("1d").label).to_be("Last day")
+      expect(ids_now().fresh).to_be_nil()
+
+      -- And the next open starts from the config again, like the sort criterion.
+      model.detach()
+      model.attach(1, "/proj")
+      expect(model.window().key).to_be("2w")
+    end)
+
+    it("says what is in force, for the menu and the empty screen", function()
+      model.attach(1, "/proj")
+      expect(model.window().label).to_be("Last 2 weeks")
+      model.setup({ agents = { enabled = true, sessions = { limit = 30 } } })
+      expect(model.window().label).to_be("newest 30")
+      expect(model.window().key).to_be_nil()
+    end)
+
+    it("holds a conversation from outside the window until it is let go", function()
+      -- What a search hit needs: the panes follow a row, so a conversation you
+      -- picked has to have one whether or not the window reaches it.
+      model.attach(1, "/proj")
+      expect(ids_now().stale).to_be_nil()
+
+      model.pin("stale", { path = "/p/stale.jsonl", cwd = "/proj" })
+      expect(ids_now().stale).to_be_true()
+      expect(model.row("stale").title).to_be("Title stale")
+
+      model.unpin("stale")
+      expect(ids_now().stale).to_be_nil()
+    end)
+
+    it("lists a pinned conversation the project's own enumeration cannot see", function()
+      -- A hit from another project: the row is built from what the search knew,
+      -- and it is resumed in the directory that conversation ran in.
+      model.attach(1, "/proj")
+      model.pin("elsewhere", { path = "/other/elsewhere.jsonl", cwd = "/other" })
+      expect(ids_now().elsewhere).to_be_true()
+      expect(model.row("elsewhere").cwd).to_be("/other")
     end)
   end)
 

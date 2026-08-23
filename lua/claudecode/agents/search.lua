@@ -25,6 +25,17 @@
 --- bottom, and the cursor is anchored to its session across those repaints for the
 --- reason the sessions pane anchors its own: a row that moves under the cursor is
 --- a row you act on by accident.
+---
+--- **The search is not bounded by the list.** The sessions pane shows a window of
+--- recent work; the conversation you are looking for is very often the one that
+--- fell out of it, which is why you are searching rather than reading. So `<Tab>`
+--- cycles what is read: the rows on screen, every conversation this project has
+--- ever had, or every conversation on this machine. It opens on the project,
+--- because "somewhere in this project" is what the question almost always means,
+--- and the choice lasts as long as the view does.
+---
+--- Order follows that: the sessions already on screen keep the pane's own order at
+--- the top, and everything reached past it follows newest first.
 ---@brief ]]
 ---@module 'claudecode.agents.search'
 
@@ -68,26 +79,147 @@ end
 ---@type table|nil
 local shown = nil
 
+--- How much of the store a scan reads, in `<Tab>` order.
+---
+--- `visible` is the rows the sessions pane is showing, which is the cheapest scan
+--- and the only one that cannot answer "which conversation was that" for work
+--- older than the pane's window. `disk` reaches every project the CLI has ever run
+--- in; a hit there names a conversation from another directory, which is resumed
+--- in the directory it ran in rather than in this one.
+---@type { key: string, label: string }[]
+M.SCOPES = {
+  { key = "visible", label = "listed" },
+  { key = "project", label = "project" },
+  { key = "disk", label = "everywhere" },
+}
+
+local DEFAULT_SCOPE = "project"
+
+--- Sessions drawn at once. A `disk` scan can match in hundreds of conversations,
+--- and a list nobody can read to the end of is not worth the repaint — the answer
+--- to "too many" is a better query, which the count in the border asks for.
+local MAX_LISTED = 60
+
 --- The query survives the picker, but not the view: reopening with `gf` starts
 --- from what you last searched for, pre-selected, so refining after a look at a
---- session costs nothing.
+--- session costs nothing. The scope is remembered the same way and for the same
+--- reason — a second `gf` is usually the same search, widened.
 local last_query = ""
+local last_scope = DEFAULT_SCOPE
 
 ---@return string
 function M.last_query()
   return last_query
 end
 
----Forget the remembered query. Called when the view closes, so the next open
----starts clean rather than with a search from a previous sitting.
+---@return string
+function M.last_scope()
+  return last_scope
+end
+
+---Forget the remembered query and scope. Called when the view closes, so the next
+---open starts clean rather than with a search from a previous sitting.
 function M.reset()
   last_query = ""
+  last_scope = DEFAULT_SCOPE
 end
 
 ---@param name string
 ---@return string
 local function hl(name)
   return render.highlight(name)
+end
+
+--------------------------------------------------------------------------------
+-- What gets read
+--------------------------------------------------------------------------------
+
+---What a conversation the pane is not showing is called, before anything is read.
+---
+---The warm cache often knows already — every session the view has folded is in it
+---— and the id prefix is what the sessions pane itself falls back to.
+---@param entry table
+---@return string
+local function offlist_title(entry)
+  local sum = entry.summary or transcript.get(entry.path)
+  local title = sum and (sum.name or sum.title or sum.first_prompt)
+  if type(title) == "string" and title ~= "" then
+    return title
+  end
+  return entry.id:sub(1, 8)
+end
+
+---The sessions a scope reads, in the order the list shows them.
+---
+---The pane's rows first, in the pane's own order — those are the ones the user has
+---just been looking at, and a search that reshuffles them reads as a different
+---list. Everything reached past them follows by recency, which is the only order
+---available for a conversation nothing on screen has an opinion about.
+---@param opts table The picker's options: `sessions` (the pane's rows) and `cwd`.
+---@param scope string
+---@return table[]
+function M.sessions_for(opts, scope)
+  local visible = opts.sessions or {}
+  local out, seen = {}, {}
+  for _, session in ipairs(visible) do
+    out[#out + 1] = session
+    seen[session.session_id] = true
+  end
+  if scope == "visible" then
+    return out
+  end
+
+  local cwd = opts.cwd
+  local project_dir = cwd and transcript.project_dir(cwd) or nil
+  if cwd then
+    for _, entry in ipairs(transcript.list(cwd)) do
+      if not seen[entry.id] then
+        seen[entry.id] = true
+        out[#out + 1] = {
+          session_id = entry.id,
+          title = offlist_title(entry),
+          path = entry.path,
+          cwd = cwd,
+        }
+      end
+    end
+  end
+
+  if scope == "disk" then
+    for _, entry in ipairs(transcript.list_all()) do
+      if not seen[entry.id] then
+        seen[entry.id] = true
+        out[#out + 1] = {
+          session_id = entry.id,
+          title = offlist_title(entry),
+          path = entry.path,
+          -- Read from the transcript only if this one turns out to matter: the
+          -- directory is what a hit is resumed in, and a `disk` scan enumerates
+          -- far more conversations than it ever lists.
+          foreign = entry.dir ~= project_dir,
+        }
+      end
+    end
+  end
+
+  return out
+end
+
+---The directory a foreign session ran in, and how it reads in a list.
+---
+---Both are read on demand and kept on the session: `cwd_of` opens the file, and a
+---repaint must not do that for every row it draws.
+---@param session table
+---@return string|nil cwd
+---@return string|nil label
+local function foreign_project(session)
+  if session.project_label ~= nil then
+    return session.cwd, session.project_label or nil
+  end
+  local cwd = session.cwd or (session.path and transcript.cwd_of(session.path))
+  session.cwd = cwd
+  session.project_label = cwd and vim.fn.fnamemodify(cwd, ":t") or false
+  return cwd, session.project_label or nil
 end
 
 --------------------------------------------------------------------------------
@@ -101,6 +233,49 @@ local function cancel_scans(state)
     pcall(job.cancel)
   end
   state.jobs = {}
+end
+
+--- How often the list repaints while a scan streams into it. One repaint per
+--- transcript is right for the thirty a pane shows and wrong for the several
+--- hundred a `disk` scan reads — the paint is the whole list, so the cost is
+--- quadratic in what is on screen. Coalescing is invisible at this rate and turns
+--- that back into a fixed frame budget.
+local REDRAW_MS = 60
+
+---@param state table
+local function stop_redraw_timer(state)
+  if state.redraw_timer then
+    pcall(function()
+      state.redraw_timer:stop()
+      state.redraw_timer:close()
+    end)
+    state.redraw_timer = nil
+  end
+end
+
+---Repaint soon, and only once however many results land in the meantime.
+---@param state table
+local function request_redraw(state)
+  if state.redraw_timer then
+    return
+  end
+  local timer = vim.loop and vim.loop.new_timer()
+  if not timer then
+    M.redraw()
+    return
+  end
+  state.redraw_timer = timer
+  timer:start(
+    REDRAW_MS,
+    0,
+    vim.schedule_wrap(function()
+      if shown ~= state then
+        return
+      end
+      stop_redraw_timer(state)
+      M.redraw()
+    end)
+  )
 end
 
 ---Run `query` against the session list, calling `on_update` as results land.
@@ -156,7 +331,7 @@ local function start_scan(state)
             entry.matches = matches
             state.results[index] = entry
           end
-          M.redraw()
+          request_redraw(state)
           pump()
         end)
         state.jobs[#state.jobs + 1] = job
@@ -168,6 +343,9 @@ local function start_scan(state)
     end
     if running == 0 and next_index > #sessions then
       state.done = true
+      -- The last paint is immediate: "no matches" arriving a frame late reads as
+      -- the picker having stopped answering.
+      stop_redraw_timer(state)
       M.redraw()
     end
   end
@@ -199,13 +377,18 @@ function M.render(state)
   end
 
   if not state.matcher then
-    push(" type to search this project's conversations", { { from = 1, to = 44, hl = hl("time") } }, nil)
+    local invite = " type to search " .. M.scope_blurb(state.scope) .. "   <Tab> widens"
+    push(invite, { { from = 1, to = #invite, hl = hl("time") } }, nil)
     return lines, marks, rows
   end
 
+  local listed, skipped = 0, 0
   for index, session in ipairs(state.sessions) do
     local result = state.results[index]
-    if result then
+    if result and listed >= MAX_LISTED then
+      skipped = skipped + 1
+    elseif result then
+      listed = listed + 1
       local title = session.title or ""
       local icon = session.icon or "○"
       local prefix = " " .. icon .. " "
@@ -220,7 +403,19 @@ function M.render(state)
           hl = hl("match"),
         }
       end
-      push(prefix .. title, spans, { session_id = session.session_id })
+      local line = prefix .. title
+      -- A conversation from another project is one you can still resume, but only
+      -- where it ran — so the row says where that is rather than leaving the user
+      -- to find out by opening it.
+      if session.foreign then
+        local _, label = foreign_project(session)
+        if label then
+          local note = "  · " .. label
+          spans[#spans + 1] = { from = #line, to = #line + #note, hl = hl("time") }
+          line = line .. note
+        end
+      end
+      push(line, spans, { session_id = session.session_id, index = index })
 
       for _, match in ipairs(result.matches) do
         local label = M.label(match)
@@ -231,9 +426,14 @@ function M.render(state)
         push(indent .. label .. gap .. text, {
           { from = #indent, to = #indent + #label, hl = hl(match.kind == "file" and "path" or "kind") },
           { from = at + match.col, to = at + match.col + match.len, hl = hl("match") },
-        }, { session_id = session.session_id })
+        }, { session_id = session.session_id, index = index })
       end
     end
+  end
+
+  if skipped > 0 then
+    local text = "  " .. skipped .. " more conversations match — narrow the search"
+    push(text, { { from = 0, to = #text, hl = hl("time") } }, nil)
   end
 
   if #lines == 0 then
@@ -243,12 +443,39 @@ function M.render(state)
   return lines, marks, rows
 end
 
----What the list's border says: how far the scan has got, and what it found.
+---How a scope reads in a sentence.
+---@param scope string|nil
+---@return string
+function M.scope_blurb(scope)
+  if scope == "visible" then
+    return "the conversations listed"
+  end
+  if scope == "disk" then
+    return "every conversation on this machine"
+  end
+  return "this project's conversations"
+end
+
+---How a scope reads in the border, where there is room for one word.
+---@param scope string|nil
+---@return string
+local function scope_label(scope)
+  for _, spec in ipairs(M.SCOPES) do
+    if spec.key == (scope or DEFAULT_SCOPE) then
+      return spec.label
+    end
+  end
+  return DEFAULT_SCOPE
+end
+
+---What the list's border says: which scope is being read, how far the scan has
+---got, and what it found.
 ---@param state table
 ---@return string
 local function status_title(state)
+  local scope = scope_label(state.scope)
   if not state.matcher then
-    return " " .. tostring(#state.sessions) .. " conversations "
+    return " " .. scope .. " · " .. tostring(#state.sessions) .. " conversations "
   end
   local sessions, matches = 0, 0
   for _, result in pairs(state.results) do
@@ -257,9 +484,9 @@ local function status_title(state)
   end
   local found = sessions == 0 and "nothing yet" or (sessions .. " sessions · " .. matches .. " matches")
   if state.done then
-    return " " .. (sessions == 0 and "no matches" or found) .. " "
+    return " " .. scope .. " · " .. (sessions == 0 and "no matches" or found) .. " "
   end
-  return " " .. found .. " · " .. state.scanned .. "/" .. #state.sessions .. " "
+  return " " .. scope .. " · " .. found .. " · " .. state.scanned .. "/" .. #state.sessions .. " "
 end
 
 ---@param state table
@@ -300,7 +527,7 @@ local function place_cursor(state)
   end
   pcall(vim.api.nvim_win_set_cursor, state.list_win, { target, 0 })
   local payload = rows[target]
-  M.preview(payload and payload.session_id)
+  M.preview(payload and payload.session_id, payload and payload.index)
 end
 
 ---Repaint the list from the current results.
@@ -321,10 +548,33 @@ end
 -- Selection
 --------------------------------------------------------------------------------
 
+---What the caller needs to know about a session it has no row for: where its
+---transcript is, and which directory it ran in.
+---@param state table
+---@param index integer|nil
+---@return table|nil
+local function session_info(state, index)
+  local session = index and state.sessions[index]
+  if not session then
+    return nil
+  end
+  local cwd = session.cwd
+  if session.foreign then
+    cwd = foreign_project(session) or cwd
+  end
+  return {
+    path = session.path,
+    cwd = cwd or state.opts.cwd,
+    title = session.title,
+    foreign = session.foreign == true,
+  }
+end
+
 ---Preview a session, at most once per session: the panes follow the highlighted
 ---row, and every repaint would otherwise re-select the same conversation.
 ---@param session_id string|nil
-function M.preview(session_id)
+---@param index integer|nil Where it is in the scanned list, for its path and cwd.
+function M.preview(session_id, index)
   local state = shown
   if not state or not session_id or state.previewed == session_id then
     return
@@ -332,7 +582,33 @@ function M.preview(session_id)
   state.previewed = session_id
   state.cursor_session = session_id
   if state.opts.on_preview then
-    pcall(state.opts.on_preview, session_id)
+    pcall(state.opts.on_preview, session_id, session_info(state, index))
+  end
+end
+
+---Read the store more widely, or less: the rows on screen, the whole project, or
+---every project. The scan restarts against the new set, and the choice is what the
+---next `gf` opens with.
+---@param delta integer
+function M.cycle_scope(delta)
+  local state = shown
+  if not state then
+    return
+  end
+  local at = 1
+  for index, spec in ipairs(M.SCOPES) do
+    if spec.key == state.scope then
+      at = index
+    end
+  end
+  at = ((at - 1 + (delta or 1)) % #M.SCOPES) + 1
+  state.scope = M.SCOPES[at].key
+  last_scope = state.scope
+  state.sessions = M.sessions_for(state.opts, state.scope)
+  if state.matcher then
+    start_scan(state)
+  else
+    M.redraw()
   end
 end
 
@@ -355,7 +631,7 @@ function M.move(delta)
     end
     if rows[at] then
       pcall(vim.api.nvim_win_set_cursor, state.list_win, { at, 0 })
-      M.preview(rows[at].session_id)
+      M.preview(rows[at].session_id, rows[at].index)
       return
     end
   end
@@ -410,6 +686,7 @@ function M.close(committed)
     return
   end
   stop_timer(state)
+  stop_redraw_timer(state)
   cancel_scans(state)
   -- Whatever is in the input when it goes away is what `gf` reopens with.
   last_query = state.query or ""
@@ -454,13 +731,14 @@ function M.accept()
     or 1
   local payload = rows[lnum]
   local session_id = payload and payload.session_id
+  local info = session_info(state, payload and payload.index)
   local on_accept = state.opts.on_accept
   M.close(true)
   if session_id and on_accept then
     -- Out of the closing keymap, like the sort menu and the confirm dialog: the
     -- windows are still going away, and accepting opens windows of its own.
     vim.schedule(function()
-      pcall(on_accept, session_id)
+      pcall(on_accept, session_id, info)
     end)
   end
 end
@@ -598,6 +876,12 @@ local function bind_keys(state)
   map({ "i", "n" }, "<CR>", function()
     M.accept()
   end, "Claude agents: open the highlighted conversation")
+  map({ "i", "n" }, "<Tab>", function()
+    M.cycle_scope(1)
+  end, "Claude agents: search more of the store (listed / project / everywhere)")
+  map({ "i", "n" }, "<S-Tab>", function()
+    M.cycle_scope(-1)
+  end, "Claude agents: search less of the store")
   for _, lhs in ipairs({ "<Esc>", "<C-c>" }) do
     map({ "i", "n" }, lhs, function()
       M.close(false)
@@ -633,7 +917,7 @@ end
 ---
 ---A second `gf` while it is open closes it, so the key that summoned it dismisses
 ---it — the same rule the sort menu and the help window follow.
----@param opts { sessions: table[], limit: integer|nil, debounce_ms: integer|nil, query: string|nil, on_preview: fun(session_id: string)|nil, on_accept: fun(session_id: string)|nil, on_cancel: fun()|nil }
+---@param opts { sessions: table[], cwd: string|nil, scope: string|nil, limit: integer|nil, debounce_ms: integer|nil, query: string|nil, on_preview: fun(session_id: string, info: table|nil)|nil, on_accept: fun(session_id: string, info: table|nil)|nil, on_cancel: fun()|nil }
 ---@return boolean shown
 function M.open(opts)
   if M.is_open() then
@@ -644,9 +928,11 @@ function M.open(opts)
     return false
   end
 
+  local scope = opts.scope or last_scope
   local state = {
     opts = opts,
-    sessions = opts.sessions,
+    scope = scope,
+    sessions = M.sessions_for(opts, scope),
     query = opts.query or "",
     limit = opts.limit or DEFAULT_LIMIT,
     debounce_ms = opts.debounce_ms or DEFAULT_DEBOUNCE_MS,
@@ -659,6 +945,7 @@ function M.open(opts)
     done = true,
   }
 
+  last_scope = scope
   shown = state
   if not open_windows(state) then
     M.close(true)

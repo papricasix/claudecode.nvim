@@ -502,6 +502,103 @@ describe("agents.search", function()
     it("invites a query when there is none", function()
       local lines = search.render(state({ matcher = false, done = false }))
       assert.is_not_nil(lines[1]:find("type to search", 1, true))
+      -- And says what "there" means, plus the key that widens it: the scope is
+      -- otherwise invisible state, exactly like the list's own order.
+      assert.is_not_nil(lines[1]:find("<Tab>", 1, true))
+    end)
+
+    it("names the project a foreign conversation belongs to", function()
+      transcript.cwd_of = function()
+        return "/Users/me/proj/other-project"
+      end
+      local st = state({
+        sessions = {
+          { session_id = "far", title = "the one about tokens", icon = "○", foreign = true, path = "/far/x.jsonl" },
+        },
+        results = { [1] = { title = { col = 13, len = 5 }, matches = {} } },
+      })
+      local lines = search.render(st)
+      assert.is_not_nil(lines[1]:find("other-project", 1, true))
+    end)
+
+    it("stops drawing rather than paint a list nobody can read to the end of", function()
+      local sessions, results = {}, {}
+      for index = 1, 70 do
+        sessions[index] = { session_id = "s" .. index, title = "token " .. index, icon = "○" }
+        results[index] = { title = { col = 0, len = 5 }, matches = {} }
+      end
+      local lines = search.render(state({ sessions = sessions, results = results }))
+      -- Sixty rows and one line saying what was left out, so "too many" is visible
+      -- rather than silently truncated.
+      assert.are_equal(61, #lines)
+      assert.is_not_nil(lines[61]:find("10 more conversations", 1, true))
+    end)
+  end)
+
+  describe("scope", function()
+    local visible
+
+    before_each(function()
+      visible = {
+        { session_id = "one", title = "listed one", path = "/store/one.jsonl" },
+      }
+      transcript.project_dir = function()
+        return "/store"
+      end
+      transcript.list = function()
+        return {
+          { id = "one", path = "/store/one.jsonl", mtime = 9 },
+          { id = "two", path = "/store/two.jsonl", mtime = 8 },
+        }
+      end
+      transcript.list_all = function()
+        return {
+          { id = "far", path = "/elsewhere/far.jsonl", mtime = 30, dir = "/elsewhere" },
+          { id = "two", path = "/store/two.jsonl", mtime = 8, dir = "/store" },
+        }
+      end
+    end)
+
+    local function ids(sessions)
+      local out = {}
+      for _, session in ipairs(sessions) do
+        out[#out + 1] = session.session_id
+      end
+      return table.concat(out, ",")
+    end
+
+    it("reads only the rows on screen when asked to", function()
+      assert.are_equal("one", ids(search.sessions_for({ sessions = visible, cwd = "/proj" }, "visible")))
+    end)
+
+    it("reaches the whole project, listed rows first", function()
+      -- The pane's own order at the top: those are the rows the user has just been
+      -- looking at, and a search that reshuffles them reads as a different list.
+      local sessions = search.sessions_for({ sessions = visible, cwd = "/proj" }, "project")
+      assert.are_equal("one,two", ids(sessions))
+      assert.are_equal("/store/two.jsonl", sessions[2].path)
+      assert.is_nil(sessions[2].foreign)
+    end)
+
+    it("reaches every project, marking what belongs to another one", function()
+      local sessions = search.sessions_for({ sessions = visible, cwd = "/proj" }, "disk")
+      assert.are_equal("one,two,far", ids(sessions))
+      assert.is_true(sessions[3].foreign)
+      -- A conversation this project already listed is not listed twice because the
+      -- store-wide enumeration also found it.
+      assert.is_falsy(sessions[2].foreign)
+    end)
+
+    it("says which scope is in force, in words", function()
+      assert.is_not_nil(search.scope_blurb("visible"):find("listed", 1, true))
+      assert.is_not_nil(search.scope_blurb("project"):find("project", 1, true))
+      assert.is_not_nil(search.scope_blurb("disk"):find("machine", 1, true))
+    end)
+
+    it("opens on the project, and forgets that with the view", function()
+      assert.are_equal("project", search.last_scope())
+      search.reset()
+      assert.are_equal("project", search.last_scope())
     end)
   end)
 end)

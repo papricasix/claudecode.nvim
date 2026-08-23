@@ -645,7 +645,7 @@ local KEY_SPECS = {
     -- key can mean two things in one view only because no pane is offered both.
     panes = { "sessions" },
     group = "Sessions",
-    desc = "Search these conversations for what was said in them",
+    desc = "Search this project's conversations for what was said in them (<Tab> reaches further)",
     run = function()
       M.show_search()
     end,
@@ -807,19 +807,25 @@ function M.show_help(pane)
   help.open(M.help_entries(pane), pane)
 end
 
----Show the sort menu, and apply what it picks.
+---Show the sessions menu, and apply what it picks.
 ---
----The list keeps whatever order it was last given, so this window is the only
----place the criterion is stated — and the only place it can change.
+---Two invisible things about the list are stated here and nowhere else: the order
+---it is in (it keeps whatever it was last given) and how far back it reaches (the
+---rows that are not on screen leave no trace of themselves). So one window
+---answers both, and one key opens it.
 function M.show_sort_menu()
   local ok, menu = pcall(require, "claudecode.agents.sort_menu")
   if not ok then
     return
   end
-  menu.open(model.SORTS, model.sort_mode(), function(key)
-    model.set_sort(key)
+  menu.open(model.SORTS, model.sort_mode(), function(key, kind)
+    if kind == "window" then
+      model.set_window(key)
+    else
+      model.set_sort(key)
+    end
     M.redraw()
-  end)
+  end, model.WINDOWS, model.window())
 end
 
 ---What a doubled normal-mode key is called in visual mode.
@@ -916,6 +922,20 @@ end
 ---@param buf integer
 ---@param kind string
 local function apply_notice_keys(buf, kind)
+  -- The window screen names `gs`, which is otherwise a list-pane key: a centre
+  -- that says "nothing from the last two weeks" has to be answerable where it is
+  -- read, or the user is told about a key that does nothing under their cursor.
+  local sort_lhs = keymap_for("sort", "gs")
+  if sort_lhs then
+    if kind == "empty" then
+      map(buf, sort_lhs, function()
+        M.show_sort_menu()
+      end, "Claude agents: choose how the session list is ordered and how far back it reaches")
+    else
+      pcall(vim.keymap.del, "n", sort_lhs, { buffer = buf })
+    end
+  end
+
   local lhs = keymap_for("new", "a")
   if not lhs then
     return
@@ -1088,16 +1108,24 @@ end
 ---here, so the screen offers the one thing that does apply, and carries the key
 ---for it: `new` is otherwise a sessions-pane key.
 ---@return boolean
+---A project whose conversations are all older than the window is not an empty
+---project, and saying it is would send the user looking for work they still have.
+---The window is stated instead, with the key that widens it.
 local function show_empty_notice()
-  local lines = {
-    "",
-    "  No conversations in this project yet",
-  }
+  local hidden = model.hidden_count()
+  local headline = hidden > 0
+      and ("  Nothing from the " .. model.window().label:lower() .. " — " .. hidden .. " older conversations")
+    or "  No conversations in this project yet"
+  local lines = { "", headline }
   local marks = {
     { row = 1, col = 0, end_col = -1, hl = (opts().highlights and opts().highlights.title) or "ClaudeCodeAgentsTitle" },
   }
   local hints = {}
   local new_key, help_key = keymap_for("new", "a"), keymap_for("help", "?")
+  local sort_key = keymap_for("sort", "gs")
+  if hidden > 0 and sort_key then
+    hints[#hints + 1] = { sort_key, "show more of them" }
+  end
   if new_key then
     hints[#hints + 1] = { new_key, "start a new agent" }
   end
@@ -2131,27 +2159,45 @@ function M.show_search()
       icon = row.icon,
       hl = row.hl,
       path = model.transcript_path(row.session_id),
+      cwd = model.cwd(),
     }
-  end
-  if #sessions == 0 then
-    vim.notify("ClaudeCode: no conversations to search yet", vim.log.levels.INFO)
-    return
   end
 
   local restore = model.selected()
   local settings = opts().search or {}
+  -- A result from outside the list has no row, and a row is what the panes follow
+  -- and what `select` reads a launch directory from — so looking at one pins it
+  -- into the list. Pins made while browsing are taken back when the picker is
+  -- cancelled: the list is a window on recent work, not a scrapbook of everything
+  -- a search passed over.
+  local pinned = {}
+  local function pin(session_id, info)
+    if model.row(session_id) then
+      return
+    end
+    pinned[session_id] = true
+    model.pin(session_id, info)
+  end
+
   search.open({
     sessions = sessions,
+    cwd = model.cwd(),
     query = search.last_query(),
     limit = settings.max_per_session,
     debounce_ms = settings.debounce_ms,
-    on_preview = function(session_id)
+    on_preview = function(session_id, info)
+      pin(session_id, info)
       M.preview_session(session_id)
     end,
-    on_accept = function(session_id)
+    on_accept = function(session_id, info)
+      pin(session_id, info)
+      pinned[session_id] = nil
       M.enter_session(session_id)
     end,
     on_cancel = function()
+      for session_id in pairs(pinned) do
+        model.unpin(session_id)
+      end
       if restore then
         M.preview_session(restore)
       end

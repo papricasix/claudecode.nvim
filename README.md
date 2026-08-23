@@ -256,11 +256,22 @@ there too.
   rebound or turned off shows up rebound or not at all.
 - `a` starts a new agent, `x` stops the one under the cursor, `r` re-reads
   everything and re-sorts the list.
-- `gs` in any of the three list panes chooses the order: recent activity, name,
-  changes, or status. Picking the one already in force reverses it, and the menu
-  is where that order is stated — it names the direction in the criterion's own
-  words ("newest first", "A → Z"). The choice lasts as long as the view is open;
-  the next open starts from `agents.sessions.sort` again.
+- **The list shows the last two weeks**, newest first, capped at 200 rows. A
+  project you have worked in for months has an archive of conversations, not a
+  list, and the ones worth resuming are almost always recent — but nothing you
+  are holding on to is ever dropped: a running agent, the selected row and
+  anything a search pointed you at stay listed however old they are. When the
+  window catches nothing the centre says so and counts what is older, rather than
+  claiming the project is empty.
+- `gs` in any of the three list panes chooses the order — recent activity, name,
+  changes, or status — **and how far back the list reaches**: last day, 3 days,
+  week, 2 weeks, month, or everything. Picking the order already in force
+  reverses it, and the menu is where both are stated — it names the direction in
+  the criterion's own words ("newest first", "A → Z"). Both choices last as long
+  as the view is open; the next open starts from `agents.sessions.sort` and
+  `agents.sessions.limit` again. Set `limit` to a span (`"3d"`, `"1m"`, `"all"`)
+  or to a plain number for the old "newest N" behaviour; `max` is the ceiling
+  that holds however wide the window is opened.
 - `gf` in the sessions pane **searches the conversations themselves**: type, and
   the sessions whose transcripts mention it are listed with the lines they
   mention it in — what you said, what Claude said, the paths the session touched,
@@ -275,6 +286,14 @@ there too.
   `<CR>` selects it and puts you in it, resuming it if it is not running; `<Esc>`
   puts the selection back where it was. The query survives the picker (reopening
   starts from it, selected) but not the view.
+- **The search is not limited to the rows on screen.** It opens on the whole
+  project — including conversations older than the list's window, which is
+  usually exactly the one you are looking for — and `<Tab>` widens it further to
+  every project on this machine, or narrows it back to what is listed. A hit from
+  another project says which one, and opening it resumes it in the directory it
+  ran in. A conversation you pick is added to the session list so the panes can
+  follow it; ones you only scrolled past are not. The scope is remembered like
+  the query, for as long as the view is open.
 - `dd` deletes the session under the cursor after a confirmation dialog (a snacks.nvim float when you have it, `vim.fn.confirm` otherwise). This removes the conversation's transcript from disk, so it is gone for good and can no longer be resumed — from here or from the CLI. A session whose agent is still running is refused; stop it with `x` first.
 - **Several at once**: `dd` takes a count (`3dd` deletes three rows from the cursor down), and `d` over a visual selection deletes every session the selection covers. One dialog for the whole batch, naming the first few and counting the rest. A running agent inside the range is left alone rather than vetoing the gesture — the dialog says how many were skipped and which key stops them.
 - Switching agents leaves the previous one **running**. That is the point: start
@@ -389,7 +408,11 @@ opts = {
     layout = { left_width = 0.23, right_width = 0.23, sessions_height = 0.55 },
                                   -- the terminal absorbs the rest (0.54 by default)
     sessions = {
-      limit = 30,                 -- most recent transcripts to list
+      -- How far back the list reaches: a span ("1d", "3d", "2w", "1m" — a month
+      -- is thirty days — or "all"), or a plain number for the newest N however
+      -- old they are. `gs` changes it for as long as the view is open.
+      limit = "2w",
+      max = 200,                  -- rows the list never exceeds, whatever the window
       include_empty = true,       -- list conversations that changed no file
       -- The order the list opens in: "recent" | "name" | "changes" | "status"
       -- ("added" and "title" are the old names for two of them, still accepted).

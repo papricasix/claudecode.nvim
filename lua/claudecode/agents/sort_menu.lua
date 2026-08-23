@@ -43,33 +43,58 @@ function M.direction_label(spec, desc)
   return desc and spec.down or spec.up
 end
 
----Lines, highlights, and which line offers which criterion.
+---Lines, highlights, and which line offers what.
+---
+---Two sections when a window list is handed in: what the rows are ordered by, and
+---how far back they reach. Both are invisible state that only this window states,
+---and they are asked the same way — one key, one answer — so they are one menu
+---rather than two keys to remember.
 ---@param items table[] Entries of `model.SORTS`.
 ---@param active { key: string, desc: boolean }
+---@param windows table[]|nil Entries of `model.WINDOWS`. Omitted renders the sort list alone.
+---@param active_window { key: string|nil, label: string|nil }|nil
 ---@return string[] lines
 ---@return table[] marks
----@return table<integer, string> by_line 1-based line -> criterion key
-function M.render(items, active)
+---@return table<integer, string> by_line 1-based line -> the key it offers
+---@return table<integer, string> kind_by_line 1-based line -> "sort" | "window"
+function M.render(items, active, windows, active_window)
   local width = 0
   for _, spec in ipairs(items) do
     width = math.max(width, vim.fn.strdisplaywidth(spec.label))
   end
 
-  local lines, marks, by_line = {}, {}, {}
-  for _, spec in ipairs(items) do
-    local is_active = spec.key == active.key
+  local lines, marks, by_line, kind_by_line = {}, {}, {}, {}
+
+  ---@param text string
+  ---@param note string|nil
+  local function header(text, note)
+    local line = "  " .. text
+    marks[#marks + 1] = { row = #lines, col = 2, end_col = 2 + #text, hl = hl("header") }
+    if note and note ~= "" then
+      marks[#marks + 1] = { row = #lines, col = #line + 3, end_col = #line + 3 + #note, hl = hl("time") }
+      line = line .. "   " .. note
+    end
+    lines[#lines + 1] = line
+  end
+
+  ---@param spec table
+  ---@param is_active boolean
+  ---@param kind string
+  ---@param trailer string|nil What the active row says about itself.
+  local function entry(spec, is_active, kind, trailer)
     local mark = is_active and (ACTIVE_MARK .. " ") or "  "
-    -- Padded only where something follows it: the direction is on the active row
+    -- Padded only where something follows it: the trailer is on the active row
     -- alone, so padding every row would be trailing whitespace on three of four.
-    local pad = is_active and string.rep(" ", math.max(0, width - vim.fn.strdisplaywidth(spec.label))) or ""
+    local pad = trailer and string.rep(" ", math.max(0, width - vim.fn.strdisplaywidth(spec.label))) or ""
     local line = mark .. spec.accel .. "  " .. spec.label .. pad
     local label_at = #mark + #spec.accel + 2
 
-    if is_active then
-      line = line .. "   " .. M.direction_label(spec, active.desc)
+    if trailer then
+      line = line .. "   " .. trailer
     end
     lines[#lines + 1] = line
     by_line[#lines] = spec.key
+    kind_by_line[#lines] = kind
 
     if is_active then
       marks[#marks + 1] = { row = #lines - 1, col = 0, end_col = #ACTIVE_MARK, hl = hl("selected") }
@@ -81,15 +106,36 @@ function M.render(items, active)
       end_col = label_at + #spec.label,
       hl = hl(is_active and "header" or "title"),
     }
-    if is_active then
+    if trailer then
       marks[#marks + 1] = { row = #lines - 1, col = label_at + #spec.label + #pad, end_col = #line, hl = hl("time") }
+    end
+  end
+
+  local sectioned = type(windows) == "table" and #windows > 0
+  if sectioned then
+    header("Sort")
+  end
+  for _, spec in ipairs(items) do
+    local is_active = spec.key == active.key
+    entry(spec, is_active, "sort", is_active and M.direction_label(spec, active.desc) or nil)
+  end
+
+  if sectioned then
+    lines[#lines + 1] = ""
+    -- With a count rather than a span in force, no entry is the active one — so
+    -- the heading says what is actually being shown instead of marking a row that
+    -- would misreport it.
+    local key = active_window and active_window.key
+    header("Show", not key and active_window and active_window.label or nil)
+    for _, spec in ipairs(windows) do
+      entry(spec, spec.key == key, "window", nil)
     end
   end
 
   lines[#lines + 1] = ""
   lines[#lines + 1] = "  " .. FOOTER
   marks[#marks + 1] = { row = #lines - 1, col = 0, end_col = #lines[#lines], hl = hl("time") }
-  return lines, marks, by_line
+  return lines, marks, by_line, kind_by_line
 end
 
 ---@param lines string[]
@@ -141,16 +187,23 @@ local function dimensions(lines)
 end
 
 ---Which row the cursor should start on: the criterion already active.
----@param items table[]
+---@param by_line table<integer, string>
+---@param kind_by_line table<integer, string>
 ---@param active { key: string }
 ---@return integer
-local function active_line(items, active)
-  for index, spec in ipairs(items) do
-    if spec.key == active.key then
-      return index
+local function active_line(by_line, kind_by_line, active)
+  local first = nil
+  for lnum, key in pairs(by_line) do
+    if kind_by_line[lnum] == "sort" then
+      if key == active.key then
+        return lnum
+      end
+      if not first or lnum < first then
+        first = lnum
+      end
     end
   end
-  return 1
+  return first or 1
 end
 
 ---@param buf integer
@@ -237,9 +290,11 @@ end
 ---summoned it dismisses it.
 ---@param items table[] Entries of `model.SORTS`.
 ---@param active { key: string, desc: boolean }
----@param on_pick fun(key: string) Called at most once, after the menu is closed.
+---@param on_pick fun(key: string, kind: string) Called at most once, after the menu is closed.
+---@param windows table[]|nil Entries of `model.WINDOWS`; omitted leaves the menu about order alone.
+---@param active_window { key: string|nil, label: string|nil }|nil
 ---@return boolean shown
-function M.open(items, active, on_pick)
+function M.open(items, active, on_pick, windows, active_window)
   if M.is_open() then
     M.close()
     return false
@@ -250,17 +305,17 @@ function M.open(items, active, on_pick)
     return false
   end
 
-  local lines, marks, by_line = M.render(items, active)
+  local lines, marks, by_line, kind_by_line = M.render(items, active, windows, active_window)
   local buf = make_buf(lines, marks)
   if not buf then
     return false
   end
 
   -- Answered exactly once, whichever way the window goes away: a keymap on the
-  -- buffer outlives the close it triggers, and `<CR>` on a criterion is the same
-  -- answer as its accelerator.
+  -- buffer outlives the close it triggers, and `<CR>` on a row is the same answer
+  -- as its accelerator.
   local answered = false
-  local function pick(key)
+  local function pick(key, kind)
     if answered or not key then
       return
     end
@@ -270,14 +325,21 @@ function M.open(items, active, on_pick)
     -- the window is still going away underneath us, and what happens next opens
     -- windows of its own.
     vim.schedule(function()
-      pcall(on_pick, key)
+      pcall(on_pick, key, kind or "sort")
     end)
   end
 
-  for _, spec in ipairs(items) do
+  local function bind(spec, kind, desc)
     pcall(vim.keymap.set, "n", spec.accel, function()
-      pick(spec.key)
-    end, { buffer = buf, nowait = true, silent = true, desc = "Claude agents: sort by " .. spec.label })
+      pick(spec.key, kind)
+    end, { buffer = buf, nowait = true, silent = true, desc = desc })
+  end
+
+  for _, spec in ipairs(items) do
+    bind(spec, "sort", "Claude agents: sort by " .. spec.label)
+  end
+  for _, spec in ipairs(windows or {}) do
+    bind(spec, "window", "Claude agents: show " .. spec.label:lower())
   end
   pcall(vim.keymap.set, "n", "<CR>", function()
     local win = shown and shown.win
@@ -285,14 +347,15 @@ function M.open(items, active, on_pick)
     if win and vim.api.nvim_win_is_valid(win) then
       lnum = vim.api.nvim_win_get_cursor(win)[1]
     end
-    pick(by_line[lnum])
-  end, { buffer = buf, nowait = true, silent = true, desc = "Claude agents: sort by the criterion under the cursor" })
+    pick(by_line[lnum], kind_by_line[lnum])
+  end, { buffer = buf, nowait = true, silent = true, desc = "Claude agents: take the row under the cursor" })
 
-  local lnum = active_line(items, active)
-  if open_snacks(buf, "Sort sessions", lines, lnum) then
+  local title = (windows and #windows > 0) and "Sessions" or "Sort sessions"
+  local lnum = active_line(by_line, kind_by_line, active)
+  if open_snacks(buf, title, lines, lnum) then
     return true
   end
-  if open_native(buf, "Sort sessions", lines, lnum) then
+  if open_native(buf, title, lines, lnum) then
     return true
   end
   pcall(vim.api.nvim_buf_delete, buf, { force = true })

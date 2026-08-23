@@ -145,4 +145,73 @@ describe("agents.sort_menu", function()
       expect(vim.api.nvim_win_get_cursor(vim.api.nvim_get_current_win())[1]).to_be(3)
     end)
   end)
+
+  describe("how far back the list reaches", function()
+    local WINDOWS = require("claudecode.agents.model").WINDOWS
+
+    local function lines_with_windows(active_window)
+      return menu.render(SORTS, { key = "recent", desc = true }, WINDOWS, active_window)
+    end
+
+    local function find(lines, text)
+      for index, line in ipairs(lines) do
+        if line:find(text, 1, true) then
+          return index
+        end
+      end
+      return nil
+    end
+
+    it("offers the windows under their own heading, below the criteria", function()
+      local lines = lines_with_windows({ key = "2w", label = "Last 2 weeks" })
+      local sort_at, show_at = find(lines, "Sort"), find(lines, "Show")
+      expect(sort_at).not_to_be_nil()
+      expect(show_at > sort_at).to_be_true()
+      expect(find(lines, "1  Last day") > show_at).to_be_true()
+      expect(find(lines, "a  Everything") ~= nil).to_be_true()
+    end)
+
+    it("marks the window in force, as it marks the criterion", function()
+      local lines = lines_with_windows({ key = "2w", label = "Last 2 weeks" })
+      local at = find(lines, "Last 2 weeks")
+      expect(lines[at]:find("❯", 1, true)).to_be(1)
+    end)
+
+    it("names what is shown rather than marking a row, when a count is in force", function()
+      -- A count is not one of the offered spans, so marking any of them would
+      -- misreport what the list is doing.
+      local lines = lines_with_windows({ key = nil, label = "newest 30" })
+      local at = find(lines, "Show")
+      expect(lines[at]:find("newest 30", 1, true) ~= nil).to_be_true()
+      for _, line in ipairs(lines) do
+        if line:find("Last", 1, true) then
+          expect(line:find("❯", 1, true)).to_be_nil()
+        end
+      end
+    end)
+
+    it("says which of the two a pressed key answered", function()
+      local win = stub_snacks()
+      local answers = {}
+      menu.open(SORTS, { key = "recent", desc = true }, function(key, kind)
+        answers[#answers + 1] = { key = key, kind = kind }
+      end, WINDOWS, { key = "2w", label = "Last 2 weeks" })
+      expect(win.opts.title:find("Sessions", 1, true) ~= nil).to_be_true()
+      press(win.opts.buf, "m")
+      expect(answers[1].key).to_be("1m")
+      expect(answers[1].kind).to_be("window")
+    end)
+
+    it("still starts the cursor on the active criterion, past the heading", function()
+      menu.open(SORTS, { key = "recent", desc = true }, function() end, WINDOWS, { key = "2w" })
+      -- Line 1 is the "Sort" heading now.
+      expect(vim.api.nvim_win_get_cursor(vim.api.nvim_get_current_win())[1]).to_be(2)
+    end)
+
+    it("leaves the menu about order alone when no windows are offered", function()
+      local lines = menu.render(SORTS, { key = "recent", desc = true })
+      expect(lines[1]:find("r  Recent activity", 1, true) ~= nil).to_be_true()
+      expect(find(lines, "Show")).to_be_nil()
+    end)
+  end)
 end)

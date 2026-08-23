@@ -78,6 +78,18 @@ local function new_state()
     -- `{ key, desc }` once asked for; nil until then, so the first ask takes
     -- `agents.sessions.sort`. Lives and dies with the open view.
     sort = nil,
+    -- How far back the list reaches, as a `WINDOWS` key. nil until `gs` changes
+    -- it, so the first ask takes `agents.sessions.limit` — and, like the sort
+    -- criterion, it is a way of reading the list rather than a setting about it,
+    -- so it dies with the view.
+    window = nil,
+    -- Conversations kept in the list whatever the window says, because something
+    -- asked for them by name: a search hit older than the window has no row to
+    -- select, and the panes all follow a row. `[session_id] = { path, cwd, title }`.
+    pinned = {},
+    -- Transcripts the window and the cap left out at the last enumeration, so the
+    -- centre can say "there are older ones" rather than "there are none".
+    hidden = 0,
     -- Which Activity rows are shown: "all" | "files" | "tools". Lives and dies
     -- with the view, like the sort criterion — it is a way of reading the list,
     -- not a setting about it.
@@ -99,9 +111,21 @@ M._now_ms = function()
   return os.time() * 1000
 end
 
+--- Wall-clock seconds, which `_now_ms` cannot answer: its default is
+--- `vim.loop.now()`, a monotonic clock counting from when Neovim started, and the
+--- age window compares against a file's mtime. Injectable for the same reason.
+M._now_s = function()
+  return os.time()
+end
+
 ---@param fn fun(): number
 function M._set_clock(fn)
   M._now_ms = fn
+end
+
+---@param fn fun(): number
+function M._set_epoch_clock(fn)
+  M._now_s = fn
 end
 
 ---@return number
@@ -324,6 +348,12 @@ function M.detach()
   -- order that is written down.
   state.order = {}
   state.sort = nil
+  -- Same rule for the window and for what a search pinned into the list: both are
+  -- ways of reading it, chosen for this sitting. The next open starts from
+  -- `agents.sessions.limit`.
+  state.window = nil
+  state.pinned = {}
+  state.hidden = 0
 end
 
 ---@return string|nil
@@ -439,42 +469,253 @@ function M.foreign_state(session_id)
   return entry.state, entry.tab
 end
 
+--------------------------------------------------------------------------------
+-- How far back the list reaches
+--------------------------------------------------------------------------------
+
+--- A day, in seconds. Months are counted as thirty of them: the window is "about
+--- this far back", and a calendar month would make the same setting mean a
+--- different span depending on when it was asked.
+local DAY = 24 * 60 * 60
+
+--- What the `gs` menu offers as a window, in menu order. `seconds = nil` is "no
+--- window at all", which is a choice rather than the absence of one.
+---@type { key: string, accel: string, label: string, seconds: integer|nil }[]
+M.WINDOWS = {
+  { key = "1d", accel = "1", label = "Last day", seconds = DAY },
+  { key = "3d", accel = "3", label = "Last 3 days", seconds = 3 * DAY },
+  { key = "1w", accel = "w", label = "Last week", seconds = 7 * DAY },
+  { key = "2w", accel = "W", label = "Last 2 weeks", seconds = 14 * DAY },
+  { key = "1m", accel = "m", label = "Last month", seconds = 30 * DAY },
+  { key = "all", accel = "a", label = "Everything", seconds = nil },
+}
+
+local UNIT_SECONDS = { d = DAY, w = 7 * DAY, m = 30 * DAY }
+
+--- What the list falls back to when nothing says otherwise: two weeks of work,
+--- and a ceiling no window can lift, so a project with a thousand conversations
+--- cannot be asked to paint a thousand rows.
+local DEFAULT_WINDOW = "2w"
+local DEFAULT_MAX = 200
+
+---Read `agents.sessions.limit`, which is either a count or a span of time.
+---
+---A number is the old meaning — "the newest N" — and still exactly that. A string
+---is a window: `"3d"`, `"2w"`, `"1m"` (thirty days), or `"all"` for no window at
+---all. Anything unparseable is treated as the default rather than as an error;
+---`config.validate` is where a wrong value is reported, and this runs on a timer.
+---@param value any
+---@return { seconds: integer|nil, count: integer|nil, key: string|nil }
+function M.parse_limit(value)
+  if type(value) == "number" then
+    return { count = math.max(1, math.floor(value)) }
+  end
+  if type(value) == "string" then
+    if value == "all" then
+      return { key = "all" }
+    end
+    local n, unit = value:match("^(%d+)%s*([dwm])$")
+    if n and UNIT_SECONDS[unit] then
+      return { seconds = tonumber(n) * UNIT_SECONDS[unit], key = n .. unit }
+    end
+  end
+  return M.parse_limit(DEFAULT_WINDOW)
+end
+
+---The window in force: what `gs` last picked, else what the config asks for.
+---@return { seconds: integer|nil, count: integer|nil, key: string|nil }
+local function window_mode()
+  if state.window then
+    for _, spec in ipairs(M.WINDOWS) do
+      if spec.key == state.window then
+        return { seconds = spec.seconds, key = spec.key }
+      end
+    end
+  end
+  return M.parse_limit(opts().sessions and opts().sessions.limit)
+end
+
+---The ceiling on rows, whatever the window says.
+---@return integer
+local function max_rows()
+  local configured = opts().sessions and opts().sessions.max
+  if type(configured) == "number" and configured >= 1 then
+    return math.floor(configured)
+  end
+  return DEFAULT_MAX
+end
+
+---The window in force, as a copy, plus how it reads in the menu.
+---@return { key: string|nil, seconds: integer|nil, count: integer|nil, label: string }
+function M.window()
+  local mode = window_mode()
+  local label = mode.count and ("newest " .. mode.count) or "everything"
+  for _, spec in ipairs(M.WINDOWS) do
+    if spec.key == mode.key then
+      label = spec.label
+    end
+  end
+  return { key = mode.key, seconds = mode.seconds, count = mode.count, label = label }
+end
+
+---Show conversations from the last `key` (a `WINDOWS` key), for as long as the
+---view is open.
+---@param key string
+---@return { key: string|nil, seconds: integer|nil, count: integer|nil, label: string }
+function M.set_window(key)
+  for _, spec in ipairs(M.WINDOWS) do
+    if spec.key == key then
+      state.window = spec.key
+      M.refresh_list()
+      return M.window()
+    end
+  end
+  return M.window()
+end
+
+---How many of this project's conversations the window and the cap left out.
+---@return integer
+function M.hidden_count()
+  return state.hidden or 0
+end
+
+---Keep a conversation in the list whatever the window says.
+---
+---A search reaches past the window (and past this project), so the conversation
+---you pick may have no row — and a row is what every pane follows, what the
+---cursor sits on, and what `select` reads the launch directory from. Pinning is
+---how such a hit becomes selectable without widening the window for everything
+---else; it lasts as long as the view.
+---@param session_id string
+---@param info { path: string|nil, cwd: string|nil, title: string|nil }|nil
+function M.pin(session_id, info)
+  if type(session_id) ~= "string" or session_id == "" then
+    return
+  end
+  info = info or {}
+  state.pinned[session_id] = {
+    path = info.path or (state.cwd and transcript.session_path(info.cwd or state.cwd, session_id)),
+    cwd = info.cwd or state.cwd,
+    title = info.title,
+  }
+  M.refresh_list()
+end
+
+---Stop holding a conversation in the list.
+---
+---What cancelling a search does to everything it merely looked at: browsing
+---results moves the selection through them, and each one had to be a row for the
+---panes to show it, but none of them was chosen.
+---@param session_id string
+function M.unpin(session_id)
+  if state.pinned[session_id] == nil then
+    return
+  end
+  state.pinned[session_id] = nil
+  M.refresh_list()
+end
+
+---@return table<string, table>
+function M.pinned()
+  return state.pinned
+end
+
 ---Re-enumerate the project's transcripts and rebuild the rows.
 ---
 ---Stat-only, so it is cheap enough to run on a timer; the folding that fills in
 ---titles and counts happens separately and asynchronously.
+---
+---Two things bound the result. The **window** — the last fortnight by default —
+---is what makes a long-lived project's list readable: a hundred conversations is
+---not a list, it is an archive, and the ones worth resuming are almost always
+---recent. The **cap** is the ceiling that holds however wide the window is opened,
+---so "everything" costs a bounded number of rows and folds.
+---
+---Neither is allowed to take a conversation the user is holding on to: a running
+---agent, the selected row, and anything pinned by a search stay listed whatever
+---their age. Age is read from the file's mtime rather than from the transcript's
+---own newest timestamp, because the enumeration is stat-only — asking for
+---`last_ts` would mean folding every transcript in the project to decide which
+---ones to show, and a row that vanished once it folded would be worse than one
+---that is a bookkeeping write too young.
 function M.refresh_list()
   if not state.cwd then
     return
   end
   local listed = transcript.list(state.cwd)
-  local limit = (opts().sessions and opts().sessions.limit) or 30
+  local window = window_mode()
+  local cap = max_rows()
+  if window.count and window.count < cap then
+    cap = window.count
+  end
+  local cutoff = window.seconds and (M._now_s() - window.seconds) or nil
 
+  -- Rows that are not the window's to drop.
+  local registry = require("claudecode.agents.registry")
+  local keep = {}
+  for _, session_id in ipairs(registry.live_ids()) do
+    keep[session_id] = true
+  end
+  for session_id in pairs(state.pinned) do
+    keep[session_id] = true
+  end
+  if state.selected then
+    keep[state.selected] = true
+  end
+
+  local hidden = 0
   local rows, by_id = {}, {}
-  for index, entry in ipairs(listed) do
-    if index > limit then
-      break
+  for _, entry in ipairs(listed) do
+    local wanted = keep[entry.id] == true
+    local too_old = cutoff ~= nil and (entry.mtime or 0) < cutoff
+    if not wanted and (too_old or #rows >= cap) then
+      hidden = hidden + 1
+    else
+      local summary = entry.summary
+      -- Kept across the rebuild so a title never goes backwards: a transcript that
+      -- has just appeared is listed before it is folded, and dropping to the id
+      -- prefix in between is a visible flicker on the row the user is watching —
+      -- the one they just started. `apply_summary` keeps it the same way.
+      local previous = state.by_id[entry.id]
+      local row = {
+        session_id = entry.id,
+        path = entry.path,
+        title = display_title(summary) or (previous and previous.title) or nil,
+        cwd = summary and summary.cwd or state.cwd,
+        -- Kept even for a partial summary: `rows()` gates on `folded`, so a count
+        -- from a half-read transcript is carried but not shown.
+        added = summary and summary.added or nil,
+        removed = summary and summary.removed or nil,
+        last_ts = (summary and summary.last_ts and summary.last_ts > 0) and summary.last_ts or entry.mtime,
+        folded = summary ~= nil and not summary.partial,
+      }
+      rows[#rows + 1] = row
+      by_id[row.session_id] = row
     end
-    local summary = entry.summary
-    -- Kept across the rebuild so a title never goes backwards: a transcript that
-    -- has just appeared is listed before it is folded, and dropping to the id
-    -- prefix in between is a visible flicker on the row the user is watching —
-    -- the one they just started. `apply_summary` keeps it the same way.
-    local previous = state.by_id[entry.id]
-    local row = {
-      session_id = entry.id,
-      path = entry.path,
-      title = display_title(summary) or (previous and previous.title) or nil,
-      cwd = summary and summary.cwd or state.cwd,
-      -- Kept even for a partial summary: `rows()` gates on `folded`, so a count
-      -- from a half-read transcript is carried but not shown.
-      added = summary and summary.added or nil,
-      removed = summary and summary.removed or nil,
-      last_ts = (summary and summary.last_ts and summary.last_ts > 0) and summary.last_ts or entry.mtime,
-      folded = summary ~= nil and not summary.partial,
-    }
-    rows[#rows + 1] = row
-    by_id[row.session_id] = row
+  end
+
+  -- A pinned conversation the enumeration cannot see: a search hit from another
+  -- project. It is listed from what the search knew about it — the transcript it
+  -- matched in and the directory that transcript names — and folds from there
+  -- like any other row, so it fills in its own title and counts.
+  for session_id, pin in pairs(state.pinned) do
+    if not by_id[session_id] and pin.path then
+      local previous = state.by_id[session_id]
+      local summary = transcript.get(pin.path)
+      local row = {
+        session_id = session_id,
+        path = pin.path,
+        title = display_title(summary) or (previous and previous.title) or pin.title or nil,
+        cwd = (summary and summary.cwd) or pin.cwd or state.cwd,
+        added = summary and summary.added or nil,
+        removed = summary and summary.removed or nil,
+        last_ts = (summary and summary.last_ts and summary.last_ts > 0) and summary.last_ts or 0,
+        folded = summary ~= nil and not summary.partial,
+        pinned = true,
+      }
+      rows[#rows + 1] = row
+      by_id[session_id] = row
+    end
   end
 
   -- A conversation we are running that the enumeration cannot see yet.
@@ -486,7 +727,6 @@ function M.refresh_list()
   -- unreachable. The registry knows everything a row needs about it (its id, the
   -- directory it runs in, and that it is running), so it is listed from there
   -- until the enumeration takes over.
-  local registry = require("claudecode.agents.registry")
   for _, session_id in ipairs(registry.live_ids()) do
     if not by_id[session_id] then
       local term = registry.get(session_id)
@@ -512,6 +752,7 @@ function M.refresh_list()
 
   state.rows = rows
   state.by_id = by_id
+  state.hidden = hidden
 
   if state.selected and not by_id[state.selected] then
     state.selected = nil

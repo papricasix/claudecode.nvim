@@ -104,7 +104,11 @@ M.defaults = {
       sessions_height = 0.55, -- Sessions share of the right column (it is the pane you steer from)
     },
     sessions = {
-      limit = 30, -- most recent transcripts to list
+      -- How far back the list reaches: a span of time ("1d", "3d", "2w", "1m" —
+      -- a month is thirty days — or "all"), or a plain number for the newest N
+      -- however old they are. `gs` changes it for as long as the view is open.
+      limit = "2w",
+      max = 200, -- rows the list never exceeds, whatever the window says
       include_empty = true, -- list conversations that never changed a file (false hides them once known)
       -- The order the list opens in: "recent" | "name" | "changes" | "status"
       -- ("title" and "added" are the old names for "name" and "changes"). The
@@ -635,7 +639,17 @@ function M.validate(config)
     if ag.sessions ~= nil then
       assert(type(ag.sessions) == "table", "agents.sessions must be a table")
       local check_sessions = checker(ag.sessions, "agents.sessions")
-      check_sessions("limit", is_positive, "must be a positive number")
+      -- Either meaning of "how much of the list to show": a count, or a span of
+      -- time back from now. The units are the CLI user's own — days, weeks,
+      -- months — and "all" is the way to ask for no window rather than a number
+      -- large enough to stand in for one.
+      check_sessions("limit", function(v)
+        if is_positive(v) then
+          return true
+        end
+        return type(v) == "string" and (v == "all" or v:match("^%d+%s*[dwm]$") ~= nil)
+      end, 'must be a positive number, "all", or a span like "3d", "2w" or "1m"')
+      check_sessions("max", is_positive, "must be a positive number")
       check_sessions("include_empty", is_boolean, "must be a boolean")
       -- "added" and "title" are what "changes" and "name" were called before the
       -- sort menu existed, and still accepted: a config that names one is not

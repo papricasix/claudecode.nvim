@@ -695,7 +695,7 @@ describe("agents_view", function()
   end)
 
   describe("choosing a session without starting it", function()
-    local selected, live, foreign, shown, launched, rows, notify_change
+    local selected, live, foreign, shown, launched, rows, notify_change, hidden
 
     ---What the centre pane is holding, as lines.
     local function center_lines()
@@ -711,7 +711,7 @@ describe("agents_view", function()
     end
 
     before_each(function()
-      selected, live, foreign, shown, launched, notify_change = nil, {}, {}, {}, {}, nil
+      selected, live, foreign, shown, launched, notify_change, hidden = nil, {}, {}, {}, {}, nil, 0
       rows = { { session_id = "aaa", title = "First" }, { session_id = "bbb", title = "Second" } }
 
       package.loaded["claudecode.agents.registry"] = {
@@ -770,6 +770,12 @@ describe("agents_view", function()
         foreign_state = function(id)
           return foreign[id]
         end,
+        hidden_count = function()
+          return hidden
+        end,
+        window = function()
+          return { key = "2w", label = "Last 2 weeks" }
+        end,
         request_refresh = function() end,
         refresh_list = function() end,
         refresh_git = function() end,
@@ -810,6 +816,19 @@ describe("agents_view", function()
       expect(text:find("No conversations", 1, true) ~= nil).to_be_true()
       expect(text:find("start a new agent", 1, true) ~= nil).to_be_true()
       expect(#launched).to_be(0)
+    end)
+
+    it("says the window is empty rather than the project, when there are older ones", function()
+      -- A project whose conversations are all older than the window is not an
+      -- empty project, and saying so would send the user looking for work they
+      -- still have. The screen names the window and the key that widens it.
+      rows = {}
+      hidden = 7
+      open_view()
+      local text = center_lines()
+      expect(text:find("last 2 weeks", 1, true) ~= nil).to_be_true()
+      expect(text:find("7 older conversations", 1, true) ~= nil).to_be_true()
+      expect(text:find("show more of them", 1, true) ~= nil).to_be_true()
     end)
 
     it("binds the new-agent key on that screen, and nowhere else", function()
@@ -1034,6 +1053,12 @@ describe("agents_view", function()
         end,
         changes = function()
           return {}
+        end,
+        hidden_count = function()
+          return 0
+        end,
+        window = function()
+          return { key = "2w", label = "Last 2 weeks" }
         end,
         refresh_list = function() end,
         refresh_git = function() end,
@@ -1298,7 +1323,9 @@ describe("agents_view", function()
       expect(keys_for("feed")["gf"]).to_be_string()
       -- A session row is not a file, so `gf` is free there and means the other
       -- thing you might go looking for: the conversation itself.
-      expect(keys_for("sessions")["gf"]).to_be("Search these conversations for what was said in them")
+      expect(keys_for("sessions")["gf"]).to_be(
+        "Search this project's conversations for what was said in them (<Tab> reaches further)"
+      )
     end)
 
     it("offers the activity filter only where there are two kinds of row", function()

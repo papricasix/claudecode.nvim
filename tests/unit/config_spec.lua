@@ -299,5 +299,45 @@ describe("Configuration", function()
     expect(tostring(err)).to_match("must be a string or function")
   end)
 
+  describe("how far back the agents list reaches", function()
+    local function with_limit(limit)
+      local cfg = {
+        port_range = { min = 10000, max = 65535 },
+        auto_start = true,
+        log_level = "info",
+        track_selection = true,
+        visual_demotion_delay_ms = 50,
+        connection_wait_delay = 200,
+        connection_timeout = 10000,
+        queue_timeout = 5000,
+        diff_opts = { auto_close_on_accept = true, show_diff_stats = true, vertical_split = true },
+        env = {},
+        models = { { name = "Test Model", value = "test" } },
+        terminal = { provider = "native" },
+        agents = { enabled = true, sessions = { limit = limit } },
+      }
+      return function()
+        config.validate(cfg)
+      end
+    end
+
+    it("defaults to a fortnight, under a cap that always applies", function()
+      expect(config.defaults.agents.sessions.limit).to_be("2w")
+      expect(config.defaults.agents.sessions.max).to_be(200)
+    end)
+
+    it("takes a span, a count, or everything", function()
+      for _, limit in ipairs({ "1d", "14d", "2w", "1m", "all", 30 }) do
+        expect(pcall(with_limit(limit))).to_be_true()
+      end
+    end)
+
+    it("refuses a span it cannot read", function()
+      local ok, err = pcall(with_limit("last tuesday"))
+      expect(ok).to_be_false()
+      expect(tostring(err)).to_match("span")
+    end)
+  end)
+
   teardown()
 end)
