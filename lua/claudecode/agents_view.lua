@@ -297,6 +297,45 @@ local bind_keys
 ---@type fun(buf: integer, terminal: boolean|nil)
 local map_cycle
 
+---Paint the centre pane with the raised background snacks gives its own
+---terminals, which sets the conversation apart from the panes describing it. The
+---sidebars keep the editor's own `Normal`, so they read as part of the editor
+---rather than as three more floating surfaces.
+---
+---**Re-applied on every buffer change, not once when the pane is built.** Neovim
+---remembers window-local options per *(window, buffer)* pair, so the moment
+---another buffer lands in the pane the window takes that pair's value — empty
+---for a buffer that has never been here. Measured: `nvim_win_set_buf` on a
+---window carrying `winhighlight` leaves it blank. The very first agent's
+---terminal was therefore the buffer that lost the background, and every switch
+---after it.
+---
+---Entries somebody else put there are kept: `termopen` appends
+---`StatusLine:StatusLineTerm` when a buffer becomes a terminal, and dropping it
+---would restyle the pane's statusline on every agent switch.
+---@param win integer
+local function paint_center(win)
+  local ours = render.terminal_winhighlight()
+  local claimed = {}
+  for group in ours:gmatch("([^,:]+):") do
+    claimed[group] = true
+  end
+
+  local existing = ""
+  pcall(function()
+    existing = vim.wo[win].winhighlight or ""
+  end)
+  local entries = { ours }
+  for entry in existing:gmatch("[^,]+") do
+    local group = entry:match("^([^:]+):")
+    if group and not claimed[group] then
+      entries[#entries + 1] = entry
+    end
+  end
+
+  utils.set_win_option(win, "winhighlight", table.concat(entries, ","))
+end
+
 ---Mark a window as belonging to the view: not an editor window, and named.
 ---@param win integer
 ---@param pane string
@@ -307,12 +346,8 @@ local function tag_window(win, pane)
     vim.w[win].claudecode_live_preview = true
     vim.w[win].claudecode_agents = pane
   end)
-  -- Only the terminal is painted with the snacks background, which sets the
-  -- conversation apart from the panes describing it. The sidebars keep the
-  -- editor's own `Normal`, so they read as part of the editor rather than as
-  -- three more floating surfaces.
   if pane == "center" then
-    utils.set_win_option(win, "winhighlight", render.terminal_winhighlight())
+    paint_center(win)
   end
 
   -- The sidebars hold their size; the terminal absorbs whatever is left. Fixing
@@ -910,6 +945,9 @@ local function show_notice(lines, marks, kind)
   apply_notice_keys(buf, kind)
   render.paint(buf, lines, marks)
   pcall(vim.api.nvim_win_set_buf, center, buf)
+  -- The opening notice is shown before `arm_autocmds` runs, so the backstop is
+  -- not listening yet and this is the one swap that has to paint itself.
+  paint_center(center)
   state.notice_kind = kind
   return true
 end
@@ -1400,6 +1438,29 @@ function M.arm_autocmds()
       end)
     end,
     desc = "Put a closed Claude agents pane, and the sizes a split disturbed, back",
+  })
+
+  -- Every buffer that lands in the centre pane arrives with the `winhighlight`
+  -- Neovim remembers for *that* buffer in *this* window, which for a buffer that
+  -- has never been here is nothing at all. So the background is re-applied per
+  -- swap rather than once when the pane was built: an agent's terminal, another
+  -- agent's terminal, a notice. `TermOpen` as well, because `termopen` rewrites
+  -- the option as the buffer becomes a terminal.
+  vim.api.nvim_create_autocmd({ "BufWinEnter", "TermOpen" }, {
+    group = state.augroup,
+    callback = function(args)
+      local center = pane_win("center")
+      if not center then
+        return
+      end
+      -- `BufWinEnter` names a buffer, not a window, and the pane is often not the
+      -- current one (a swap into it is made from wherever the cursor is).
+      local ok, buf = pcall(vim.api.nvim_win_get_buf, center)
+      if ok and buf == args.buf then
+        paint_center(center)
+      end
+    end,
+    desc = "Keep the Claude agents terminal on its own background",
   })
 
   -- Synchronous, and `WinEnter`/`WinLeave` rather than the more obvious `WinNew`:

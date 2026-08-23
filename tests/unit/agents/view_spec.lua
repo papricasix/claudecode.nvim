@@ -23,6 +23,24 @@ describe("agents_view", function()
     }
   end
 
+  --- Run every autocmd registered for `event`. The mock records them rather than
+  --- dispatching, so a spec that wants to see one fire has to call it.
+  ---@param event string
+  ---@param args table What the callback is handed (`buf`, `match`, ...).
+  local function fire_autocmd(event, args)
+    for _, group in pairs(vim._autocmds or {}) do
+      for _, registered in pairs(group.events or {}) do
+        local events = registered.events
+        events = type(events) == "table" and events or { events }
+        for _, name in ipairs(events) do
+          if name == event and registered.opts and registered.opts.callback then
+            registered.opts.callback(args)
+          end
+        end
+      end
+    end
+  end
+
   before_each(function()
     if vim and vim._mock and vim._mock.reset then
       vim._mock.reset()
@@ -473,6 +491,47 @@ describe("agents_view", function()
       agents_view.restore_sizes()
 
       expect(vim.api.nvim_win_get_height(wins.sessions)).to_be(good)
+      agents_view.close()
+    end)
+
+    it("repaints the terminal background for every buffer the centre pane shows", function()
+      -- Neovim remembers window-local options per (window, buffer) pair, so a
+      -- buffer that has never been in the pane arrives with no `winhighlight` at
+      -- all: `nvim_win_set_buf` on a window carrying one leaves it blank
+      -- (measured). Painting once when the pane was built therefore lasted until
+      -- the first agent's terminal replaced the buffer it was built around, and
+      -- the conversation sat on the editor's own background from then on.
+      agents_view.setup(base_config({ enabled = true }))
+      expect(agents_view.open()).to_be_true()
+      local center = agents_view._state().wins.center
+
+      local painted = vim.wo[center].winhighlight
+      expect(painted:find("Normal:ClaudeCodeAgentsNormal", 1, true)).not_to_be_nil()
+
+      -- What a buffer swap into the pane does to it.
+      vim.wo[center].winhighlight = ""
+      fire_autocmd("BufWinEnter", { buf = vim.api.nvim_win_get_buf(center) })
+
+      expect(vim.wo[center].winhighlight).to_be(painted)
+      agents_view.close()
+    end)
+
+    it("keeps what a terminal buffer added to the pane's highlights", function()
+      -- `termopen` appends `StatusLine:StatusLineTerm` as the buffer becomes a
+      -- terminal. Overwriting rather than merging would restyle the pane's
+      -- statusline on every agent switch.
+      agents_view.setup(base_config({ enabled = true }))
+      expect(agents_view.open()).to_be_true()
+      local center = agents_view._state().wins.center
+
+      vim.wo[center].winhighlight = "StatusLine:StatusLineTerm,Normal:SomethingElse"
+      fire_autocmd("BufWinEnter", { buf = vim.api.nvim_win_get_buf(center) })
+
+      local painted = vim.wo[center].winhighlight
+      expect(painted:find("Normal:ClaudeCodeAgentsNormal", 1, true)).not_to_be_nil()
+      expect(painted:find("StatusLine:StatusLineTerm", 1, true)).not_to_be_nil()
+      -- Ours won the group both claimed.
+      expect(painted:find("Normal:SomethingElse", 1, true)).to_be_nil()
       agents_view.close()
     end)
   end)
