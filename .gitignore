@@ -71,3 +71,8 @@ luacov.stats.out
 # Local working notes and scratch output
 /.notes/
 /out.txt
+
+# Conversation transcripts. Copying one in from ~/.claude/projects/ is the
+# obvious way to debug the parser against real data, and every line of one is
+# somebody's private conversation — file paths, prompts, command output.
+*.jsonl
