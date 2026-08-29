@@ -27,10 +27,25 @@ local float = require("claudecode.agents.float")
 local logger = require("claudecode.logger")
 local patch = require("claudecode.agents.patch")
 local transcript = require("claudecode.agents.transcript")
+local utils = require("claudecode.utils")
 
 local M = {}
 
 local ns = vim.api.nvim_create_namespace("claudecode_agents_file_view")
+
+---How a float's title names the file it is showing (`utils.path_title`), at this
+---feature's own float geometry.
+---
+---The tail alone does not say *where*: a session touches several `init.lua`, and
+---a row is a record of work rather than a file you already have open, so the one
+---thing the title has to answer is which file this is.
+---@param path string
+---@param root string|nil Directory the session ran in.
+---@param note string|nil Parenthesised aside, e.g. `"(vs HEAD)"`.
+---@return string
+function M.title(path, root, note)
+  return utils.path_title(path, root, note, float.title_width())
+end
 
 ---@return boolean
 local function unified_available()
@@ -104,12 +119,12 @@ end
 ---file the session never edited — differ only in where the ranges come from.
 ---@param session_id string|nil
 ---@param path string
----@param name string
+---@param title string
 ---@param ranges { start_line: integer, num_lines: integer }[]
 ---@param line integer|nil Explicit line to land on; the first read otherwise.
 ---@param reuse integer|nil Float to swap this into, rather than stacking a new one.
 ---@return integer|nil win
-local function open_read(session_id, path, name, ranges, line, reuse)
+local function open_read(session_id, path, title, ranges, line, reuse)
   local lines = read_lines(path)
   if not lines or #ranges == 0 then
     return nil
@@ -119,7 +134,7 @@ local function open_read(session_id, path, name, ranges, line, reuse)
     return nil
   end
   set_filetype(buf, path)
-  local win = float.create(session_id, { title = name .. "  (read)", buf = buf, reuse = reuse })
+  local win = float.create(session_id, { title = title, buf = buf, reuse = reuse })
   if not win then
     return nil
   end
@@ -251,7 +266,7 @@ end
 ---is asked just as often once several agents have been over the same tree, and
 ---no session's history can answer it. Same float, same inline rendering, a
 ---different baseline.
----@param opts { session_id: string?, path: string, line: integer?, reuse: integer? }
+---@param opts { session_id: string?, path: string, line: integer?, cwd: string?, reuse: integer? }
 ---@param done fun(win: integer|nil)|nil
 function M.open_against_head(opts, done)
   local path = opts and opts.path
@@ -276,7 +291,7 @@ function M.open_against_head(opts, done)
     -- Not in HEAD: untracked, or created since the last commit. Diffing against
     -- nothing reads every line as an addition, which is what it is.
     local before = head or {}
-    local title = name .. (head and "  (vs HEAD)" or "  (new since HEAD)")
+    local title = M.title(path, opts.cwd, head and "(vs HEAD)" or "(new since HEAD)")
 
     if head and M._same_lines(head, lines) then
       vim.notify("ClaudeCode: " .. name .. " matches HEAD", vim.log.levels.INFO)
@@ -296,7 +311,7 @@ end
 ---Open a file from one of the panes, showing what the session did to it.
 ---@param opts { session_id: string?, transcript: string?, path: string, line: integer?,
 ---             read: { start_line: integer, num_lines: integer }?, prefer: "diff"|"read"?,
----             reuse: integer? }
+---             cwd: string?, reuse: integer? }
 ---@param done fun(win: integer|nil)|nil Called once the float is up (the history read is async).
 function M.open(opts, done)
   local path = opts and opts.path
@@ -306,7 +321,11 @@ function M.open(opts, done)
     end
     return
   end
-  local name = vim.fn.fnamemodify(path, ":t")
+  ---@param note string|nil
+  ---@return string
+  local function title_for(note)
+    return M.title(path, opts.cwd, note)
+  end
 
   local function finish(win)
     if done then
@@ -318,14 +337,14 @@ function M.open(opts, done)
   -- lines it covered marked, and nothing else.
   if opts.prefer == "read" and opts.read then
     -- No explicit line: the read's own first line *is* what this row is about.
-    local win = open_read(opts.session_id, path, name, { opts.read }, nil, opts.reuse)
+    local win = open_read(opts.session_id, path, title_for("(read)"), { opts.read }, nil, opts.reuse)
     if win then
       return finish(win)
     end
   end
 
   if not opts.transcript then
-    return finish(float.open_file(opts.session_id, path, opts.line, opts.reuse))
+    return finish(float.open_file(opts.session_id, path, opts.line, opts.reuse, title_for(nil)))
   end
 
   transcript.file_history(opts.transcript, path, function(history)
@@ -335,19 +354,19 @@ function M.open(opts, done)
     if #hunks == 0 and not created then
       -- The session only read this file: show it with every window it read marked.
       local reads = (history and history.reads) or {}
-      local win = open_read(opts.session_id, path, name, reads, opts.line, opts.reuse)
-      return finish(win or float.open_file(opts.session_id, path, opts.line, opts.reuse))
+      local win = open_read(opts.session_id, path, title_for("(read)"), reads, opts.line, opts.reuse)
+      return finish(win or float.open_file(opts.session_id, path, opts.line, opts.reuse, title_for(nil)))
     end
 
     local lines = read_lines(path)
     if not lines then
       -- Gone from disk: the patches are all that is left of it, and they are enough.
       logger.debug("agents", "file_view: no file on disk for", path, "- showing its patches")
-      return finish(open_patch_text(opts.session_id, path, hunks, name .. "  (deleted)", opts.reuse))
+      return finish(open_patch_text(opts.session_id, path, hunks, title_for("(deleted)"), opts.reuse))
     end
 
     if not unified_available() then
-      return finish(open_patch_text(opts.session_id, path, hunks, name .. "  (session changes)", opts.reuse))
+      return finish(open_patch_text(opts.session_id, path, hunks, title_for("(session changes)"), opts.reuse))
     end
 
     -- A file the session created has an empty baseline: every line is an addition.
@@ -365,19 +384,19 @@ function M.open(opts, done)
       -- Nothing the session did is still in this file; showing it against itself
       -- would claim it changed nothing.
       logger.debug("agents", "file_view: no hunk located in", path, "- showing its patches")
-      return finish(open_patch_text(opts.session_id, path, hunks, name .. "  (session changes)", opts.reuse))
+      return finish(open_patch_text(opts.session_id, path, hunks, title_for("(session changes)"), opts.reuse))
     end
 
-    local title = name
+    local note = nil
     if skipped > 0 then
       -- Say it rather than quietly showing a partial diff: the rest of the session's
       -- work is not missing, it was overwritten after the session ran.
-      title = string.format("%s  (%d/%d changes still present)", name, applied, applied + skipped)
+      note = string.format("(%d/%d changes still present)", applied, applied + skipped)
     end
 
-    local win = open_inline_diff(opts.session_id, path, lines, before, title, opts.reuse)
+    local win = open_inline_diff(opts.session_id, path, lines, before, title_for(note), opts.reuse)
     if not win then
-      return finish(open_patch_text(opts.session_id, path, hunks, name .. "  (session changes)", opts.reuse))
+      return finish(open_patch_text(opts.session_id, path, hunks, title_for("(session changes)"), opts.reuse))
     end
     return finish(win)
   end)

@@ -2716,6 +2716,7 @@ function open_row(payload, pane, lnum, action, nav_opts)
       session_id = model.selected(),
       path = payload.path,
       line = payload.line,
+      cwd = model.selected_cwd(),
       reuse = nav_opts.reuse,
     }, opened)
     return
@@ -2733,6 +2734,7 @@ function open_row(payload, pane, lnum, action, nav_opts)
     line = payload.line,
     read = read,
     prefer = read and "read" or "diff",
+    cwd = model.selected_cwd(),
     reuse = nav_opts.reuse,
   }, opened)
 end

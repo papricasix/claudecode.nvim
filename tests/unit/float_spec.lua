@@ -307,6 +307,56 @@ describe("float", function()
     end)
   end)
 
+  describe("diff float titles", function()
+    local diff
+
+    before_each(function()
+      package.loaded["claudecode.diff"] = nil
+      diff = require("claudecode.diff")
+      float.setup(base_config())
+    end)
+
+    after_each(function()
+      package.loaded["claudecode.diff"] = nil
+    end)
+
+    ---@return string|nil
+    local function last_title()
+      local list = float.list()
+      local entry = list[#list]
+      return entry and entry.title or nil
+    end
+
+    it("says where the file is, not just its tail", function()
+      diff.open_float({ file_path = vim.fn.getcwd() .. "/lua/claudecode/diff.lua" })
+      expect(last_title()).to_be("lua/claudecode/diff.lua")
+    end)
+
+    it("shows a file outside the editor's directory as a path", function()
+      local home = os.getenv("HOME") or "/home/u"
+      diff.open_float({ file_path = home .. "/.config/nvim/init.lua" })
+      expect(last_title()).to_be("~/.config/nvim/init.lua")
+    end)
+
+    it("keeps naming the agent that asked", function()
+      -- Several agents answer at once, so a float has to say whose question it is.
+      diff.open_float({ file_path = vim.fn.getcwd() .. "/lua/a.lua", session_id = "abcdef1234" })
+      expect(last_title()).to_be("lua/a.lua  ·  abcdef12")
+    end)
+
+    it("still names a float with no file at all", function()
+      diff.open_float({ session_id = "abcdef1234" })
+      expect(last_title()).to_be("diff  ·  abcdef12")
+      diff.open_float({})
+      expect(last_title()).to_be("diff")
+    end)
+
+    it("leaves a title the caller supplied alone", function()
+      diff.open_float({ file_path = "/proj/a.lua", title = "mine" })
+      expect(last_title()).to_be("mine")
+    end)
+  end)
+
   describe("config", function()
     local config
 

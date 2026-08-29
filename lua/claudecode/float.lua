@@ -72,6 +72,26 @@ function M.opts(overrides)
   return out
 end
 
+---How wide a float is, in cells.
+---@param opts table Merged float options.
+---@return integer
+local function float_width(opts)
+  return math.max(20, math.floor(vim.o.columns * (opts.width or 0.7)))
+end
+
+---Cells a border title has to fit into.
+---
+---Neovim draws a title inside the frame and cuts what does not fit at its *right*
+---edge — which on a path is the filename, the one part the title is there for. So
+---a caller building a title out of a path fits it itself (`render.shorten_path`
+---cuts from the inside); this is what it has to fit into: the float's width, less
+---the space either side of the title and a cell of clearance from each corner.
+---@param float_opts table|nil A feature's own float table.
+---@return integer
+function M.title_width(float_opts)
+  return math.max(8, float_width(M.opts(float_opts)) - 6)
+end
+
 ---Drop floats whose windows are gone (the user closed one).
 local function prune()
   local kept = {}
@@ -91,7 +111,7 @@ local function next_geometry(opts)
   local columns = vim.o.columns
   local lines = vim.o.lines
 
-  local width = math.max(20, math.floor(columns * (opts.width or 0.7)))
+  local width = float_width(opts)
   local height = math.max(5, math.floor(lines * (opts.height or 0.7)))
   local offset = (opts.cascade_offset or 2) * #floats
 
@@ -379,11 +399,6 @@ function M.jump_to(win, line, inline_diff)
   end)
 end
 
----Show a file in a float.
----@param opts { session_id: string?, path: string, line: integer?, reuse: integer?,
----             float_opts: table?, border_hl: string?, tags: table<string, any>?,
----             purpose: string? }
----@return integer|nil win
 ---A read-only scratch buffer holding `lines`, ready to be put in a float.
 ---
 ---Named rather than anonymous so `:ls` and a window picker say what the float is,
@@ -406,6 +421,11 @@ function M.scratch(lines, name)
   return buf
 end
 
+---Show a file on disk in a float.
+---@param opts { session_id: string?, path: string, line: integer?, reuse: integer?,
+---             title: string?, float_opts: table?, border_hl: string?, tags: table?,
+---             purpose: string? }
+---@return integer|nil win
 function M.open_file(opts)
   local path = opts and opts.path
   if type(path) ~= "string" or path == "" then
@@ -419,7 +439,9 @@ function M.open_file(opts)
 
   local win = M.create({
     session_id = opts.session_id,
-    title = vim.fn.fnamemodify(path, ":t"),
+    -- The caller names it when it knows more than the path does — a pane's float
+    -- says where in the project the file is, which a bare tail cannot.
+    title = opts.title or vim.fn.fnamemodify(path, ":t"),
     buf = buf,
     reuse = opts.reuse,
     float_opts = opts.float_opts,

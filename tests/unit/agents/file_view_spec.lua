@@ -189,6 +189,56 @@ describe("agents.file_view", function()
     expect(float.count()).to_be(1)
   end)
 
+  describe("naming the file in the title", function()
+    it("shows where the file is, relative to the directory the session ran in", function()
+      -- The tail alone does not say which `init.lua` this is, and the project
+      -- prefix every file shares says nothing.
+      disk["/proj/lua/agents/init.lua"] = { "one" }
+      open({ session_id = "s", path = "/proj/lua/agents/init.lua", cwd = "/proj" })
+      local _, title = float_buf()
+      expect(title).to_be("lua/agents/init.lua")
+    end)
+
+    it("shows a file outside that directory as a path, not as a bare name", function()
+      local home = os.getenv("HOME") or "/home/u"
+      local path = home .. "/.config/nvim/init.lua"
+      disk[path] = { "one" }
+      open({ session_id = "s", path = path, cwd = "/proj" })
+      local _, title = float_buf()
+      expect(title).to_be("~/.config/nvim/init.lua")
+    end)
+
+    it("cuts a path too long for the border from the inside, keeping the filename", function()
+      -- Neovim would cut the title at its right edge, throwing away the one part
+      -- the title is there for.
+      local columns = vim.o.columns
+      vim.o.columns = 40
+      local path = "/proj/lua/claudecode/agents/deeply/nested/file_view.lua"
+      disk[path] = { "one" }
+      open({ session_id = "s", path = path, cwd = "/proj" })
+      vim.o.columns = columns
+
+      local _, title = float_buf()
+      expect(title:find("…", 1, true) ~= nil).to_be_true()
+      expect(title:sub(-13)).to_be("file_view.lua")
+      expect(vim.fn.strdisplaywidth(title) <= 22).to_be_true()
+    end)
+
+    it("keeps the note beside the path", function()
+      disk["/proj/lua/a.lua"] = { "1", "2", "3" }
+      open({
+        session_id = "s",
+        transcript = "/p/a.jsonl",
+        path = "/proj/lua/a.lua",
+        read = { start_line = 1, num_lines = 2 },
+        prefer = "read",
+        cwd = "/proj",
+      })
+      local _, title = float_buf()
+      expect(title).to_be("lua/a.lua  (read)")
+    end)
+  end)
+
   describe("against git HEAD", function()
     local git
 

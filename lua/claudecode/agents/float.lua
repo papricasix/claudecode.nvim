@@ -83,18 +83,26 @@ function M.create_for(opts)
   })
 end
 
+---Cells a title has to fit into, at this feature's own geometry.
+---@return integer
+function M.title_width()
+  return base.title_width(float_opts())
+end
+
 ---Show a file in a float.
 ---@param session_id string|nil
 ---@param path string
 ---@param line integer|nil
 ---@param reuse integer|nil Float to swap this into, rather than stacking a new one.
+---@param title string|nil Border title; the file's tail otherwise.
 ---@return integer|nil win
-function M.open_file(session_id, path, line, reuse)
+function M.open_file(session_id, path, line, reuse, title)
   return base.open_file({
     session_id = session_id,
     path = path,
     line = line,
     reuse = reuse,
+    title = title,
     float_opts = float_opts(),
     border_hl = border_hl(),
     tags = TAGS,

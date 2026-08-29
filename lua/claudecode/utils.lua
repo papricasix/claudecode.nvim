@@ -216,6 +216,193 @@ function M.path_key(path)
   return out
 end
 
+---Truncate to a display width, marking the cut.
+---@param text string
+---@param width integer
+---@return string
+function M.truncate(text, width)
+  if width <= 0 then
+    return ""
+  end
+  if vim.fn.strdisplaywidth(text) <= width then
+    return text
+  end
+  -- Cut by display cells, not bytes: a multibyte title would otherwise be sliced
+  -- mid-character and render as a replacement glyph.
+  local out = vim.fn.strcharpart(text, 0, width - 1)
+  while vim.fn.strdisplaywidth(out) > width - 1 and #out > 0 do
+    out = vim.fn.strcharpart(out, 0, vim.fn.strchars(out) - 1)
+  end
+  return out .. "…"
+end
+
+---Cut a filename to a width while keeping its extension.
+---
+---A plain tail-cut drops the extension first, which is the half of a filename
+---that says what kind of thing it is; `render.lua` and `render.md` are two files
+---and `render…` is neither. The extension is dropped only when keeping it would
+---leave no room for the name in front of it.
+---@param name string
+---@param width integer
+---@return string
+local function fit_name(name, width)
+  if width <= 0 then
+    return ""
+  end
+  if vim.fn.strdisplaywidth(name) <= width then
+    return name
+  end
+  local stem, ext = name:match("^(.+)(%.[^./]+)$")
+  if stem then
+    local room = width - vim.fn.strdisplaywidth(ext)
+    -- Two cells: one character of the name and the cut mark. Below that the
+    -- extension is all you would see, which names no file.
+    if room >= 2 then
+      return M.truncate(stem, room) .. ext
+    end
+  end
+  return M.truncate(name, width)
+end
+
+---Split a path into segments, keeping a leading `/` on the first one, and report
+---the separator it was written with.
+---
+---Both separators are split on, and a Windows drive is kept with the segment that
+---follows it (`D:\Git\proj` -> `D:\Git`, `proj`): `D:` on its own is not the
+---coarse "where in the project" answer `shorten_path` picks a first segment for.
+---A path split on `/` alone left a Windows path as one segment, which sent it to
+---the tail cut this whole function exists to avoid.
+---@param path string
+---@return string[] segments, string separator
+local function path_segments(path)
+  local segments = {}
+  for segment in path:gmatch("[^/\\]+") do
+    segments[#segments + 1] = segment
+  end
+  local separator = path:find("\\", 1, true) and not path:find("/", 1, true) and "\\" or "/"
+  if segments[1] then
+    if path:sub(1, 1) == "/" or path:sub(1, 1) == "\\" then
+      segments[1] = path:sub(1, 1) .. segments[1]
+    elseif segments[1]:match("^%a:$") and segments[2] then
+      segments[1] = segments[1] .. separator .. segments[2]
+      table.remove(segments, 2)
+    end
+  end
+  return segments, separator
+end
+
+---Fit a path into a width from the inside out, so the filename always survives.
+---
+---`M.truncate` cuts the tail, which on a path throws away the one part you were
+---reading it for: a narrow pane turned `lua/claudecode/agents/render.lua` into
+---`lua/claudecod…`, so every file in a directory looked alike. This drops
+---*interior* directories instead, and only as many as the width demands, in the
+---order they are worth least:
+---
+---  1. the whole path, if it fits;
+---  2. `first/…/parent/name` — where in the project, and which module;
+---  3. `first/…/name` — where in the project;
+---  4. `…/name` — the name, said to be part of a path;
+---  5. `name`;
+---  6. `name` cut, extension kept (`fit_name`).
+---
+---The first folder outranks the parent because it is the coarser answer: in a
+---list of files from one session, `lua/…/init.lua` and `tests/…/init.lua` are
+---told apart by it, while their parents are often the same word.
+---@param path string
+---@param width integer Display cells.
+---@return string
+function M.shorten_path(path, width)
+  if type(path) ~= "string" or path == "" or width <= 0 then
+    return ""
+  end
+  if vim.fn.strdisplaywidth(path) <= width then
+    return path
+  end
+
+  local segments, sep = path_segments(path)
+  local count = #segments
+  if count <= 1 then
+    return fit_name(path, width)
+  end
+
+  local name = segments[count]
+  local first, parent = segments[1], segments[count - 1]
+
+  local candidates = {}
+  -- Only when the ellipsis actually stands for something: with three segments
+  -- `first/…/parent/name` would spell the whole path with a cut mark in it.
+  if count >= 4 then
+    candidates[#candidates + 1] = first .. sep .. "…" .. sep .. parent .. sep .. name
+  end
+  if count >= 3 then
+    candidates[#candidates + 1] = first .. sep .. "…" .. sep .. name
+  end
+  candidates[#candidates + 1] = "…" .. sep .. name
+  candidates[#candidates + 1] = name
+
+  for _, candidate in ipairs(candidates) do
+    if vim.fn.strdisplaywidth(candidate) <= width then
+      return candidate
+    end
+  end
+  return fit_name(name, width)
+end
+
+---A path shown relative to a directory it is under.
+---
+---Compared in normalized form, since the two spellings need not match: on Windows
+---the session's cwd is `D:\Git\proj` while the same directory can reach us as
+---`D:/Git/proj`. What is returned is a slice of the original, so the path keeps
+---the separators it was written with.
+---@param path string
+---@param root string|nil
+---@return string
+function M.relative_path(path, root)
+  if type(path) ~= "string" then
+    return ""
+  end
+  if type(root) == "string" and root ~= "" then
+    local prefix = M.path_key(root) .. "/"
+    local key = M.path_key(path)
+    if key:sub(1, #prefix) == prefix then
+      -- Normalizing rewrites separators and case in place, so an offset into the
+      -- key is the same offset into the path — unless it also collapsed a
+      -- doubled separator, in which case the key's own remainder is the answer.
+      return #key == #path and path:sub(#prefix + 1) or key:sub(#prefix + 1)
+    end
+  end
+  return path
+end
+
+---How a float's border title names a file.
+---
+---The tail alone does not say *where*: a project has several `init.lua`, and a
+---float is opened over work you may not have on screen. The path is shown
+---relative to the directory it belongs to — the prefix every file in a project
+---shares says nothing — and `~`-shortened when it is outside that directory,
+---which is exactly the case where being elsewhere is the point.
+---
+---Fitted here rather than left to the border: Neovim cuts a title that does not
+---fit at its *right* edge, which is the filename. `shorten_path` drops interior
+---directories instead, so `lua/…/agents/file_view.lua` still names it.
+---@param path string
+---@param root string|nil Directory the path is shown relative to.
+---@param note string|nil Parenthesised aside, e.g. `"(vs HEAD)"`.
+---@param width integer Display cells the title has to fit into.
+---@return string
+function M.path_title(path, root, note, width)
+  local suffix = (type(note) == "string" and note ~= "") and ("  " .. note) or ""
+  if type(path) ~= "string" or path == "" then
+    return (suffix:gsub("^%s+", ""))
+  end
+  local text = M.relative_path(path, root)
+  if text == path then
+    text = vim.fn.fnamemodify(path, ":~")
+  end
+  return M.shorten_path(text, width - vim.fn.strdisplaywidth(suffix)) .. suffix
+end
+
 ---Where the Claude CLI keeps its state.
 ---
 ---One rule, because three features read it — the lock files it discovers editors

@@ -765,6 +765,13 @@ local vim = {
       if modifier == ":t" then
         return path:match("([^/]+)$") or path
       end
+      if modifier == ":~" then
+        local home = os.getenv("HOME")
+        if home and home ~= "" and path:sub(1, #home + 1) == home .. "/" then
+          return "~" .. path:sub(#home + 1)
+        end
+        return path
+      end
       return path
     end,
 

@@ -5,6 +5,10 @@ local M = {}
 local logger = require("claudecode.logger")
 local utils = require("claudecode.utils")
 
+--- What a float title is fitted to when the module hosting it cannot say. Only
+--- an older host module reaches this; both of ours report their own width.
+local DEFAULT_TITLE_WIDTH = 60
+
 ---Tell the live-cursor feature to dismiss its ride-along preview before we build
 ---a review diff for `file_path`. Done first thing in diff setup so the preview
 ---window is gone before window discovery runs (it must not become the diff
@@ -257,25 +261,38 @@ end
 ---and is configured by the top-level `float` block. Before they were split, a
 ---user with agents disabled was sizing their diffs through `agents.float`.
 ---@param opts { session_id: string?, file_path: string?, owner: table?, purpose: string?,
----             title: string?, term_win: integer? }
+---             title: string?, root: string?, term_win: integer? }
 ---@return integer|nil win
 function M.open_float(opts)
   opts = opts or {}
-  local title = opts.title
-  if not title then
-    title = opts.file_path and vim.fn.fnamemodify(opts.file_path, ":t") or "diff"
-    if opts.session_id then
-      title = title .. "  ·  " .. opts.session_id:sub(1, 8)
-    end
-  end
 
   local module = (opts.owner and opts.owner.float_module) or "claudecode.float"
   local ok, float = pcall(require, module)
-  if not ok or type(float.create_for) ~= "function" then
+  local hosted = ok and type(float.create_for) == "function"
+  if not hosted then
     ok, float = pcall(require, "claudecode.float")
     if not ok then
       return nil
     end
+  end
+
+  local title = opts.title
+  if not title then
+    -- Where the file is, not just its tail: a float opens over work that is not
+    -- otherwise on screen, and every project has several `init.lua`. Relative to
+    -- the editor's own directory unless a caller knows better, and fitted to the
+    -- geometry of whichever module hosts it — that is the border it has to live
+    -- in.
+    local width = (type(float.title_width) == "function" and float.title_width()) or DEFAULT_TITLE_WIDTH
+    local note = opts.session_id and ("·  " .. opts.session_id:sub(1, 8)) or nil
+    if opts.file_path then
+      title = utils.path_title(opts.file_path, opts.root or vim.fn.getcwd(), note, width)
+    else
+      title = note and ("diff  " .. note) or "diff"
+    end
+  end
+
+  if not hosted then
     -- Parenthesised: `create` also hands back the buffer, and this returns a window.
     return (
       float.create({
