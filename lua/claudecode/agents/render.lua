@@ -53,6 +53,10 @@ local config = nil
 --- [bufnr] = { [lnum] = payload }
 local payloads = {}
 
+--- [bufnr] = { lines, marks, tick } — what the last paint put there, so a repaint
+--- that would change nothing can be skipped.
+local painted = {}
+
 local DEFAULT_HIGHLIGHTS = {
   title = "ClaudeCodeAgentsTitle",
   time = "ClaudeCodeAgentsTime",
@@ -228,6 +232,7 @@ function M.create_buf(kind)
   pcall(vim.api.nvim_buf_set_option, buf, "buftype", "nofile")
   pcall(vim.api.nvim_buf_set_option, buf, "bufhidden", "hide")
   pcall(vim.api.nvim_buf_set_option, buf, "swapfile", false)
+  pcall(vim.api.nvim_buf_set_option, buf, "undolevels", -1) -- see `M.paint`
   pcall(vim.api.nvim_buf_set_option, buf, "modifiable", false)
   pcall(vim.api.nvim_set_option_value, "filetype", "claudecode-agents-" .. kind, { buf = buf })
   pcall(vim.api.nvim_buf_set_name, buf, "Claude agents: " .. kind)
@@ -277,6 +282,61 @@ local function push_spans(marks, lnum, at, spans)
   end
 end
 
+---@param buf integer
+---@return integer|nil
+local function changedtick(buf)
+  local ok, tick = pcall(vim.api.nvim_buf_get_changedtick, buf)
+  return ok and tick or nil
+end
+
+local MARK_FIELDS = { "row", "col", "end_col", "hl", "line_hl", "priority" }
+
+---@param a string[]
+---@param b string[]|nil
+local function same_lines(a, b)
+  b = b or {}
+  if #a ~= #b then
+    return false
+  end
+  for i = 1, #a do
+    if a[i] ~= b[i] then
+      return false
+    end
+  end
+  return true
+end
+
+---@param a table[]
+---@param b table[]|nil
+local function same_marks(a, b)
+  b = b or {}
+  if #a ~= #b then
+    return false
+  end
+  for i = 1, #a do
+    for _, field in ipairs(MARK_FIELDS) do
+      if a[i][field] ~= b[i][field] then
+        return false
+      end
+    end
+  end
+  return true
+end
+
+---@param marks table[]|nil
+---@return table[]
+local function copy_marks(marks)
+  local out = {}
+  for i, mark in ipairs(marks or {}) do
+    local copy = {}
+    for _, field in ipairs(MARK_FIELDS) do
+      copy[field] = mark[field]
+    end
+    out[i] = copy
+  end
+  return out
+end
+
 ---Replace a buffer's contents and marks in one pass.
 ---
 ---Exported because every pane-like buffer in the view needs exactly this — the
@@ -285,11 +345,31 @@ end
 ---@param buf integer
 ---@param lines string[]
 ---@param marks { row: integer, col: integer, end_col: integer, hl: string }[]
+---
+---**Undo is switched off on every buffer painted here.** Neovim closes an undo
+---block only after a typed command, never in a timer or RPC callback, so every
+---paint of a polled pane was appended to one block that `undolevels` (a count of
+---blocks) never trimmed: a full copy of the replaced lines per paint, held until
+---the buffer was deleted — gigabytes over a multi-day session. Set here rather
+---than only in `create_buf` because the notice, help, sort menu and search list
+---buffers are made elsewhere.
+---
+---A paint that would leave lines and marks exactly as they are is skipped (most
+---polls change nothing). The buffer's `changedtick` guards the skip, so a
+---buffer something else wrote to is still repainted.
 ---@param rows table<integer, table>|nil 1-based line -> payload
 function M.paint(buf, lines, marks, rows)
   if not buf or not vim.api.nvim_buf_is_valid(buf) then
     return
   end
+  payloads[buf] = rows
+  local tick = changedtick(buf)
+  local last = painted[buf]
+  if last and last.tick == tick and same_lines(last.lines, lines) and same_marks(last.marks, marks) then
+    return
+  end
+
+  pcall(vim.api.nvim_buf_set_option, buf, "undolevels", -1)
   pcall(vim.api.nvim_buf_set_option, buf, "modifiable", true)
   pcall(vim.api.nvim_buf_set_lines, buf, 0, -1, false, lines)
   pcall(vim.api.nvim_buf_set_option, buf, "modifiable", false)
@@ -306,7 +386,13 @@ function M.paint(buf, lines, marks, rows)
       })
     end
   end
-  payloads[buf] = rows
+  -- Copies, not the caller's tables: a caller that mutated and repainted the same
+  -- table would otherwise always compare equal to itself.
+  local kept = {}
+  for i, line in ipairs(lines or {}) do
+    kept[i] = line
+  end
+  painted[buf] = { lines = kept, marks = copy_marks(marks), tick = changedtick(buf) }
 end
 
 local paint = M.paint
@@ -324,6 +410,7 @@ end
 ---@param buf integer
 function M.forget(buf)
   payloads[buf] = nil
+  painted[buf] = nil
 end
 
 --------------------------------------------------------------------------------
@@ -649,6 +736,7 @@ end
 ---Test/reload helper.
 function M.reset()
   payloads = {}
+  painted = {}
 end
 
 return M

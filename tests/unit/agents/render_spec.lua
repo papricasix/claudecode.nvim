@@ -27,6 +27,80 @@ describe("agents.render", function()
       expect(vim.api.nvim_buf_get_option(buf, "modifiable")).to_be(false)
       expect(vim.api.nvim_buf_get_option(buf, "swapfile") ~= true).to_be_true()
     end)
+
+    it("keeps no undo history, so polled repaints cannot accumulate", function()
+      expect(vim.api.nvim_buf_get_option(buf, "undolevels")).to_be(-1)
+    end)
+  end)
+
+  describe("paint", function()
+    local writes, set_lines
+
+    before_each(function()
+      writes = 0
+      set_lines = vim.api.nvim_buf_set_lines
+      vim.api.nvim_buf_set_lines = function(...)
+        writes = writes + 1
+        return set_lines(...)
+      end
+    end)
+
+    after_each(function()
+      vim.api.nvim_buf_set_lines = set_lines
+    end)
+
+    local function marks_for(hl)
+      return { { row = 0, col = 0, end_col = 1, hl = hl } }
+    end
+
+    it("switches undo off on buffers it did not create", function()
+      local other = vim.api.nvim_create_buf(false, true)
+      render.paint(other, { "x" }, {})
+      expect(vim.api.nvim_buf_get_option(other, "undolevels")).to_be(-1)
+    end)
+
+    it("skips a repaint that would change nothing", function()
+      render.paint(buf, { "a", "b" }, marks_for("Comment"))
+      render.paint(buf, { "a", "b" }, marks_for("Comment"))
+      expect(writes).to_be(1)
+    end)
+
+    it("repaints when a line or a mark changed", function()
+      render.paint(buf, { "a", "b" }, marks_for("Comment"))
+      render.paint(buf, { "a", "c" }, marks_for("Comment"))
+      render.paint(buf, { "a", "c" }, marks_for("String"))
+      expect(writes).to_be(3)
+    end)
+
+    it("repaints when a caller mutated and re-passed the same tables", function()
+      local lines, marks = { "a" }, marks_for("Comment")
+      render.paint(buf, lines, marks)
+      lines[1] = "b"
+      marks[1].hl = "String"
+      render.paint(buf, lines, marks)
+      expect(writes).to_be(2)
+    end)
+
+    it("repaints a buffer something else wrote to since", function()
+      render.paint(buf, { "a" }, {})
+      vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "scribbled" })
+      render.paint(buf, { "a" }, {})
+      expect(writes).to_be(3)
+      expect(lines_of(buf)[1]).to_be("a")
+    end)
+
+    it("still updates the row payloads on a skipped paint", function()
+      render.paint(buf, { "a" }, {}, { { id = 1 } })
+      render.paint(buf, { "a" }, {}, { { id = 2 } })
+      expect(render.payload_at(buf, 1).id).to_be(2)
+    end)
+
+    it("repaints after forget", function()
+      render.paint(buf, { "a" }, {})
+      render.forget(buf)
+      render.paint(buf, { "a" }, {})
+      expect(writes).to_be(2)
+    end)
   end)
 
   describe("terminal background", function()

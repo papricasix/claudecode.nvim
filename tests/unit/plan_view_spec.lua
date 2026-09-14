@@ -128,6 +128,8 @@ describe("plan_view", function()
       expect(vim.api.nvim_win_get_buf(1000)).to_be(buf)
       local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
       assert.are.same({ "# Plan", "first", "second" }, lines)
+      -- Rewritten from hook RPC, where Neovim never closes an undo block.
+      expect(vim.api.nvim_buf_get_option(buf, "undolevels")).to_be(-1)
     end)
 
     it("restores the displaced buffer and cursor when the plan resolves", function()

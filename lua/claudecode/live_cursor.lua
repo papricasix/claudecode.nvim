@@ -1313,6 +1313,10 @@ local function scratch_preview(file_path, lines)
     pcall(vim.api.nvim_buf_set_option, buf, "buftype", "nofile")
     pcall(vim.api.nvim_buf_set_option, buf, "bufhidden", "hide")
     pcall(vim.api.nvim_buf_set_option, buf, "swapfile", false)
+    -- Rewritten from hook RPC for every edit and never deleted. Outside a typed
+    -- command Neovim never closes an undo block, so each rewrite would keep a
+    -- copy of the whole previous file for the rest of the session.
+    pcall(vim.api.nvim_buf_set_option, buf, "undolevels", -1)
     state.diff_buf = buf
   end
   clear_unified(buf)

@@ -174,6 +174,9 @@ local function ensure_buf(markdown)
     pcall(vim.api.nvim_buf_set_option, buf, "buftype", "nofile")
     pcall(vim.api.nvim_buf_set_option, buf, "bufhidden", "hide")
     pcall(vim.api.nvim_buf_set_option, buf, "swapfile", false)
+    -- Reused for every plan and rewritten from hook RPC, where Neovim never closes
+    -- an undo block: each plan would otherwise be kept as undo until exit.
+    pcall(vim.api.nvim_buf_set_option, buf, "undolevels", -1)
     pcall(vim.api.nvim_set_option_value, "filetype", "markdown", { buf = buf })
     pcall(vim.api.nvim_buf_set_name, buf, "Claude plan")
     state.plan_buf = buf

@@ -308,6 +308,14 @@ local vim = {
         vim._buffers[bufnr] = { lines = {}, options = {} }
       end
       vim._buffers[bufnr].lines = replacement or {}
+      vim._buffers[bufnr].changedtick = (vim._buffers[bufnr].changedtick or 0) + 1
+    end,
+
+    nvim_buf_get_changedtick = function(bufnr)
+      if not vim._buffers[bufnr] then
+        error("Invalid buffer id: " .. tostring(bufnr))
+      end
+      return vim._buffers[bufnr].changedtick or 0
     end,
 
     nvim_buf_set_option = function(bufnr, name, value)
