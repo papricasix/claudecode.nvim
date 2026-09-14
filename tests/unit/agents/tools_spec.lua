@@ -27,6 +27,10 @@ describe("agents.tools", function()
       expect(tools.short(nil)).to_be("tool")
     end)
 
+    it("names Windows' PowerShell tool as the shell it is", function()
+      expect(tools.short("PowerShell")).to_be("pwsh")
+    end)
+
     it("names an MCP tool by its server", function()
       expect(tools.short("mcp__godot__send_debug_command")).to_be("godot")
     end)
@@ -42,6 +46,11 @@ describe("agents.tools", function()
 
     it("falls back to the command when there is no description", function()
       expect(tools.label("Bash", { command = "ls -la" })).to_be("ls -la")
+    end)
+
+    it("labels a PowerShell call the way it labels a Bash one", function()
+      expect(tools.label("PowerShell", { command = "cargo build", description = "Build" })).to_be("Build")
+      expect(tools.label("PowerShell", { command = "cargo build" })).to_be("cargo build")
     end)
 
     it("flattens a multi-line command onto one line", function()
@@ -130,6 +139,29 @@ describe("agents.tools", function()
       expect(text:find("warning: x", 1, true) ~= nil).to_be_true()
     end)
 
+    it("shows a PowerShell call as a command and its output, not as JSON", function()
+      -- Same result shape as Bash, CRLF line endings and all.
+      local body = tools.body("PowerShell", { command = "cargo build\nexit 0" }, {
+        stdout = "warning: unused\r\n   Finished `dev`\r\n",
+        stderr = "",
+        interrupted = false,
+        isImage = false,
+      })
+      expect(body.lines[1]).to_be("PS> cargo build")
+      expect(body.lines[2]).to_be("    exit 0")
+      expect(body.lines[3]).to_be("")
+      expect(body.lines[4]:find("stdout", 1, true) ~= nil).to_be_true()
+      expect(body.lines[5]).to_be("warning: unused")
+      expect(body.lines[6]).to_be("   Finished `dev`")
+      expect(body.filetype).to_be_nil()
+      expect(body.ansi).to_be_true()
+    end)
+
+    it("puts the PowerShell prompt on a running or refused call too", function()
+      expect(tools.body("PowerShell", { command = "Start-Sleep 30" }, nil).lines[1]).to_be("PS> Start-Sleep 30")
+      expect(tools.body("PowerShell", { command = "rm x" }, "declined").lines[1]).to_be("PS> rm x")
+    end)
+
     it("says so when a command printed nothing", function()
       local body = tools.body("Bash", { command = "true" }, { stdout = "", stderr = "" })
       expect(body.lines[#body.lines]).to_be("(no output)")
@@ -210,6 +242,16 @@ describe("agents.tools", function()
       -- The command as typed may be a path, and the pipeline's last stage is the
       -- one whose output this is.
       expect(tools.detect_filetype("rg foo | /usr/bin/head -3 x.md", { "# x" })).to_be("markdown")
+    end)
+
+    it("takes PowerShell's readers at their word as well, however they are spelled", function()
+      expect(tools.detect_filetype("Get-Content lua/x.lua", { "local M = {}" })).to_be("lua")
+      expect(tools.detect_filetype("gc -Raw config.json", { "{" })).to_be("json")
+      expect(tools.detect_filetype("type notes.md", { "# x" })).to_be("markdown")
+      -- A parameter's value is not the file.
+      expect(tools.detect_filetype("Get-Content -Tail 20 x.lua", { "end" })).to_be("lua")
+      expect(tools.detect_filetype("Get-Content -Path x.lua", { "end" })).to_be("lua")
+      expect(tools.detect_filetype("Get-Process | ConvertTo-Json", { "[" })).to_be("json")
     end)
 
     it("calls jq's output JSON unless it was asked for raw text", function()

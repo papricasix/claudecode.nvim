@@ -41,6 +41,15 @@ M.FILE_TOOLS = {
   NotebookRead = true,
 }
 
+--- Tools that run a command in a shell, and the prompt their command is shown
+--- under. On Windows the CLI offers `PowerShell` in place of `Bash`: the same
+--- input (`command`, `description`) and the same `{stdout, stderr}` result, so
+--- every rule for one is the rule for the other.
+local SHELLS = {
+  Bash = "$ ",
+  PowerShell = "PS> ",
+}
+
 --- The kind column is five cells wide (`added` is the longest file label), so a
 --- tool's name is shortened to fit rather than the column widened for the one MCP
 --- tool with a long name. Unlisted tools fall back to their first five characters,
@@ -50,6 +59,7 @@ M.SHORT = {
   Bash = "bash",
   BashOutput = "bash",
   KillShell = "bash",
+  PowerShell = "pwsh",
   Grep = "grep",
   Glob = "glob",
   WebFetch = "fetch",
@@ -239,6 +249,7 @@ local LABELS = {
   end,
 }
 LABELS.Agent = LABELS.Task
+LABELS.PowerShell = LABELS.Bash
 
 ---One line naming what a tool call was for.
 ---@param name string|nil Tool name as the CLI recorded it.
@@ -399,16 +410,21 @@ local function rule(label)
   return "── " .. label .. " " .. string.rep("─", math.max(0, 40 - #label))
 end
 
+---A shell call's command under its shell's prompt, continuation lines indented
+---to match; nothing for a tool that is not a shell.
+---@param tool string
 ---@param input table|nil
 ---@return string[]
-local function bash_command_lines(input)
+local function command_lines(tool, input)
+  local prompt = SHELLS[tool]
   local command = type(input) == "table" and input.command or nil
-  if type(command) ~= "string" or command == "" then
+  if not prompt or type(command) ~= "string" or command == "" then
     return {}
   end
+  local indent = string.rep(" ", #prompt)
   local lines = {}
   for index, line in ipairs(split_lines(command)) do
-    lines[#lines + 1] = (index == 1 and "$ " or "  ") .. line
+    lines[#lines + 1] = (index == 1 and prompt or indent) .. line
   end
   return lines
 end
@@ -433,6 +449,24 @@ local READERS = {
   tail = true,
   more = true,
   less = true,
+  -- PowerShell's, with its aliases (`cat` and `more` are aliases there too).
+  ["get-content"] = true,
+  gc = true,
+  type = true,
+}
+
+--- PowerShell reader parameters that take a value, which is not the file. A
+--- `Get-Content -Tail 20 x.lua` would otherwise be asked what `20` is.
+local VALUE_FLAGS = {
+  ["-tail"] = true,
+  ["-last"] = true,
+  ["-totalcount"] = true,
+  ["-head"] = true,
+  ["-first"] = true,
+  ["-encoding"] = true,
+  ["-delimiter"] = true,
+  ["-readcount"] = true,
+  ["-stream"] = true,
 }
 
 --- `jq` flags that print something other than JSON.
@@ -516,7 +550,10 @@ local function from_command(command)
     words[#words + 1] = (word:gsub("^['\"]", ""):gsub("['\"]$", ""))
   end
   -- The command as it was typed may be a path (`/usr/bin/cat`, `./scripts/x`).
+  -- PowerShell's names are case-insensitive, and `Get-Content` is how it is
+  -- usually spelled.
   local name = words[1] and words[1]:match("([^/\\]+)$") or nil
+  name = name and name:lower()
   if not name then
     return nil
   end
@@ -528,13 +565,19 @@ local function from_command(command)
     end
     return "json"
   end
+  if name == "convertto-json" then
+    return "json"
+  end
   if not READERS[name] then
     return nil
   end
-  for index = 2, #words do
-    if words[index]:sub(1, 1) ~= "-" then
-      return filetype_for_path(words[index])
+  local index = 2
+  while index <= #words do
+    local word = words[index]
+    if word:sub(1, 1) ~= "-" then
+      return filetype_for_path(word)
     end
+    index = index + (VALUE_FLAGS[word:lower()] and 2 or 1)
   end
   return nil
 end
@@ -554,10 +597,10 @@ end
 
 --- Per-tool bodies. Each returns the float's lines, and may name a filetype for
 --- them or ask for the ANSI pass. Falling through to nil means "pretty JSON".
----@type table<string, fun(input: table, result: any): { lines: string[], filetype: string?, ansi: boolean? }|nil>
+---@type table<string, fun(input: table, result: any, tool: string): { lines: string[], filetype: string?, ansi: boolean? }|nil>
 local BODIES = {
-  Bash = function(input, result)
-    local lines = bash_command_lines(input)
+  Bash = function(input, result, tool)
+    local lines = command_lines(tool or "Bash", input)
     if type(result) ~= "table" then
       return nil
     end
@@ -608,6 +651,7 @@ local BODIES = {
     return #lines > 0 and { lines = lines, filetype = "markdown" } or nil
   end,
 }
+BODIES.PowerShell = BODIES.Bash
 
 ---What a float shows for one tool call.
 ---@param name string|nil Tool name.
@@ -618,7 +662,7 @@ function M.body(name, input, result)
   local tool = type(name) == "string" and name or "tool"
 
   if result == nil then
-    local lines = tool == "Bash" and bash_command_lines(input) or {}
+    local lines = command_lines(tool, input)
     if #lines > 0 then
       lines[#lines + 1] = ""
     end
@@ -628,7 +672,7 @@ function M.body(name, input, result)
 
   local rule_fn = BODIES[tool]
   if rule_fn then
-    local rendered = rule_fn(input, result)
+    local rendered = rule_fn(input, result, tool)
     if rendered then
       return { lines = rendered.lines, filetype = rendered.filetype, ansi = rendered.ansi }
     end
@@ -637,7 +681,7 @@ function M.body(name, input, result)
   -- A rejected or errored call answers with a bare string, whatever the tool ran;
   -- so does `Grep` in its default mode. Shown as it is written.
   if type(result) == "string" then
-    local lines = tool == "Bash" and bash_command_lines(input) or {}
+    local lines = command_lines(tool, input)
     if #lines > 0 then
       lines[#lines + 1] = ""
     end
