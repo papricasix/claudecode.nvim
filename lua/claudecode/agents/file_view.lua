@@ -215,7 +215,12 @@ end
 local function open_text_diff(session_id, path, before, after, title, reuse)
   -- `vim.diff` is a Neovim built-in, so the answer is still a diff on a machine
   -- with no unified.nvim — just not an inline one.
-  local ok, text = pcall(vim.diff, table.concat(before, "\n") .. "\n", table.concat(after, "\n") .. "\n", {
+  -- An empty side is empty text, not one blank line: a deleted file would
+  -- otherwise read as replaced by a single empty line.
+  local function text_of(lines)
+    return #lines == 0 and "" or (table.concat(lines, "\n") .. "\n")
+  end
+  local ok, text = pcall(vim.diff, text_of(before), text_of(after), {
     result_type = "unified",
     ctxlen = 3,
   })
@@ -283,8 +288,18 @@ function M.open_against_head(opts, done)
   local name = vim.fn.fnamemodify(path, ":t")
   local lines = read_lines(path)
   if not lines then
-    vim.notify("ClaudeCode: " .. name .. " is not on disk", vim.log.levels.WARN)
-    return finish(nil)
+    -- Deleted: what HEAD holds is what was removed. The inline renderer needs
+    -- the file's own buffer, and a buffer on a missing path is one `:w` from
+    -- resurrecting it, so this is always shown as diff text.
+    require("claudecode.agents.git").file_at_head(path, function(head)
+      if not head then
+        vim.notify("ClaudeCode: " .. name .. " is not on disk", vim.log.levels.WARN)
+        return finish(nil)
+      end
+      local title = M.title(path, opts.cwd, "(deleted since HEAD)")
+      return finish(open_text_diff(opts.session_id, path, head, {}, title, opts.reuse))
+    end)
+    return
   end
 
   require("claudecode.agents.git").file_at_head(path, function(head)

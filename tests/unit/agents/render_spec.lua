@@ -446,6 +446,30 @@ describe("agents.render", function()
       expect(lines[2]:find("A", 1, true) ~= nil).to_be_true()
     end)
 
+    it("dims a deleted file's whole row and leaves the D standing out", function()
+      local changes = render.create_buf("changes")
+      render.changes(changes, {
+        { path = "/proj/gone.lua", status = "D", deleted = true, added = 40, removed = 0 },
+      }, { width = 40, cwd = "/proj" })
+
+      local line = lines_of(changes)[1]
+      expect(line:find("D", 1, true) ~= nil).to_be_true()
+      expect(line:find("+40", 1, true) ~= nil).to_be_true()
+      local groups = {}
+      for _, mark in ipairs(vim._extmarks or {}) do
+        if mark.bufnr == changes and mark.row == 0 and mark.opts.end_col then
+          groups[#groups + 1] = { text = line:sub(mark.col + 1, mark.opts.end_col), hl = mark.opts.hl_group }
+        end
+      end
+      -- One span from the path to the end of the counts, and nothing else: no
+      -- path colour, no count blocks, and the letter left alone.
+      expect(#groups).to_be(1)
+      expect(groups[1].hl).to_be("ClaudeCodeAgentsDeleted")
+      expect(groups[1].text:find("gone.lua", 1, true)).to_be(1)
+      expect(groups[1].text:find("+40", 1, true) ~= nil).to_be_true()
+      expect(groups[1].text:find("D", 1, true)).to_be_nil()
+    end)
+
     it("says so when the session changed nothing", function()
       local changes = render.create_buf("changes")
       render.changes(changes, {}, { width = 40 })

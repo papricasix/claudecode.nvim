@@ -7,6 +7,7 @@ describe("agents.model", function()
   local scans -- paths passed to transcript.summary, in order
   local live -- conversations the stubbed registry reports as running
   local git_calls
+  local git_result -- what the stubbed `git status` answers
   local scheduled -- pending scheduler callbacks
   local deleted -- transcripts the stubbed store was asked to remove
 
@@ -27,6 +28,7 @@ describe("agents.model", function()
 
   local function stub_modules()
     summaries, scans, live, git_calls, scheduled, deleted = {}, {}, {}, 0, {}, {}
+    git_result = {}
 
     package.loaded["claudecode.agents.transcript"] = {
       setup = function() end,
@@ -108,7 +110,7 @@ describe("agents.model", function()
     package.loaded["claudecode.agents.git"] = {
       status = function(_, _, cb)
         git_calls = git_calls + 1
-        cb({})
+        cb(git_result)
       end,
     }
   end
@@ -715,6 +717,86 @@ describe("agents.model", function()
       model.attach(1, "/proj")
       model.select("aaa")
       expect(model.selected_cwd()).to_be("/elsewhere")
+    end)
+
+    describe("a changed file that is no longer on disk", function()
+      local gone
+
+      before_each(function()
+        gone = {}
+        model._is_gone = function(path)
+          return gone[path] == true
+        end
+        summaries.aaa.files["/proj/scratch.lua"] = { added = 40, removed = 0, kind = "add", last_ts = 2 }
+        table.insert(summaries.aaa.order, "/proj/scratch.lua")
+        model.select("aaa")
+      end)
+
+      local function entry(path)
+        for _, e in ipairs(model.changes()) do
+          if e.path == path then
+            return e
+          end
+        end
+      end
+
+      it("is marked deleted even though git never tracked it", function()
+        -- Created and then removed by the session: git has nothing to say about
+        -- it, and the transcript alone still calls it an add.
+        gone["/proj/scratch.lua"] = true
+        model.refresh_git(true)
+
+        local e = entry("/proj/scratch.lua")
+        expect(e.deleted).to_be_true()
+        expect(e.status).to_be("D")
+        expect(e.added).to_be(40) -- the session's work still counts
+        expect(entry("/proj/a.lua").deleted).to_be_false()
+        expect(entry("/proj/a.lua").status).to_be("M")
+      end)
+
+      it("takes git's D for a tracked file", function()
+        git_result = { ["/proj/a.lua"] = "D" }
+        model.refresh_git(true)
+        expect(entry("/proj/a.lua").deleted).to_be_true()
+      end)
+
+      it("checks the disk with git turned off", function()
+        model.setup({ agents = { enabled = true, refresh_ms = 10, git = false } })
+        gone["/proj/scratch.lua"] = true
+        model.refresh_git(true)
+        expect(entry("/proj/scratch.lua").deleted).to_be_true()
+        expect(git_calls).to_be(0)
+      end)
+
+      it("is noticed when the conversation moves, whatever tool removed it", function()
+        -- A shell `rm` is not one of the editing tools, and polling reports no
+        -- tool at all: the transcript moving is the signal.
+        tick()
+        model._state().git_at = nil
+        local before = git_calls
+        gone["/proj/scratch.lua"] = true
+        summaries.aaa.last_ts = 200
+        model.note({ hook_event_name = "PostToolUse", tool_name = "Bash", session_id = "aaa" })
+        tick()
+
+        expect(git_calls).to_be(before + 1)
+        expect(entry("/proj/scratch.lua").deleted).to_be_true()
+      end)
+
+      it("asks once more when a request lands inside the rate gate", function()
+        model.refresh_git(true)
+        local before = git_calls
+        gone["/proj/scratch.lua"] = true
+        model.refresh_git()
+        expect(git_calls).to_be(before)
+        model.refresh_git() -- a second request inside the gate queues nothing more
+        expect(#scheduled).to_be(1)
+
+        model._state().git_at = nil
+        tick()
+        expect(git_calls).to_be(before + 1)
+        expect(entry("/proj/scratch.lua").deleted).to_be_true()
+      end)
     end)
   end)
 

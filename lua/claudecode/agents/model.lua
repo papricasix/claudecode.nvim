@@ -54,6 +54,7 @@ local function new_state()
     by_id = {}, ---@type table<string, table> Conversation id -> row.
     status = {}, ---@type table<string, table> Conversation id -> { state, tool, message, since }
     git = {}, ---@type table<string, string> Path -> status letter.
+    gone = {}, ---@type table<string, boolean> Path key -> no longer on disk.
     dirty = {},
     armed = false,
     ---@type table<string, fun()> Keyed by name, so re-registering replaces rather
@@ -1292,10 +1293,19 @@ function M.changes()
     return {}
   end
 
+  local utils = require("claudecode.utils")
   local entries = {}
   for _, path in ipairs(summary.order or {}) do
     local file = summary.files[path]
     if file and file.kind ~= "read" then
+      -- Keyed the way `git.parse_status` keys it: git answers with `/`
+      -- separators whatever the platform, and this path is the CLI's own.
+      local key = utils.path_key(path)
+      local letter = state.git[key]
+      -- Gone from disk is decided by us as well as by git: a file the session
+      -- created and then removed was never tracked, so git says nothing about it
+      -- and the transcript alone would still call it an add.
+      local deleted = letter == "D" or state.gone[key] == true
       -- Keyed by session as well as path: the same file under a different
       -- conversation is a different set of counts, and comparing across the two
       -- would flash the whole pane on every selection change.
@@ -1307,9 +1317,8 @@ function M.changes()
         added_age_ms = added_age,
         removed_age_ms = removed_age,
         kind = file.kind,
-        -- Keyed the way `git.parse_status` keys it: git answers with `/`
-        -- separators whatever the platform, and this path is the CLI's own.
-        status = state.git[require("claudecode.utils").path_key(path)] or (file.kind == "add" and "A" or "M"),
+        deleted = deleted,
+        status = deleted and "D" or letter or (file.kind == "add" and "A" or "M"),
       }
     end
   end
@@ -1522,9 +1531,17 @@ function M._flush()
   if dirty.transcript then
     local row = state.selected and state.by_id[state.selected]
     if row then
+      local last_ts = row.last_ts
       transcript.summary(row.path, function(summary)
         if summary then
           apply_summary(row, summary)
+          -- The conversation said something new, and any of it — a shell `rm`
+          -- included — may have changed the disk. Only the editing tools mark
+          -- git dirty from a hook, and polling marks nothing at all, so without
+          -- this a removed file kept its old letter until the selection moved.
+          if last_ts and row.last_ts ~= last_ts then
+            M.refresh_git()
+          end
           notify_change()
         end
       end)
@@ -1541,22 +1558,51 @@ function M._flush()
     end
   end
 
-  if dirty.git and opts().git ~= false then
+  if dirty.git then
     M.refresh_git()
   end
 
   notify_change()
 end
 
----Ask git for the status of the selected session's files.
+---Whether a path is known to be gone from disk.
+---
+---Only an explicit "no such file" counts: a stat that fails for any other reason
+---(permissions, a flaky network mount) says nothing about the file, and calling
+---it deleted would be a lie the pane then draws. Replaceable for tests.
+---@param path string
+---@return boolean
+function M._is_gone(path)
+  local uv = vim.loop
+  if not (uv and uv.fs_stat) then
+    return false
+  end
+  local stat, _, code = uv.fs_stat(path)
+  return stat == nil and code == "ENOENT"
+end
+
+---Ask what the selected session's files look like on disk now: whether each one
+---still exists, and git's letter for it.
+---
+---The existence check does not depend on git, so it runs with `git = false` too.
 ---@param force boolean|nil Skip the rate gate (a manual refresh).
 function M.refresh_git(force)
-  if opts().git == false or not state.cwd then
+  if not state.cwd then
     return
   end
   local now = os.time() * 1000
   local gate = opts().git_refresh_ms or 1500
   if not force and state.git_at and (now - state.git_at) < gate then
+    -- Answer once the gate opens rather than dropping the request: an edit and
+    -- the `rm` that follows it land well inside one gate, and nothing else would
+    -- ask again until the conversation next moved.
+    if not state.git_trailing then
+      state.git_trailing = true
+      M._scheduler(function()
+        state.git_trailing = false
+        M.refresh_git()
+      end, gate)
+    end
     return
   end
   state.git_at = now
@@ -1565,11 +1611,20 @@ function M.refresh_git(force)
   if #entries == 0 then
     return
   end
-  local paths = {}
+  local utils = require("claudecode.utils")
+  local paths, gone = {}, {}
   for _, entry in ipairs(entries) do
     paths[#paths + 1] = entry.path
+    if M._is_gone(entry.path) then
+      gone[utils.path_key(entry.path)] = true
+    end
   end
+  state.gone = gone
 
+  if opts().git == false then
+    notify_change()
+    return
+  end
   local ok, git = pcall(require, "claudecode.agents.git")
   if not ok then
     return

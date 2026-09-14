@@ -62,6 +62,7 @@ local DEFAULT_HIGHLIGHTS = {
   path = "ClaudeCodeAgentsPath",
   kind = "ClaudeCodeAgentsKind",
   stopped = "ClaudeCodeAgentsStopped",
+  deleted = "ClaudeCodeAgentsDeleted",
   failed = "ClaudeCodeAgentsFailed",
   float = "ClaudeCodeAgentsFloat",
   normal = "ClaudeCodeAgentsNormal",
@@ -87,6 +88,10 @@ local HIGHLIGHT_LINKS = {
   -- a tabline draws nothing at all for a tab with no Claude — but here those
   -- sessions are rows on screen, and they are the ones that should read quietest.
   ClaudeCodeAgentsStopped = "Comment",
+  -- A changed file that is no longer on disk. Its row stays — the session did
+  -- that work, and the counts still add up to the session's own — but it is
+  -- the quietest thing in the pane, with the `D` beside it saying why.
+  ClaudeCodeAgentsDeleted = "Comment",
   -- A tool call the CLI marked `is_error`. The one thing in the pane that is not
   -- a neutral record of work, so it borrows the editor's own error colour.
   ClaudeCodeAgentsFailed = "DiagnosticError",
@@ -598,7 +603,7 @@ end
 
 ---Draw the files the selected agent touched.
 ---@param buf integer
----@param entries table[] `{ path, status, added, removed }`
+---@param entries table[] `{ path, status, added, removed, deleted }`
 ---@param opts { cwd: string?, width: integer? }|nil
 function M.changes(buf, entries, opts)
   opts = opts or {}
@@ -627,8 +632,15 @@ function M.changes(buf, entries, opts)
     lines[#lines + 1] = line
     payload_map[index] = { kind = "file", path = entry.path, event_kind = entry.kind }
 
-    marks[#marks + 1] = { row = lnum, col = #head, end_col = #head + #name, hl = hl("path") }
-    push_spans(marks, lnum, counts_at, spans)
+    if entry.deleted then
+      -- Dimmed whole, counts included: their coloured blocks and flashes are for
+      -- work that is still in the tree. The letter keeps the pane's own colour,
+      -- so the one thing left standing out on the row is the `D`.
+      marks[#marks + 1] = { row = lnum, col = #head, end_col = #line, hl = hl("deleted") }
+    else
+      marks[#marks + 1] = { row = lnum, col = #head, end_col = #head + #name, hl = hl("path") }
+      push_spans(marks, lnum, counts_at, spans)
+    end
   end
 
   paint(buf, lines, marks, payload_map)

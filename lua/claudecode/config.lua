@@ -206,6 +206,9 @@ M.defaults = {
       -- The bullet of a session that is not running; defaults to a link to
       -- Comment. A running one keeps the pane's own colour instead.
       stopped = "ClaudeCodeAgentsStopped",
+      -- A changed file that is no longer on disk (drawn with a `D`); defaults to
+      -- a link to Comment.
+      deleted = "ClaudeCodeAgentsDeleted",
       float = "ClaudeCodeAgentsFloat", -- defaults to a link to FloatBorder
       -- Terminal pane background: follows SnacksNormal when snacks is loaded,
       -- else NormalFloat. The sidebars keep the editor's own Normal.
@@ -712,6 +715,7 @@ function M.validate(config)
         "path",
         "kind",
         "stopped",
+        "deleted",
         "failed",
         "float",
         "normal",

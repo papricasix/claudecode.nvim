@@ -512,6 +512,8 @@ opts = {
     --     stopped = "ClaudeCodeAgentsStopped",   -- Comment (the bullet of a session
     --                                            -- that is not running; a running
     --                                            -- one keeps the pane's own colour)
+    --     deleted = "ClaudeCodeAgentsDeleted",   -- Comment (a Changes row whose file
+    --                                            -- is no longer on disk, marked D)
     --     added = "ClaudeCodeAgentsAdded",       -- DiffAdd
     --     removed = "ClaudeCodeAgentsRemoved",   -- DiffDelete
     -- Only the *hue* is taken from these two groups: the +N/-N number and the

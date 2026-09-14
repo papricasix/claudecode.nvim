@@ -302,8 +302,27 @@ describe("agents.file_view", function()
       expect(float.count()).to_be(0)
     end)
 
-    it("opens nothing for a file that is not on disk", function()
-      head["/proj/gone.lua"] = { "one" }
+    it("shows a deleted file as everything HEAD held, removed", function()
+      install_unified()
+      head["/proj/gone.lua"] = { "one", "two" }
+
+      expect(open_head("/proj/gone.lua")).not_to_be_nil()
+      -- Never the inline renderer: that needs a buffer on the missing path.
+      expect(#shown).to_be(0)
+      local lines = vim.api.nvim_buf_get_lines(float_buf(), 0, -1, false)
+      local removed, added = 0, 0
+      for _, line in ipairs(lines) do
+        if line:match("^%-[^%-]") then
+          removed = removed + 1
+        elseif line:match("^%+[^%+]") or line == "+" then
+          added = added + 1
+        end
+      end
+      expect(removed).to_be(2)
+      expect(added).to_be(0)
+    end)
+
+    it("opens nothing for a file that is neither on disk nor in HEAD", function()
       expect(open_head("/proj/gone.lua")).to_be_nil()
       expect(float.count()).to_be(0)
     end)
