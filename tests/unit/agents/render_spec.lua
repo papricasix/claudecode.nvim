@@ -580,7 +580,7 @@ describe("agents.render", function()
       expect(render.payload_at(pane, 2).agent_id).to_be("b")
     end)
 
-    it("names a run by its description on request, cut with an ellipsis to fit", function()
+    it("names a run by its description, cut with an ellipsis to fit, or by its type on request", function()
       local rows = {
         {
           id = "a",
@@ -593,7 +593,7 @@ describe("agents.render", function()
         },
         { id = "b", agent_type = "Explore", description = "", prefix = "└─", state = "running", runtime_s = 3 },
       }
-      render.subagents(pane, rows, { width = 40, label = "description" })
+      render.subagents(pane, rows, { width = 40 })
       local lines = lines_of(pane)
       -- 40 cells: gutter, glyph and space (3), the name (23), a gap, the numbers (13).
       expect(lines[1]).to_be(" ✓ Custom components comp…  167k   13:50")
@@ -601,7 +601,7 @@ describe("agents.render", function()
       -- No description to show: the type stands in rather than a blank.
       expect(lines[2]:find("└─● Explore", 1, true) ~= nil).to_be_true()
 
-      render.subagents(pane, rows, { width = 40 })
+      render.subagents(pane, rows, { width = 40, label = "type" })
       expect(lines_of(pane)[1]:find("✓ general-purpose", 1, true) ~= nil).to_be_true()
     end)
 

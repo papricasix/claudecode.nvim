@@ -95,9 +95,11 @@ local function new_state()
     -- with the view, like the sort criterion — it is a way of reading the list,
     -- not a setting about it.
     feed_filter = "all",
-    -- What names a row in the Subagents pane: "type" | "description". A way of
+    -- What names a row in the Subagents pane: "description" | "type". A way of
     -- reading the pane, so it lives and dies with the view like the filter.
-    subagent_label = "type",
+    -- What a run was sent to do by default: several `general-purpose` rows are
+    -- told apart only by it.
+    subagent_label = "description",
   }
 end
 
@@ -358,7 +360,7 @@ function M.detach()
   state.window = nil
   state.pinned = {}
   state.hidden = 0
-  state.subagent_label = "type"
+  state.subagent_label = "description"
 end
 
 ---@return string|nil
@@ -1363,11 +1365,11 @@ function M.subagent_label()
   return state.subagent_label
 end
 
----Switch the Subagents pane between agent types and descriptions.
+---Switch the Subagents pane between descriptions and agent types.
 ---
----Both answer a glance at the pane, just different ones: the type says what kind
----of worker it is, the description what it was sent to do — and three rows of
----`general-purpose` are told apart only by the second.
+---Both answer a glance at the pane, just different ones: the description says
+---what a run was sent to do, the type what kind of worker it is — and three rows
+---of `general-purpose` are told apart only by the first, hence the default.
 ---@return "type"|"description" label The one now in force.
 function M.toggle_subagent_label()
   state.subagent_label = state.subagent_label == "description" and "type" or "description"

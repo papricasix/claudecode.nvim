@@ -748,8 +748,8 @@ local SUBAGENT_MARK = {
 ---right edge what it cost and how long it ran. A run that has ended is drawn
 ---quietly — the working ones are what the pane is glanced at for.
 ---
----The name is the agent type or, with `label = "description"`, what the run was
----sent to do (falling back to the type when it has none). Either is cut with an
+---The name is what the run was sent to do (falling back to the type when it has
+---none) or, with `label = "type"`, the agent type. Either is cut with an
 ---ellipsis to whatever the tree and the numbers leave: a description is a
 ---sentence and the pane is a sidebar, and a name running under the numbers would
 ---push them past the window edge, where Neovim cuts without saying so.
@@ -783,7 +783,7 @@ function M.subagents(buf, rows, opts)
     local head = GUTTER .. row.prefix .. mark.text .. " "
     local room = math.max(1, width - vim.fn.strdisplaywidth(head) - vim.fn.strdisplaywidth(right) - 1)
     local text = row.agent_type or "agent"
-    if opts.label == "description" and type(row.description) == "string" then
+    if opts.label ~= "type" and type(row.description) == "string" then
       -- One line, whatever the launching call wrote.
       local described = row.description:gsub("%s+", " "):gsub("^ ", ""):gsub(" $", "")
       if described ~= "" then

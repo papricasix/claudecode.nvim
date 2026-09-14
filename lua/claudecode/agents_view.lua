@@ -387,13 +387,19 @@ local function apply_marker(win, label)
   utils.set_win_option(win, "winbar", "%#" .. group .. "#%=" .. safe .. "%=")
 end
 
----The Subagents pane's winbar, which also says what its rows are named by: the
----two readings look alike at a glance (a short name either way), and nothing
----else on screen says which one is in force.
+---What names a Subagents row right now: what each run was sent to do, unless
+---switched to agent types with `g.`.
+---@return "description"|"type"
+local function subagent_label()
+  return model.subagent_label and model.subagent_label() or "description"
+end
+
+---The Subagents pane's winbar. The default reading needs no word; the other one
+---says so, since a short type name and a cut-down description look alike at a
+---glance and nothing else on screen says which is in force.
 ---@return string
 local function subagents_title()
-  local label = model.subagent_label and model.subagent_label() or "type"
-  return label == "description" and "Subagents · what for" or "Subagents"
+  return subagent_label() == "type" and "Subagents · type" or "Subagents"
 end
 
 ---The pane sizes the config asks for, in cells.
@@ -699,7 +705,7 @@ local KEY_SPECS = {
     field = "subagent_label",
     panes = { "subagents" },
     group = "Subagents",
-    desc = "Name each subagent by its agent type / by what it was sent to do",
+    desc = "Name each subagent by what it was sent to do / by its agent type",
     run = function()
       M.toggle_subagent_label()
     end,
@@ -1966,7 +1972,7 @@ function M.redraw()
   if subagents_win and state.bufs.subagents then
     render.subagents(state.bufs.subagents, model.subagents(), {
       width = vim.api.nvim_win_get_width(subagents_win),
-      label = model.subagent_label and model.subagent_label() or "type",
+      label = subagent_label(),
     })
   end
 
