@@ -387,6 +387,15 @@ local function apply_marker(win, label)
   utils.set_win_option(win, "winbar", "%#" .. group .. "#%=" .. safe .. "%=")
 end
 
+---The Subagents pane's winbar, which also says what its rows are named by: the
+---two readings look alike at a glance (a short name either way), and nothing
+---else on screen says which one is in force.
+---@return string
+local function subagents_title()
+  local label = model.subagent_label and model.subagent_label() or "type"
+  return label == "description" and "Subagents · what for" or "Subagents"
+end
+
 ---The pane sizes the config asks for, in cells.
 ---
 ---One place, because a fresh build and a `VimResized` must agree: the defaults
@@ -473,7 +482,7 @@ local function build_layout()
   apply_marker(state.wins.sessions, "Sessions")
   apply_marker(state.wins.feed, "Activity")
   apply_marker(state.wins.changes, "Changes")
-  apply_marker(state.wins.subagents, "Subagents")
+  apply_marker(state.wins.subagents, subagents_title())
 
   -- Sized last, after the buffers, the tags and the winbars are in place: doing
   -- it between the splits leaves Neovim free to redistribute afterwards, and it
@@ -684,6 +693,15 @@ local KEY_SPECS = {
     desc = "Show everything / only files / only commands",
     run = function()
       M.cycle_feed_filter()
+    end,
+  },
+  {
+    field = "subagent_label",
+    panes = { "subagents" },
+    group = "Subagents",
+    desc = "Name each subagent by its agent type / by what it was sent to do",
+    run = function()
+      M.toggle_subagent_label()
     end,
   },
   {
@@ -1948,6 +1966,7 @@ function M.redraw()
   if subagents_win and state.bufs.subagents then
     render.subagents(state.bufs.subagents, model.subagents(), {
       width = vim.api.nvim_win_get_width(subagents_win),
+      label = model.subagent_label and model.subagent_label() or "type",
     })
   end
 
@@ -2804,6 +2823,17 @@ function M.cycle_feed_filter()
   local filter = model.cycle_feed_filter()
   M.redraw()
   vim.notify("ClaudeCode: activity — " .. filter.desc, vim.log.levels.INFO)
+end
+
+---Switch the Subagents pane between agent types and descriptions. The winbar says
+---which is showing, so no message is needed.
+function M.toggle_subagent_label()
+  model.toggle_subagent_label()
+  local win = pane_win("subagents")
+  if win then
+    apply_marker(win, subagents_title())
+  end
+  M.redraw()
 end
 
 ---Open a path in a new tabpage, on `line` when there is one.

@@ -687,6 +687,15 @@ describe("agents.model", function()
         expect(#model.feed()).to_be(4)
       end)
 
+      it("names subagents by type until switched, and forgets the switch with the view", function()
+        expect(model.subagent_label()).to_be("type")
+        expect(model.toggle_subagent_label()).to_be("description")
+        expect(model.toggle_subagent_label()).to_be("type")
+        model.toggle_subagent_label()
+        model.detach()
+        expect(model.subagent_label()).to_be("type")
+      end)
+
       it("fills the pane from the whole history, not from the last few events", function()
         -- Slicing to the limit first and filtering after would show a short list
         -- of whatever happened to be at the end — with a filter on, the rows that

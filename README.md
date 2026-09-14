@@ -309,7 +309,7 @@ there too.
 - The view **opens already pointed at your newest session**, as though you had
   pressed `<C-n>` once — so `i` from any pane starts that one, and nothing has to
   be chosen before the panes have something to show.
-- The **Subagents** pane, under Changes, shows the subagents the selected session started as a tree — a nested subagent under the one that launched it — with each one's agent type, tokens used and runtime. A running one is marked `●` and its runtime counts up; one that finished is marked `✓` (with the tokens and duration the CLI reported), one that failed `✗`, and one that was stopped or abandoned `⊘`. Everything comes from the CLI's own per-subagent transcripts, so it works for conversations that ran anywhere.
+- The **Subagents** pane, under Changes, shows the subagents the selected session started as a tree — a nested subagent under the one that launched it — with each one's agent type, tokens used and runtime. A running one is marked `●` and its runtime counts up; one that finished is marked `✓` (with the tokens and duration the CLI reported), one that failed `✗`, and one that was stopped or abandoned `⊘`. Everything comes from the CLI's own per-subagent transcripts, so it works for conversations that ran anywhere. `g.` switches the rows between the agent type and what each subagent was sent to do (its description), cut with `…` to fit the pane; the pane's title says which is showing.
 - The Activity pane lists the selected agent's tool calls **newest first**, so
   what it is doing now is at the top rather than scrolled off the bottom.
 - It lists **everything the agent did**, not only its file work: the shell
@@ -492,6 +492,7 @@ opts = {
       sort = "gs",                -- choose what the list is ordered by
       close = "q", open = "<CR>", git_diff = ".", goto_file = "gf", help = "?",
       filter = "f",               -- Activity: everything / files / commands
+      subagent_label = "g.",      -- Subagents: agent type / description
       next_pane = "<Tab>", focus_term = "i",
       -- Cycle the selected session from any pane, and from inside the agent's
       -- terminal (bound there in terminal mode too). Inside a file float the same

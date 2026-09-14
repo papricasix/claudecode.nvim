@@ -1349,6 +1349,13 @@ describe("agents_view", function()
       )
     end)
 
+    it("offers the subagent naming toggle in the Subagents pane alone", function()
+      setup_with({ enabled = true })
+      expect(keys_for("subagents")["g."]).to_be_string()
+      expect(keys_for("feed")["g."]).to_be(nil)
+      expect(keys_for("sessions")["g."]).to_be(nil)
+    end)
+
     it("offers the activity filter only where there are two kinds of row", function()
       setup_with({ enabled = true })
       expect(keys_for("feed")["f"]).to_be_string()

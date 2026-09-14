@@ -95,6 +95,9 @@ local function new_state()
     -- with the view, like the sort criterion — it is a way of reading the list,
     -- not a setting about it.
     feed_filter = "all",
+    -- What names a row in the Subagents pane: "type" | "description". A way of
+    -- reading the pane, so it lives and dies with the view like the filter.
+    subagent_label = "type",
   }
 end
 
@@ -355,6 +358,7 @@ function M.detach()
   state.window = nil
   state.pinned = {}
   state.hidden = 0
+  state.subagent_label = "type"
 end
 
 ---@return string|nil
@@ -1351,6 +1355,23 @@ function M.subagents()
   end
   state.subagents_running = running
   return rows
+end
+
+---What names a row in the Subagents pane.
+---@return "type"|"description"
+function M.subagent_label()
+  return state.subagent_label
+end
+
+---Switch the Subagents pane between agent types and descriptions.
+---
+---Both answer a glance at the pane, just different ones: the type says what kind
+---of worker it is, the description what it was sent to do — and three rows of
+---`general-purpose` are told apart only by the second.
+---@return "type"|"description" label The one now in force.
+function M.toggle_subagent_label()
+  state.subagent_label = state.subagent_label == "description" and "type" or "description"
+  return state.subagent_label
 end
 
 ---Fold the selected session's subagent transcripts, repainting when one grew.

@@ -580,6 +580,47 @@ describe("agents.render", function()
       expect(render.payload_at(pane, 2).agent_id).to_be("b")
     end)
 
+    it("names a run by its description on request, cut with an ellipsis to fit", function()
+      local rows = {
+        {
+          id = "a",
+          agent_type = "general-purpose",
+          description = "Custom components\ncompat with 2026.9",
+          prefix = "",
+          state = "done",
+          tokens = 167410,
+          runtime_s = 830,
+        },
+        { id = "b", agent_type = "Explore", description = "", prefix = "└─", state = "running", runtime_s = 3 },
+      }
+      render.subagents(pane, rows, { width = 40, label = "description" })
+      local lines = lines_of(pane)
+      -- 40 cells: gutter, glyph and space (3), the name (23), a gap, the numbers (13).
+      expect(lines[1]).to_be(" ✓ Custom components comp…  167k   13:50")
+      expect(vim.fn.strdisplaywidth(lines[1])).to_be(40)
+      -- No description to show: the type stands in rather than a blank.
+      expect(lines[2]:find("└─● Explore", 1, true) ~= nil).to_be_true()
+
+      render.subagents(pane, rows, { width = 40 })
+      expect(lines_of(pane)[1]:find("✓ general-purpose", 1, true) ~= nil).to_be_true()
+    end)
+
+    it("keeps the numbers inside a pane too narrow for any name", function()
+      render.subagents(pane, {
+        {
+          id = "a",
+          agent_type = "general-purpose",
+          prefix = "│ └─",
+          state = "done",
+          tokens = 1000,
+          runtime_s = 1,
+        },
+      }, { width = 22 })
+      local line = lines_of(pane)[1]
+      expect(vim.fn.strdisplaywidth(line)).to_be(22)
+      expect(line:find("…", 1, true) ~= nil).to_be_true()
+    end)
+
     it("says so when the session started none", function()
       render.subagents(pane, {}, { width = 30 })
       expect(lines_of(pane)[1]:find("no subagents", 1, true) ~= nil).to_be_true()

@@ -187,6 +187,7 @@ M.defaults = {
       git_diff = ".", -- diff that file against git HEAD instead of against the session
       goto_file = "gf", -- open the file itself, on disk, in a new tab
       filter = "f", -- Activity pane: everything / only files / only commands
+      subagent_label = "g.", -- Subagents pane: name each run by its agent type / by its description
       help = "?", -- show the keys that reach the pane you are in
       next_pane = "<Tab>",
       focus_term = "i",
@@ -693,6 +694,7 @@ function M.validate(config)
         "git_diff",
         "goto_file",
         "filter",
+        "subagent_label",
         "help",
         "next_pane",
         "focus_term",
