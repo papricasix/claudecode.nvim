@@ -227,6 +227,64 @@ describe("agents.subagent_view", function()
       expect(links[at]).to_be("child1")
     end)
 
+    it("records the call behind each tool line, so <CR> can open it", function()
+      local doc = fold({
+        user("go"),
+        assistant({ { type = "tool_use", id = "t1", name = "Read", input = { file_path = "/proj/a.lua" } } }),
+        result("t1", "", { type = "text", file = { filePath = "/proj/a.lua", startLine = 10, numLines = 5 } }),
+        assistant({
+          { type = "tool_use", id = "t2", name = "Bash", input = { command = "false", description = "Fail" } },
+        }),
+        result("t2", "Exit code 1", nil, true),
+      })
+      local lines, _, _, _, calls = view.render(doc, ctx())
+      local read_line, bash_line
+      for index, line in ipairs(lines) do
+        if line:find("`read`", 1, true) then
+          read_line = index
+        elseif line:find("`bash`", 1, true) then
+          bash_line = index
+        end
+      end
+      expect(calls[read_line].path).to_be("/proj/a.lua")
+      expect(calls[read_line].read.start_line).to_be(10)
+      expect(calls[bash_line].tool_id).to_be("t2")
+      expect(calls[bash_line].status).to_be("error")
+    end)
+
+    it("opens a call the way the Activity pane opens its row", function()
+      local opened = {}
+      package.loaded["claudecode.agents.file_view"] = {
+        open = function(opts)
+          opened[#opened + 1] = { kind = "file", opts = opts }
+        end,
+      }
+      package.loaded["claudecode.agents.tool_view"] = {
+        open = function(opts)
+          opened[#opened + 1] = { kind = "tool", opts = opts }
+        end,
+      }
+      local run = { path = "/store/sess/subagents/agent-a.jsonl", cwd = "/proj" }
+      view.open_call(
+        "s1",
+        run,
+        { tool_id = "t1", tool = "Read", path = "/proj/a.lua", read = { start_line = 10, num_lines = 5 } }
+      )
+      view.open_call("s1", run, { tool_id = "t2", tool = "Bash", label = "Fail", status = "error" })
+      view.open_call("s1", run, { tool_id = "t3", tool = "Edit", path = "/proj/b.lua", status = "done" })
+      package.loaded["claudecode.agents.file_view"] = nil
+      package.loaded["claudecode.agents.tool_view"] = nil
+
+      expect(opened[1].kind).to_be("file")
+      expect(opened[1].opts.transcript).to_be(run.path)
+      expect(opened[1].opts.prefer).to_be("read")
+      expect(opened[2].kind).to_be("tool")
+      expect(opened[2].opts.tool_id).to_be("t2")
+      expect(opened[2].opts.status).to_be("error")
+      expect(opened[3].kind).to_be("file")
+      expect(opened[3].opts.prefer).to_be("diff")
+    end)
+
     it("cuts a long command to one line with an ellipsis", function()
       local doc = fold({
         user("go"),

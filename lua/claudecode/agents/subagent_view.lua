@@ -128,7 +128,16 @@ function M.summarize_result(block, result)
       return { status = "done", summary = ("+%d -%d"):format(added, removed) }
     end
     if type(result.file) == "table" and tonumber(result.file.numLines) then
-      return { status = "done", summary = plural(tonumber(result.file.numLines), "line") }
+      return {
+        status = "done",
+        summary = plural(tonumber(result.file.numLines), "line"),
+        -- The window it read, which the file float marks the way the Activity
+        -- pane's read row does.
+        read = tonumber(result.file.startLine) and {
+          start_line = tonumber(result.file.startLine),
+          num_lines = tonumber(result.file.numLines),
+        } or nil,
+      }
     end
     if tonumber(result.totalTokens) then
       return { status = "done", summary = subagents.format_tokens(tonumber(result.totalTokens)) .. " tokens" }
@@ -318,9 +327,11 @@ end
 ---@return table[] marks `{ row, col, end_col, hl }`, 0-based.
 ---@return table<integer, string> links 1-based line -> agent id it opens.
 ---@return { [1]: integer, [2]: integer }[] folds 1-based inclusive ranges, closed by default.
+---@return table<integer, table> calls 1-based line -> the tool call on it
+---        `{ tool_id, tool, label, path, read, status }`, what `<CR>` opens.
 function M.render(doc, ctx)
   local row = ctx.row or {}
-  local lines, marks, links, folds = {}, {}, {}, {}
+  local lines, marks, links, folds, calls = {}, {}, {}, {}, {}
   local function add(line)
     lines[#lines + 1] = line
   end
@@ -420,6 +431,18 @@ function M.render(doc, ctx)
       glyph_mark(glyph, 2)
       if child then
         links[#lines] = child.id
+      elseif item.id then
+        -- Everything the Activity pane's row for this call would carry, so `<CR>`
+        -- can open the same float it opens.
+        local result = doc.results[item.id]
+        calls[#lines] = {
+          tool_id = item.id,
+          tool = item.name,
+          label = item.label,
+          path = item.path,
+          read = result and result.read or nil,
+          status = result and result.status or nil,
+        }
       end
     elseif item.kind == "note" then
       local target = ctx.by_id[item.id]
@@ -439,7 +462,7 @@ function M.render(doc, ctx)
     previous = item
   end
 
-  return lines, marks, links, folds
+  return lines, marks, links, folds, calls
 end
 
 ---The float's border title: type, state and cost, which fit a border; the
@@ -513,8 +536,10 @@ end
 ---@param view table
 local function paint(buf, view)
   local ctx = context(view.session_path, view.agent_id, view.opts.row_for, view.opts.history)
-  local lines, marks, links, folds = M.render(view.doc, ctx)
+  local lines, marks, links, folds, calls = M.render(view.doc, ctx)
   view.links = links
+  view.calls = calls
+  view.cwd = ctx.cwd
 
   local old = view.lines or {}
   local first = 1
@@ -659,6 +684,47 @@ local function forget(buf)
   end
 end
 
+--- The Activity pane's status words, which `tool_view` titles by. A call that
+--- worked says nothing there, so `done` has no word.
+local TOOL_VIEW_STATUS = { error = "error", rejected = "rejected", interrupted = "interrupted" }
+
+---Open one of a run's tool calls the way the Activity pane opens its row: a file
+---tool as what the run did to that file, anything else as the call and its output.
+---
+---Read out of the run's own transcript, which is the same format the pane reads a
+---session from. A new float, stacked over this one, so `q` comes back here.
+---@param session_id string|nil
+---@param view table The viewer the call was chosen in.
+---@param call { tool_id: string, tool: string, label: string?, path: string?, read: table?, status: string? }
+function M.open_call(session_id, view, call)
+  if tools.FILE_TOOLS[call.tool] and call.path then
+    local ok, file_view = pcall(require, "claudecode.agents.file_view")
+    if ok then
+      local read = call.tool == "Read" and call.read or nil
+      file_view.open({
+        session_id = session_id,
+        transcript = view.path,
+        path = call.path,
+        read = read,
+        prefer = read and "read" or "diff",
+        cwd = view.cwd,
+      })
+    end
+    return
+  end
+  local ok, tool_view = pcall(require, "claudecode.agents.tool_view")
+  if ok then
+    tool_view.open({
+      session_id = session_id,
+      transcript = view.path,
+      tool_id = call.tool_id,
+      tool = call.tool,
+      label = call.label,
+      status = call.status and TOOL_VIEW_STATUS[call.status] or (call.status == nil and "running" or nil),
+    })
+  end
+end
+
 --- Injectable: specs drive the follow tick by hand.
 M._new_timer = function()
   return vim.loop and vim.loop.new_timer and vim.loop.new_timer() or nil
@@ -729,12 +795,17 @@ function M.open(opts, done)
     end,
   })
 
-  -- A subagent line opens that run here, in the same float.
+  -- A subagent line opens that run here, in the same float; a tool line opens what
+  -- the Activity pane opens for that call, in a float of its own on top.
   pcall(vim.keymap.set, "n", "<CR>", function()
     local current = views[buf]
     local lnum = vim.api.nvim_win_get_cursor(0)[1]
     local target = current and current.links and current.links[lnum]
     if not target then
+      local call = current and current.calls and current.calls[lnum]
+      if call then
+        M.open_call(opts.session_id, current, call)
+      end
       return
     end
     -- Remember where this run was left, so `<BS>` from the child lands back on
