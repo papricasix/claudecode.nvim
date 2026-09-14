@@ -702,6 +702,15 @@ local KEY_SPECS = {
     end,
   },
   {
+    field = "open",
+    panes = { "subagents" },
+    group = "Subagents",
+    desc = "Read its transcript: what it was sent to do, said and ran (<CR> on a subagent in it opens that one)",
+    run = function()
+      M.open_under_cursor()
+    end,
+  },
+  {
     field = "subagent_label",
     panes = { "subagents" },
     group = "Subagents",
@@ -2566,7 +2575,8 @@ local function next_open_row(pane, lnum, delta, action)
   for step = 1, count do
     local candidate = ((lnum - 1 + delta * step) % count) + 1
     local payload = render.payload_at(buf, candidate)
-    local openable = payload and (payload.path or (payload.kind == "tool" and action ~= "head"))
+    local openable = payload
+      and (payload.path or ((payload.kind == "tool" or payload.kind == "subagent") and action ~= "head"))
     if openable then
       return candidate
     end
@@ -2738,6 +2748,42 @@ function open_row(payload, pane, lnum, action, nav_opts)
       label = payload.label,
       status = payload.status,
       reuse = nav_opts.reuse,
+    }, opened)
+    return
+  end
+
+  -- A subagent run: its transcript, rendered. `<CR>` on one of its own subagents
+  -- swaps that one into the same float, and the stepping keys are rebound there.
+  if payload and payload.kind == "subagent" then
+    if action ~= "diff" then
+      return opened(nil)
+    end
+    local ok_sub, subagent_view = pcall(require, "claudecode.agents.subagent_view")
+    local session_path = model.transcript_path()
+    if not ok_sub or not session_path then
+      return opened(nil)
+    end
+    subagent_view.open({
+      session_id = model.selected(),
+      session_path = session_path,
+      agent_id = payload.agent_id,
+      reuse = nav_opts.reuse,
+      -- The pane's rows know whether the session is live; a row the selection has
+      -- moved away from is left for the viewer to work out from the files.
+      row_for = function(id)
+        if model.transcript_path() ~= session_path then
+          return nil
+        end
+        for _, row in ipairs(model.subagents()) do
+          if row.id == id then
+            return row
+          end
+        end
+        return nil
+      end,
+      on_open = function(win)
+        bind_float_nav(win, pane, lnum, action)
+      end,
     }, opened)
     return
   end

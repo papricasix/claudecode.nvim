@@ -66,6 +66,7 @@ M.INTERRUPT_MARKER = "[Request interrupted by user"
 --- like any other as far as the JSON goes, but the agent did nothing wrong, so
 --- the pane says so differently.
 local REJECTION_MARKER = "The user doesn't want to proceed with this tool use"
+M.REJECTION_MARKER = REJECTION_MARKER
 
 --- The tools that start a subagent. `Task` is the name older CLIs used.
 local AGENT_TOOLS = { Agent = true, Task = true }
