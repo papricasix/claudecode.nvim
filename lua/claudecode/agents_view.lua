@@ -3,8 +3,9 @@
 ---
 ---   ┌───────────┬──────────────────────────┬───────────────┐
 ---   │ Changes   │  the selected agent's    │ Sessions      │
----   │ (files it │  Claude terminal         ├───────────────┤
----   │  touched) │                          │ Activity      │
+---   │ (files it │  Claude terminal         │               │
+---   ├───────────┤                          ├───────────────┤
+---   │ Subagents │                          │ Activity      │
 ---   └───────────┴──────────────────────────┴───────────────┘
 ---
 --- The question it answers is one nothing else can: with several conversations
@@ -62,7 +63,7 @@ local state = {
   --- Last pane sizes seen while the tab held nothing but the four panes. What a
   --- foreign split disturbs is restored from here rather than recomputed, so a
   --- size the user set by hand survives one.
-  sizes = nil, ---@type { left: integer, right: integer, sessions: integer }|nil
+  sizes = nil, ---@type { left: integer, right: integer, sessions: integer, changes: integer }|nil
   --- Set between a window closing in this tab and the sizes being put back.
   --- Without it a redraw landing in that gap would snapshot the very sizes the
   --- close disturbed — the layout is already "clean" by then, the foreign window
@@ -101,7 +102,7 @@ local restored = nil
 --- `close_for_session`). Consumed once.
 local pending_capture = nil
 
-local PANES = { "center", "sessions", "feed", "changes" }
+local PANES = { "center", "sessions", "feed", "changes", "subagents" }
 
 --- How often `redraw` re-snapshots the pane sizes. The autocmds are what
 --- normally catch a change; this is the backstop for a programmatic resize that
@@ -437,6 +438,9 @@ local function build_layout()
 
   pcall(vim.cmd, "topleft " .. left_width .. "vsplit")
   state.wins.changes = vim.api.nvim_get_current_win()
+  -- Split like the right column, so the two dividers line up across the screen.
+  pcall(vim.cmd, "belowright split")
+  state.wins.subagents = vim.api.nvim_get_current_win()
 
   pcall(vim.api.nvim_set_current_win, center)
   pcall(vim.cmd, "botright " .. right_width .. "vsplit")
@@ -445,12 +449,12 @@ local function build_layout()
   pcall(vim.cmd, "belowright split")
   state.wins.feed = vim.api.nvim_get_current_win()
 
-  for _, pane in ipairs({ "sessions", "feed", "changes" }) do
+  for _, pane in ipairs({ "sessions", "feed", "changes", "subagents" }) do
     -- Reuse the pane's buffer when there is one: a rebuild after a window was
     -- lost must not throw away what the pane already had drawn in it.
     local buf = state.bufs[pane]
     if not buf or not vim.api.nvim_buf_is_valid(buf) then
-      buf = render.create_buf(pane == "changes" and "changes" or pane)
+      buf = render.create_buf(pane)
       if not buf then
         return false
       end
@@ -469,6 +473,7 @@ local function build_layout()
   apply_marker(state.wins.sessions, "Sessions")
   apply_marker(state.wins.feed, "Activity")
   apply_marker(state.wins.changes, "Changes")
+  apply_marker(state.wins.subagents, "Subagents")
 
   -- Sized last, after the buffers, the tags and the winbars are in place: doing
   -- it between the splits leaves Neovim free to redistribute afterwards, and it
@@ -478,9 +483,10 @@ local function build_layout()
   pcall(vim.api.nvim_win_set_width, state.wins.changes, left_width)
   pcall(vim.api.nvim_win_set_width, state.wins.sessions, right_width)
   pcall(vim.api.nvim_win_set_height, state.wins.sessions, sessions_height)
+  pcall(vim.api.nvim_win_set_height, state.wins.changes, sessions_height)
   -- The baseline a foreign split is measured against, replaced by any later
   -- deliberate resize.
-  state.sizes = { left = left_width, right = right_width, sessions = sessions_height }
+  state.sizes = { left = left_width, right = right_width, sessions = sessions_height, changes = sessions_height }
 
   pcall(vim.api.nvim_set_current_win, center)
   return true
@@ -654,7 +660,7 @@ local KEY_SPECS = {
     field = "sort",
     -- Every pane you can read the list from, so re-ordering it does not first
     -- mean navigating back to it. Not the terminal: `gs` belongs to Claude there.
-    panes = { "sessions", "feed", "changes" },
+    panes = { "sessions", "feed", "changes", "subagents" },
     group = "Sessions",
     desc = "Choose how the session list is ordered",
     run = function()
@@ -1642,6 +1648,7 @@ function M.resize()
   local sessions = pane_win("sessions")
   if changes then
     pcall(vim.api.nvim_win_set_width, changes, left_width)
+    pcall(vim.api.nvim_win_set_height, changes, sessions_height)
   end
   if sessions then
     pcall(vim.api.nvim_win_set_width, sessions, right_width)
@@ -1694,9 +1701,10 @@ function M.remember_sizes()
       left = vim.api.nvim_win_get_width(changes),
       right = vim.api.nvim_win_get_width(sessions),
       sessions = vim.api.nvim_win_get_height(sessions),
+      changes = vim.api.nvim_win_get_height(changes),
     }
   end)
-  if ok and sizes.left > 1 and sizes.right > 1 and sizes.sessions > 1 then
+  if ok and sizes.left > 1 and sizes.right > 1 and sizes.sessions > 1 and sizes.changes > 1 then
     state.sizes = sizes
   end
 end
@@ -1726,6 +1734,9 @@ function M.restore_sizes()
   local changes, sessions = pane_win("changes"), pane_win("sessions")
   if changes then
     pcall(vim.api.nvim_win_set_width, changes, sizes.left)
+    if sizes.changes then
+      pcall(vim.api.nvim_win_set_height, changes, sizes.changes)
+    end
   end
   if sessions then
     pcall(vim.api.nvim_win_set_width, sessions, sizes.right)
@@ -1930,6 +1941,13 @@ function M.redraw()
     render.changes(state.bufs.changes, model.changes(), {
       width = vim.api.nvim_win_get_width(changes_win),
       cwd = model.selected_cwd(),
+    })
+  end
+
+  local subagents_win = pane_win("subagents")
+  if subagents_win and state.bufs.subagents then
+    render.subagents(state.bufs.subagents, model.subagents(), {
+      width = vim.api.nvim_win_get_width(subagents_win),
     })
   end
 
@@ -2873,7 +2891,7 @@ function M.focus_terminal()
 end
 
 function M.focus_next_pane()
-  local order = { "sessions", "feed", "changes", "center" }
+  local order = { "sessions", "feed", "changes", "subagents", "center" }
   local current = vim.api.nvim_get_current_win()
   local at = 0
   for index, pane in ipairs(order) do

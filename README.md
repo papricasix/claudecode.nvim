@@ -309,6 +309,7 @@ there too.
 - The view **opens already pointed at your newest session**, as though you had
   pressed `<C-n>` once — so `i` from any pane starts that one, and nothing has to
   be chosen before the panes have something to show.
+- The **Subagents** pane, under Changes, shows the subagents the selected session started as a tree — a nested subagent under the one that launched it — with each one's agent type, tokens used and runtime. A running one is marked `●` and its runtime counts up; one that finished is marked `✓` (with the tokens and duration the CLI reported), one that failed `✗`, and one that was stopped or abandoned `⊘`. Everything comes from the CLI's own per-subagent transcripts, so it works for conversations that ran anywhere.
 - The Activity pane lists the selected agent's tool calls **newest first**, so
   what it is doing now is at the top rather than scrolled off the bottom.
 - It lists **everything the agent did**, not only its file work: the shell
@@ -406,7 +407,8 @@ opts = {
     source = "auto",              -- "hooks" | "poll" | "auto"
     poll_ms = 500,
     layout = { left_width = 0.23, right_width = 0.23, sessions_height = 0.55 },
-                                  -- the terminal absorbs the rest (0.54 by default)
+                                  -- the terminal absorbs the rest (0.54 by default);
+                                  -- sessions_height also splits Changes from Subagents
     sessions = {
       -- How far back the list reaches: a span ("1d", "3d", "2w", "1m" — a month
       -- is thirty days — or "all"), or a plain number for the newest N however

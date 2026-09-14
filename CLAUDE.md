@@ -166,7 +166,7 @@ Rules:
 
 ### 12. Agents Mode
 
-`agents = { enabled }`, `<leader>aA` / `:ClaudeCodeAgents`. A dedicated tabpage running several Claudes on one project: selected agent's terminal centre, project sessions top-right, that agent's file activity bottom-right, files it touched left.
+`agents = { enabled }`, `<leader>aA` / `:ClaudeCodeAgents`. A dedicated tabpage running several Claudes on one project: selected agent's terminal centre, project sessions top-right, that agent's file activity bottom-right, files it touched top-left, the subagents it started bottom-left.
 
 **Transcript store is the source of truth**
 
@@ -348,6 +348,17 @@ Same key as `goto_file`, different meaning; possible because no pane is offered 
 - A `disk` hit is resumed **in the directory it ran in**, read from the transcript by `transcript.cwd_of` (memoised, one bounded synchronous read) — the slug is not reversible. The row is labelled with that directory's tail, read only for rows that actually match.
 - A hit with no row is **pinned** (`model.pin`) before the panes are pointed at it: every pane follows a row, and `select` reads the launch directory from one. Pins made while merely browsing are taken back when the picker is cancelled.
 - No cap on a `disk` scan — it streams — but the paint is throttled (`REDRAW_MS`, 60ms; the last one is immediate) since a repaint is the whole list, and only `MAX_LISTED` (60) sessions are drawn, with a line saying how many more matched.
+
+**Subagents pane (`agents/subagents.lua`)**
+
+- Under Changes, split at `layout.sessions_height` so its divider lines up with Sessions/Activity; `state.sizes.changes` is snapshotted and restored like the other sizes. Draws the selected session's subagents as a tree: connectors, state glyph (`●` running, `✓` done, `✗` failed, `⊘` stopped), agent type, tokens, runtime.
+- **The store layout** (verified against CLI 2.1.270): each subagent has `<session>/subagents/agent-<id>.jsonl` plus `agent-<id>.meta.json` (`agentType`, `description`, `toolUseId`, `parentAgentId`, `spawnDepth`, `requestShape`). Nested subagents live in the **same flat directory**; `parentAgentId` makes the tree. A parent whose descriptor is unreadable puts its children at the top rather than dropping them.
+- **How a run ends is recorded by its launcher, not by the subagent**: a background run gets a `<task-notification>` (`<status>`, `<subagent_tokens>`, `<duration_ms>`) in the launching transcript, written twice (a `queue-operation` enqueue, then the delivered `user` entry) — and for a nested run the enqueue also lands in the session's transcript. A foreground run gets the `Agent` call's `toolUseResult` with `totalTokens`/`totalDurationMs`. `transcript._fold_line` folds both into every summary (`task_notes` by agent id, `agent_results` by tool_use id), so `subagents.rows` merges the session's summary with every subagent's.
+- `_task_notification` checks structurally, like `_is_interrupt_line`: only a `queue-operation` enqueue or a `user` entry whose whole string content is the notification (optionally after the `[SYSTEM NOTIFICATION` header). A tool result quoting one — reading a transcript does — is skipped before decoding.
+- **A notification can be stale**: a resumed agent (sent another message) notifies again later. A note only ends the run when the subagent's newest line is no newer than it (same second counts as ended; the note is written after the last line).
+- Live tokens: `_usage_tokens` decodes only the balanced `usage` object of the newest assistant line (input + cache creation + cache read + output ≈ the CLI's `subagent_tokens`; 167,704 vs 167,410 measured). Raw key matching was order-dependent because `usage.iterations` repeats the keys.
+- **Running with no recorded end** requires the session to be live (`model.is_live`) or the subagent's transcript/descriptor to be written within `STALE_S` (10 min, the longest a single tool call may run). Otherwise its CLI exited without notifying anyone, and the row reads stopped. A foreground `Agent` call the interrupt marker resolved (`agent_calls[id].status`) is stopped too.
+- A running subagent keeps `model.poll` marking `dirty.subagents`, so the runtime ticks at `poll_ms` in hooks mode too, without taking the frame clock. `refresh_subagents` folds the session and every subagent transcript (a stat each when unchanged) and repaints only when one grew. Subagent summaries are left out of the warm cache file.
 
 **Help (`?` / `keymaps.help`, `agents/help.lua`)**
 

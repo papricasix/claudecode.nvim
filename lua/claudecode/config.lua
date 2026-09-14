@@ -101,7 +101,7 @@ M.defaults = {
     layout = {
       left_width = 0.23, -- Changes pane, as a fraction of the screen
       right_width = 0.23, -- Sessions/Activity pane, as a fraction of the screen (0.54 left for the terminal)
-      sessions_height = 0.55, -- Sessions share of the right column (it is the pane you steer from)
+      sessions_height = 0.55, -- Sessions share of the right column (it is the pane you steer from), and Changes' share of the left
     },
     sessions = {
       -- How far back the list reaches: a span of time ("1d", "3d", "2w", "1m" —

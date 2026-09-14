@@ -550,4 +550,39 @@ describe("agents.render", function()
       expect(lines_of(changes)[1]:find("no files", 1, true) ~= nil).to_be_true()
     end)
   end)
+
+  describe("subagents", function()
+    local pane
+
+    before_each(function()
+      pane = render.create_buf("subagents")
+    end)
+
+    it("draws the tree with cost and runtime aligned at the right edge", function()
+      render.subagents(pane, {
+        { id = "a", agent_type = "general-purpose", prefix = "", state = "running", tokens = 167410, runtime_s = 830 },
+        { id = "b", agent_type = "Explore", prefix = "├─", state = "running", tokens = 42000, runtime_s = 124 },
+        { id = "c", agent_type = "Explore", prefix = "│ └─", state = "done", tokens = 18000, runtime_s = 51 },
+        { id = "d", agent_type = "Plan", prefix = "└─", state = "failed", tokens = nil, runtime_s = 12 },
+      }, { width = 40 })
+
+      local lines = lines_of(pane)
+      expect(#lines).to_be(4)
+      -- Tokens in a 5-cell field, a space, the runtime in a 7-cell field.
+      expect(lines[1]).to_be(" ● general-purpose" .. string.rep(" ", 9) .. " 167k   13:50")
+      expect(lines[3]).to_be(" │ └─✓ Explore" .. string.rep(" ", 13) .. "  18k    0:51")
+      expect(lines[4]:find("└─✗ Plan", 1, true) ~= nil).to_be_true()
+      -- An unknown count keeps its field, so the runtime stays in its column.
+      expect(lines[4]:find("    ·    0:12$") ~= nil).to_be_true()
+      for _, line in ipairs(lines) do
+        expect(vim.fn.strdisplaywidth(line)).to_be(40)
+      end
+      expect(render.payload_at(pane, 2).agent_id).to_be("b")
+    end)
+
+    it("says so when the session started none", function()
+      render.subagents(pane, {}, { width = 30 })
+      expect(lines_of(pane)[1]:find("no subagents", 1, true) ~= nil).to_be_true()
+    end)
+  end)
 end)

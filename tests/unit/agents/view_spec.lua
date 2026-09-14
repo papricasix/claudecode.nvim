@@ -430,10 +430,25 @@ describe("agents_view", function()
       local wins = agents_view._state().wins
       expect(vim.wo[wins.center].winfixwidth).to_be(false)
       expect(vim.wo[wins.center].winfixheight).to_be(false)
-      for _, pane in ipairs({ "sessions", "feed", "changes" }) do
+      for _, pane in ipairs({ "sessions", "feed", "changes", "subagents" }) do
         expect(vim.wo[wins[pane]].winfixwidth).to_be_true()
         expect(vim.wo[wins[pane]].winfixheight).to_be_true()
       end
+      agents_view.close()
+    end)
+
+    it("splits the left column where the right one is split", function()
+      -- Subagents sits under Changes the way Activity sits under Sessions, and the
+      -- two dividers line up across the screen.
+      agents_view.setup(base_config({ enabled = true }))
+      expect(agents_view.open()).to_be_true()
+      local wins = agents_view._state().wins
+      expect(type(wins.subagents)).to_be("number")
+      expect(vim.api.nvim_win_get_height(wins.changes)).to_be(vim.api.nvim_win_get_height(wins.sessions))
+
+      vim.api.nvim_win_set_height(wins.changes, 3)
+      agents_view.restore_sizes()
+      expect(vim.api.nvim_win_get_height(wins.changes)).to_be(vim.api.nvim_win_get_height(wins.sessions))
       agents_view.close()
     end)
 
@@ -761,6 +776,9 @@ describe("agents_view", function()
         changes = function()
           return {}
         end,
+        subagents = function()
+          return {}
+        end,
         select = function(id)
           selected = id
         end,
@@ -1052,6 +1070,9 @@ describe("agents_view", function()
           return {}
         end,
         changes = function()
+          return {}
+        end,
+        subagents = function()
           return {}
         end,
         hidden_count = function()

@@ -1120,6 +1120,7 @@ function M.select(session_id)
   if row and not row.folded then
     M.fold_row(row)
   end
+  M.refresh_subagents()
   notify_change()
 end
 
@@ -1325,6 +1326,41 @@ function M.changes()
   return entries
 end
 
+---The selected session's subagents, as a flattened tree.
+---
+---Answered from what is already folded; `refresh_subagents` is what folds more.
+---Also notes whether any of them is running, which is what keeps `poll` asking
+---while a runtime is counting up on screen.
+---@return ClaudeCodeSubagentRow[]
+function M.subagents()
+  local row = state.selected and state.by_id[state.selected]
+  if not row then
+    state.subagents_running = false
+    return {}
+  end
+  local rows = require("claudecode.agents.subagents").rows(row.path, {
+    live = is_live(row),
+    now = M._now_s(),
+  })
+  local running = false
+  for _, entry in ipairs(rows) do
+    if entry.state == "running" then
+      running = true
+      break
+    end
+  end
+  state.subagents_running = running
+  return rows
+end
+
+---Fold the selected session's subagent transcripts, repainting when one grew.
+function M.refresh_subagents()
+  local row = state.selected and state.by_id[state.selected]
+  if row then
+    require("claudecode.agents.subagents").refresh(row.path, notify_change)
+  end
+end
+
 ---@return string|nil cwd The directory the selected session ran in.
 function M.selected_cwd()
   local row = state.selected and state.by_id[state.selected]
@@ -1414,7 +1450,7 @@ function M.note(event)
     if WRITING_TOOLS[tool] then
       state.dirty.git = true
     end
-  elseif ehn == "Stop" or ehn == "SessionStart" or ehn == "SessionEnd" then
+  elseif ehn == "Stop" or ehn == "SessionStart" or ehn == "SessionEnd" or ehn == "SubagentStop" then
     state.dirty.transcript = true
     state.dirty.list = true
   end
@@ -1562,6 +1598,13 @@ function M._flush()
     M.refresh_git()
   end
 
+  -- A subagent's tool calls are hook events of the session's, so a dirty
+  -- transcript covers them; `subagents` is the poll asking on behalf of a runtime
+  -- that is counting up, which in hooks mode nothing else would repaint.
+  if dirty.transcript or dirty.subagents then
+    M.refresh_subagents()
+  end
+
   notify_change()
 end
 
@@ -1648,6 +1691,9 @@ function M.poll(tick_opts)
   end
   if not (tick_opts and tick_opts.list_only) then
     state.dirty.transcript = true
+  end
+  if state.subagents_running then
+    state.dirty.subagents = true
   end
 
   local now = (vim.loop and vim.loop.now()) or 0

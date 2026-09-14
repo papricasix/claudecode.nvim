@@ -222,7 +222,7 @@ end
 --------------------------------------------------------------------------------
 
 ---Create a read-only scratch buffer for one pane.
----@param kind "sessions"|"feed"|"changes"
+---@param kind "sessions"|"feed"|"changes"|"subagents"|"center"
 ---@return integer|nil bufnr
 function M.create_buf(kind)
   local buf = vim.api.nvim_create_buf(false, true)
@@ -728,6 +728,77 @@ function M.changes(buf, entries, opts)
       marks[#marks + 1] = { row = lnum, col = #head, end_col = #head + #name, hl = hl("path") }
       push_spans(marks, lnum, counts_at, spans)
     end
+  end
+
+  paint(buf, lines, marks, payload_map)
+end
+
+--- How a subagent's run stands, as a glyph and the highlight it is drawn in.
+--- `hl` names a key of `agents.highlights`; running borrows `status`'s busy group.
+local SUBAGENT_MARK = {
+  running = { text = "●" },
+  done = { text = "✓", hl = "time" },
+  failed = { text = "✗", hl = "failed" },
+  stopped = { text = "⊘", hl = "stopped" },
+}
+
+---Draw the selected session's subagents as a tree.
+---
+---One row per run: the tree's connectors, a state glyph, the agent type, and at
+---the right edge what it cost and how long it ran. A run that has ended is drawn
+---quietly — the working ones are what the pane is glanced at for.
+---@param buf integer
+---@param rows ClaudeCodeSubagentRow[]
+---@param opts { width: integer? }|nil
+function M.subagents(buf, rows, opts)
+  opts = opts or {}
+  local width = opts.width or 28
+  local lines, marks, payload_map = {}, {}, {}
+
+  if #rows == 0 then
+    paint(buf, { "  no subagents" }, {}, {})
+    return
+  end
+
+  local subagents = require("claudecode.agents.subagents")
+  local busy_group = nil
+  pcall(function()
+    local _, group = require("claudecode.status").icon_for_state("busy")
+    busy_group = group
+  end)
+
+  for index, row in ipairs(rows) do
+    local mark = SUBAGENT_MARK[row.state] or SUBAGENT_MARK.stopped
+    local ended = row.state ~= "running"
+    -- Fixed fields, so every row's numbers line up however deep the tree goes.
+    local right = lpad(subagents.format_tokens(row.tokens), 5)
+      .. " "
+      .. lpad(subagents.format_runtime(row.runtime_s), 7)
+    local head = GUTTER .. row.prefix .. mark.text .. " "
+    local room = math.max(4, width - vim.fn.strdisplaywidth(head) - vim.fn.strdisplaywidth(right) - 1)
+    local name = M.truncate(row.agent_type or "agent", room)
+    local line, right_at = right_align(head .. name, width, right)
+
+    local lnum = index - 1
+    lines[#lines + 1] = line
+    payload_map[index] = { kind = "subagent", agent_id = row.id, description = row.description }
+
+    local prefix_at = #GUTTER
+    local mark_at = prefix_at + #row.prefix
+    if #row.prefix > 0 then
+      marks[#marks + 1] = { row = lnum, col = prefix_at, end_col = mark_at, hl = hl("time") }
+    end
+    local mark_group = mark.hl and hl(mark.hl) or busy_group
+    if mark_group then
+      marks[#marks + 1] = { row = lnum, col = mark_at, end_col = mark_at + #mark.text, hl = mark_group }
+    end
+    marks[#marks + 1] = {
+      row = lnum,
+      col = #head,
+      end_col = #head + #name,
+      hl = ended and hl("stopped") or hl("title"),
+    }
+    marks[#marks + 1] = { row = lnum, col = right_at, end_col = #line, hl = hl("time") }
   end
 
   paint(buf, lines, marks, payload_map)
