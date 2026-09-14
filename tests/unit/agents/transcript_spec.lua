@@ -1004,4 +1004,109 @@ describe("agents.transcript", function()
       expect(transcript.get("/p/big.jsonl").added < 180).to_be_true()
     end)
   end)
+
+  describe("subagent records", function()
+    local NOTE = table.concat({
+      "<task-notification>",
+      "<task-id>a325dafc</task-id>",
+      "<tool-use-id>toolu_01</tool-use-id>",
+      "<status>completed</status>",
+      "<usage><subagent_tokens>167410</subagent_tokens><tool_uses>65</tool_uses><duration_ms>830519</duration_ms></usage>",
+      "</task-notification>",
+    }, "\n")
+
+    it("reads a completion from the queued copy and from the delivered one", function()
+      put("/p/a.jsonl", {
+        vim.json.encode({
+          type = "queue-operation",
+          operation = "enqueue",
+          timestamp = "2026-09-13T11:11:53.000Z",
+          content = NOTE,
+        }),
+        vim.json.encode({
+          type = "user",
+          timestamp = "2026-09-13T11:11:54.000Z",
+          message = { role = "user", content = "[SYSTEM NOTIFICATION - NOT USER INPUT]\nheader\n\n" .. NOTE },
+        }),
+      })
+      local note = fold("/p/a.jsonl").task_notes["a325dafc"]
+      expect(note.status).to_be("completed")
+      expect(note.tokens).to_be(167410)
+      expect(note.duration_ms).to_be(830519)
+      expect(note.ts).to_be(transcript._iso_to_epoch("2026-09-13T11:11:54Z"))
+    end)
+
+    it("ignores a notification that is only being quoted or dequeued", function()
+      put("/p/a.jsonl", {
+        -- A command whose output quotes a transcript.
+        vim.json.encode({
+          type = "user",
+          message = { role = "user", content = { { type = "tool_result", tool_use_id = "toolu_x", content = NOTE } } },
+          toolUseResult = { stdout = NOTE, stderr = "" },
+        }),
+        -- A message that merely mentions one.
+        vim.json.encode({ type = "user", message = { role = "user", content = "what does this mean? " .. NOTE } }),
+        vim.json.encode({ type = "queue-operation", operation = "remove", content = NOTE }),
+      })
+      expect(next(fold("/p/a.jsonl").task_notes)).to_be(nil)
+    end)
+
+    it("takes a foreground run's cost from the Agent result", function()
+      put("/p/a.jsonl", {
+        vim.json.encode({
+          type = "user",
+          timestamp = "2026-09-13T11:00:00.000Z",
+          message = { role = "user", content = { { type = "tool_result", tool_use_id = "toolu_fg", content = "ok" } } },
+          toolUseResult = { status = "completed", totalTokens = 77000, totalDurationMs = 40000, totalToolUseCount = 3 },
+        }),
+      })
+      local result = fold("/p/a.jsonl").agent_results["toolu_fg"]
+      expect(result.status).to_be("completed")
+      expect(result.tokens).to_be(77000)
+      expect(result.duration_ms).to_be(40000)
+    end)
+
+    it("keeps the newest turn's context size and the first timestamp", function()
+      local function turn(ts, read)
+        return vim.json.encode({
+          type = "assistant",
+          timestamp = ts,
+          message = {
+            role = "assistant",
+            content = { { type = "text", text = 'quoting "usage":{"input_tokens":999999}' } },
+            usage = {
+              input_tokens = 2,
+              cache_creation_input_tokens = 2858,
+              cache_read_input_tokens = read,
+              output_tokens = 2480,
+              iterations = { { input_tokens = 5, output_tokens = 5 } },
+            },
+          },
+        })
+      end
+      put("/p/a.jsonl", { turn("2026-09-13T10:57:59.000Z", 1000), turn("2026-09-13T11:11:50.000Z", 162364) })
+      local sum = fold("/p/a.jsonl")
+      expect(sum.tokens).to_be(2 + 2858 + 162364 + 2480)
+      expect(sum.first_ts).to_be(transcript._iso_to_epoch("2026-09-13T10:57:59Z"))
+    end)
+
+    it("indexes Agent calls so an interrupt reaches a foreground run", function()
+      put("/p/a.jsonl", {
+        vim.json.encode({
+          type = "assistant",
+          timestamp = "2026-09-13T11:00:00.000Z",
+          message = {
+            role = "assistant",
+            content = { { type = "tool_use", id = "toolu_fg", name = "Agent", input = {} } },
+          },
+        }),
+        vim.json.encode({
+          type = "user",
+          timestamp = "2026-09-13T11:00:05.000Z",
+          message = { role = "user", content = "[Request interrupted by user for tool use]" },
+        }),
+      })
+      expect(fold("/p/a.jsonl").agent_calls["toolu_fg"].status).to_be("interrupted")
+    end)
+  end)
 end)

@@ -67,6 +67,9 @@ M.INTERRUPT_MARKER = "[Request interrupted by user"
 --- the pane says so differently.
 local REJECTION_MARKER = "The user doesn't want to proceed with this tool use"
 
+--- The tools that start a subagent. `Task` is the name older CLIs used.
+local AGENT_TOOLS = { Agent = true, Task = true }
+
 --- Live summaries: [path] = ClaudeCodeAgentsSummary.
 local cache = {}
 
@@ -123,6 +126,11 @@ local config = nil
 ---@field events ClaudeCodeAgentsEvent[] Oldest first; trimmed to the event limit.
 ---@field pending table<string, ClaudeCodeAgentsEvent> Tool events whose result has not been folded yet, by tool_use id.
 ---@field last_ts number Epoch seconds of the last entry carrying a timestamp.
+---@field first_ts number Epoch seconds of the first entry carrying a timestamp (0 until one is seen).
+---@field tokens integer|nil Context size of the newest assistant turn: input, both cache reads/writes and output.
+---@field agent_calls table<string, ClaudeCodeAgentsEvent> `Agent`/`Task` tool events, by tool_use id.
+---@field agent_results table<string, ClaudeCodeAgentsTaskResult> Foreground subagent results, by tool_use id.
+---@field task_notes table<string, ClaudeCodeAgentsTaskResult> Background task completions, by agent id.
 ---@field interrupted_ts number|nil Set when the CLI recorded a user interrupt; see INTERRUPT_MARKER.
 ---@field size integer Bytes of the file when last folded.
 ---@field mtime integer
@@ -130,6 +138,13 @@ local config = nil
 ---@field offset integer Bytes consumed, always a line boundary.
 ---@field skipped integer Lines that decoded but matched no known shape.
 ---@field partial boolean|nil Counts came from the warm cache; no fold state yet.
+
+---@class ClaudeCodeAgentsTaskResult How a subagent run ended, as its parent was told.
+---@field id string Agent id (notifications) or tool_use id (foreground results).
+---@field status string The CLI's own word: `completed`, `failed`, `killed`, ….
+---@field tokens integer|nil
+---@field duration_ms integer|nil
+---@field ts number Epoch seconds the parent recorded it.
 
 --------------------------------------------------------------------------------
 -- I/O seam
@@ -642,6 +657,12 @@ local function fold_tool_use(sum, entry)
       push_event(sum, event)
       if event.tool_id then
         sum.pending[event.tool_id] = event
+        -- Kept by id as well, outliving the event trim: a foreground subagent is
+        -- running for exactly as long as this call has no result, and an
+        -- interrupt marks it here like any other call (see `subagents.lua`).
+        if AGENT_TOOLS[block.name] then
+          sum.agent_calls[event.tool_id] = event
+        end
       end
     end
   end
@@ -793,6 +814,108 @@ function M._is_interrupt_line(line)
   return false
 end
 
+---The context size an assistant line reports, from its raw text.
+---
+---Input, cache creation, cache read and output, which is the figure the CLI itself
+---reports as a finished subagent's `subagent_tokens` (measured: 167,704 from the
+---last turn against 167,410 in the notification). The first `"usage":{` is the
+---message's own. Only that object is decoded — it is small, and it holds
+---per-iteration copies of the same keys, so matching the keys in the raw line
+---would depend on the order the CLI happens to write them in.
+---@param line string
+---@return integer|nil
+function M._usage_tokens(line)
+  local at = line:find('"usage":{', 1, true)
+  if not at then
+    return nil
+  end
+  local open = at + #'"usage":'
+  -- Its values are numbers, nested objects and short enum strings, none of which
+  -- contain a brace, so counting braces finds its end.
+  local depth, close = 0, nil
+  for pos = open, math.min(#line, open + 4096) do
+    local byte = line:byte(pos)
+    if byte == 123 then -- {
+      depth = depth + 1
+    elseif byte == 125 then -- }
+      depth = depth - 1
+      if depth == 0 then
+        close = pos
+        break
+      end
+    end
+  end
+  if not close then
+    return nil
+  end
+  local ok, usage = pcall(vim.json.decode, line:sub(open, close))
+  if not ok or type(usage) ~= "table" then
+    return nil
+  end
+  local total, found = 0, false
+  for _, key in ipairs({ "input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens" }) do
+    local value = tonumber(usage[key])
+    if value then
+      total = total + value
+      found = true
+    end
+  end
+  return found and total or nil
+end
+
+--- Past this a line is not a task notification worth decoding: the CLI's own are a
+--- summary plus the subagent's reply, and a line this big that merely mentions the
+--- tag is a tool result quoting one.
+local NOTIFICATION_LINE_LIMIT = 512 * 1024
+
+---A background task's completion, if this line is the CLI recording one.
+---
+---Written twice into the transcript that launched the task — as a
+---`queue-operation` enqueue, then as the `user` entry that delivers it — and for
+---a nested subagent the enqueue lands in the *session's* transcript as well.
+---Checked structurally rather than by substring, for the reason
+---`_is_interrupt_line` is: a tool result that quotes a notification (reading a
+---transcript, say) carries the same tags, but only ever inside a longer text or
+---a `tool_result` block, never as the entry's whole string content.
+---@param line string
+---@return ClaudeCodeAgentsTaskResult|nil
+function M._task_notification(line)
+  if #line > NOTIFICATION_LINE_LIMIT then
+    return nil
+  end
+  local ok, entry = pcall(vim.json.decode, line)
+  if not ok or type(entry) ~= "table" then
+    return nil
+  end
+  local text
+  if entry.type == "queue-operation" and entry.operation == "enqueue" then
+    text = entry.content
+  elseif entry.type == "user" and type(entry.message) == "table" then
+    text = entry.message.content
+  end
+  if type(text) ~= "string" then
+    return nil
+  end
+  -- The delivered copy may be prefixed with a system header; nothing else may
+  -- come before the tag.
+  local body = text:match("^%s*(<task%-notification>.*)")
+    or text:match("^%[SYSTEM NOTIFICATION.-\n(<task%-notification>.*)")
+  if not body then
+    return nil
+  end
+  local id = body:match("<task%-id>([^<]+)</task%-id>")
+  if not id then
+    return nil
+  end
+  return {
+    id = id,
+    status = body:match("<status>([^<]+)</status>") or "completed",
+    tokens = tonumber(body:match("<subagent_tokens>(%d+)</subagent_tokens>")),
+    duration_ms = tonumber(body:match("<duration_ms>(%d+)</duration_ms>")),
+    ts = M._iso_to_epoch(entry.timestamp),
+  }
+end
+
 ---Fold one raw line. Prefilters on substrings so most lines are never decoded.
 ---@param sum ClaudeCodeAgentsSummary
 ---@param line string
@@ -815,6 +938,20 @@ function M._fold_line(sum, line)
     local ts = M._iso_to_epoch(line:sub(at + 13, at + 40))
     if ts > sum.last_ts then
       sum.last_ts = ts
+    end
+    if sum.first_ts == 0 and ts > 0 then
+      sum.first_ts = ts
+    end
+  end
+
+  -- What the newest turn cost, which for a subagent is its running token count.
+  -- Matched raw like the timestamp: an assistant line also carries the whole
+  -- reply, and inside a JSON string a quote is escaped, so an unescaped
+  -- `"usage":{` is the message's own field.
+  if line:find('"type":"assistant"', 1, true) and not line:find('"toolUseResult"', 1, true) then
+    local tokens = M._usage_tokens(line)
+    if tokens then
+      sum.tokens = tokens
     end
   end
 
@@ -844,6 +981,21 @@ function M._fold_line(sum, line)
       sum.pending[id] = nil
     end
     return
+  end
+
+  -- A tool result quoting a notification is never one, and is the kind of line
+  -- that is too big to decode for nothing.
+  if line:find("<task-notification>", 1, true) and not line:find('"toolUseResult"', 1, true) then
+    local note = M._task_notification(line)
+    if note then
+      -- The same run can notify more than once (a resumed agent stops again), and
+      -- a notification is written twice (queued, then delivered); the newest wins.
+      local previous = sum.task_notes[note.id]
+      if not previous or note.ts >= previous.ts then
+        sum.task_notes[note.id] = note
+      end
+      return
+    end
   end
 
   if line:find('"aiTitle"', 1, true) then
@@ -887,6 +1039,22 @@ function M._fold_line(sum, line)
     -- that is never decoded (see `resolve_tool`).
     if tools_wanted() then
       resolve_tool(sum, line)
+    end
+    -- A foreground subagent's result says what the run cost. The keys are matched
+    -- raw for the same reason the rest of this branch is: the line also carries
+    -- the subagent's whole reply. Inside that reply a quote is escaped, so an
+    -- unescaped `"totalDurationMs":` can only be the result's own field.
+    if line:find('"totalDurationMs":', 1, true) then
+      local id = line:match('"tool_use_id":"([^"]+)"')
+      if id then
+        sum.agent_results[id] = {
+          id = id,
+          status = line:find('"is_error":true', 1, true) and "failed" or "completed",
+          tokens = tonumber(line:match('"totalTokens":(%d+)')),
+          duration_ms = tonumber(line:match('"totalDurationMs":(%d+)')),
+          ts = sum.last_ts,
+        }
+      end
     end
     if line:find('"structuredPatch"', 1, true) or line:find('"file":', 1, true) then
       local ok, entry = pcall(vim.json.decode, line)
@@ -945,7 +1113,11 @@ local function new_summary(path)
     order = {},
     events = {},
     pending = {},
+    agent_calls = {},
+    agent_results = {},
+    task_notes = {},
     last_ts = 0,
+    first_ts = 0,
     size = 0,
     mtime = 0,
     offset = 0,
@@ -2093,7 +2265,9 @@ function M.cache_save()
   local path = M.cache_path()
   local entries = {}
   for file, sum in pairs(cache) do
-    if sum.size > 0 then
+    -- Subagent transcripts are folded for the Subagents pane and never listed as
+    -- sessions, so a warm count for one would only grow the file.
+    if sum.size > 0 and not file:find("[/\\]subagents[/\\]") then
       entries[file] = {
         name = sum.name,
         title = sum.title,
