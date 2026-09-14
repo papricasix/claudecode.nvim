@@ -156,6 +156,43 @@ describe("agents.subagent_view", function()
       expect(text:find("- ✓ `bash` List files · 2 lines\n- ⊘ `read` lua/x.lua", 1, true) ~= nil).to_be_true()
     end)
 
+    it("sets a message apart with a slim arrow and its own background", function()
+      local doc = fold({ user("first line\nsecond line") })
+      local lines, marks = view.render(doc, ctx())
+      local at
+      for index, line in ipairs(lines) do
+        if line == "› first line" then
+          at = index
+        end
+      end
+      expect(lines[at + 1]).to_be("  second line")
+      local banded = 0
+      for _, mark in ipairs(marks) do
+        if mark.line_hl == "ClaudeCodeAgentsPrompt" and (mark.row == at - 1 or mark.row == at) then
+          banded = banded + 1
+        end
+      end
+      expect(banded).to_be(2)
+    end)
+
+    it("gives a foldable block its own background, every line of it", function()
+      local doc = fold({ user("go"), assistant({ { type = "thinking", thinking = "one\ntwo" } }) })
+      local _, marks, _, folds = view.render(doc, ctx())
+      local rows = {}
+      for _, mark in ipairs(marks) do
+        if mark.line_hl == "ClaudeCodeAgentsFoldable" then
+          rows[#rows + 1] = mark.row + 1
+        end
+      end
+      expect(table.concat(rows, ",")).to_be(("%d,%d,%d"):format(folds[1][1], folds[1][1] + 1, folds[1][2]))
+    end)
+
+    it("says where <BS> goes when the run was opened from another's transcript", function()
+      local lines = view.render(fold({ user("go") }), ctx({ back = "Probe foreground subagent" }))
+      expect(lines[3]).to_be("← `<BS>` back to Probe foreground subagent")
+      expect(view.render(fold({ user("go") }), ctx())[3]).to_be("")
+    end)
+
     it("marks a call still waiting as running while the run is", function()
       local doc = fold({
         user("go"),

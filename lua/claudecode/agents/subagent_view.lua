@@ -44,6 +44,9 @@ local ERROR_TEXT_LIMIT = 80
 --- Longest label kept on a tool line.
 local TOOL_LABEL_LIMIT = 100
 
+--- What marks a message to the run — its prompt, and anything sent to it later.
+local PROMPT_MARK = "›"
+
 local STATE_GLYPH = { running = "●", done = "✓", failed = "✗", stopped = "⊘" }
 local STATE_WORD = { running = "running", done = "done", failed = "failed", stopped = "stopped" }
 
@@ -306,6 +309,7 @@ end
 ---@field children table<string, ClaudeCodeSubagentRow> Runs it started, by the tool_use id that started them.
 ---@field by_id table<string, ClaudeCodeSubagentRow> Every run of the session, by agent id.
 ---@field cwd string|nil Where the session ran, which file paths are shown relative to.
+---@field back string|nil What `<BS>` returns to, when this run was opened from another's transcript.
 
 ---Lay a document out as Markdown lines.
 ---@param doc table
@@ -339,6 +343,11 @@ function M.render(doc, ctx)
     facts[#facts + 1] = spent
   end
   add(table.concat(facts, " · "))
+  -- Reached from a parent's transcript: say where `<BS>` goes, since nothing
+  -- else on screen says this float has anywhere to go back to.
+  if ctx.back then
+    add("← `<BS>` back to " .. ctx.back)
+  end
 
   local previous = nil
   for _, item in ipairs(doc.items) do
@@ -349,10 +358,16 @@ function M.render(doc, ctx)
     end
 
     if item.kind == "prompt" or item.kind == "message" then
-      add(item.kind == "prompt" and "## Prompt" or "## Message")
-      add("")
-      for _, piece in ipairs(split(item.text)) do
-        add(piece)
+      -- Drawn the way Claude Code draws what was said to it: a slim arrow in front,
+      -- the whole message on its own raised background.
+      local render = require("claudecode.agents.render")
+      local band = render.highlight("prompt")
+      for index, piece in ipairs(split(item.text)) do
+        add((index == 1 and PROMPT_MARK or string.rep(" ", vim.fn.strdisplaywidth(PROMPT_MARK))) .. " " .. piece)
+        marks[#marks + 1] = { row = #lines - 1, line_hl = band }
+        if index == 1 then
+          marks[#marks + 1] = { row = #lines - 1, col = 0, end_col = #PROMPT_MARK, hl = render.highlight("time") }
+        end
       end
     elseif item.kind == "text" then
       for _, piece in ipairs(split(item.text)) do
@@ -366,6 +381,12 @@ function M.render(doc, ctx)
       end
       if #lines > start then
         folds[#folds + 1] = { start, #lines }
+        -- Its own background, the whole block: what `<Tab>` folds reads as one
+        -- piece while it is open.
+        local group = require("claudecode.agents.render").highlight("foldable")
+        for index = start, #lines do
+          marks[#marks + 1] = { row = index - 1, line_hl = group }
+        end
       end
     elseif item.kind == "system" then
       add("> " .. item.text)
@@ -449,8 +470,9 @@ local views = {}
 ---@param session_path string
 ---@param agent_id string
 ---@param row_for fun(id: string): ClaudeCodeSubagentRow|nil
+---@param history { agent_id: string, lnum: integer }[]|nil The runs this float came through.
 ---@return ClaudeCodeSubagentViewContext
-local function context(session_path, agent_id, row_for)
+local function context(session_path, agent_id, row_for, history)
   local rows = subagents.rows(session_path, { live = nil })
   local by_id = {}
   for _, row in ipairs(rows) do
@@ -470,7 +492,19 @@ local function context(session_path, agent_id, row_for)
     end
   end
   local summary = transcript.get(session_path)
-  return { row = by_id[agent_id], children = children, by_id = by_id, cwd = summary and summary.cwd or nil }
+  local back = nil
+  local parent = history and history[#history]
+  if parent then
+    local row = by_id[parent.agent_id]
+    back = row and (row.description or row.agent_type) or parent.agent_id
+  end
+  return {
+    row = by_id[agent_id],
+    children = children,
+    by_id = by_id,
+    cwd = summary and summary.cwd or nil,
+    back = back,
+  }
 end
 
 ---Rewrite only what changed, so folds above the change survive and a reader's
@@ -478,7 +512,7 @@ end
 ---@param buf integer
 ---@param view table
 local function paint(buf, view)
-  local ctx = context(view.session_path, view.agent_id, view.opts.row_for)
+  local ctx = context(view.session_path, view.agent_id, view.opts.row_for, view.opts.history)
   local lines, marks, links, folds = M.render(view.doc, ctx)
   view.links = links
 
@@ -506,7 +540,11 @@ local function paint(buf, view)
     pcall(vim.api.nvim_set_option_value, "modifiable", false, { buf = buf })
     pcall(vim.api.nvim_buf_clear_namespace, buf, ns, 0, -1)
     for _, mark in ipairs(marks) do
-      pcall(vim.api.nvim_buf_set_extmark, buf, ns, mark.row, mark.col, { end_col = mark.end_col, hl_group = mark.hl })
+      if mark.line_hl then
+        pcall(vim.api.nvim_buf_set_extmark, buf, ns, mark.row, 0, { line_hl_group = mark.line_hl })
+      else
+        pcall(vim.api.nvim_buf_set_extmark, buf, ns, mark.row, mark.col, { end_col = mark.end_col, hl_group = mark.hl })
+      end
     end
     view.lines = lines
 
@@ -628,7 +666,10 @@ end
 
 ---Open (or swap into `opts.reuse`) the transcript of one subagent run.
 ---@param opts { session_id: string?, session_path: string, agent_id: string, reuse: integer?,
----             row_for: (fun(id: string): ClaudeCodeSubagentRow|nil)?, on_open: (fun(win: integer|nil))? }
+---             row_for: (fun(id: string): ClaudeCodeSubagentRow|nil)?, on_open: (fun(win: integer|nil))?,
+---             history: { agent_id: string, lnum: integer }[]?, cursor: integer? }
+---             `history` is the chain of runs this float came down through; `cursor`
+---             the line to land on.
 ---@param done fun(win: integer|nil)|nil
 function M.open(opts, done)
   local function finish(win)
@@ -659,13 +700,23 @@ function M.open(opts, done)
   }
   views[buf] = view
 
-  local ctx = context(opts.session_path, opts.agent_id, opts.row_for)
+  local ctx = context(opts.session_path, opts.agent_id, opts.row_for, opts.history)
   view.title = M.title(ctx.row)
   local win = float.create(opts.session_id, { title = view.title, buf = buf, reuse = opts.reuse, purpose = "open" })
   if not win then
     forget(buf)
     return finish(nil)
   end
+
+  -- `<Tab>` opens and closes the block under the cursor. Bound before `bind_close`,
+  -- which leaves a key the buffer already maps alone — its own `<Tab>` (next float)
+  -- would otherwise win. Off a fold it does nothing: jumping to another float from
+  -- a line that merely is not foldable would be a surprise.
+  pcall(vim.keymap.set, "n", "<Tab>", function()
+    if vim.fn.foldlevel(".") > 0 then
+      pcall(vim.cmd, "normal! za")
+    end
+  end, { buffer = buf, nowait = true, silent = true, desc = "Open or close this block" })
   float.bind_close(win)
   -- The placeholder is replaced wholesale by the first paint.
   view.lines = { "", "  Reading the transcript…" }
@@ -686,6 +737,13 @@ function M.open(opts, done)
     if not target then
       return
     end
+    -- Remember where this run was left, so `<BS>` from the child lands back on
+    -- the line that opened it.
+    local history = {}
+    for index, entry in ipairs(opts.history or {}) do
+      history[index] = entry
+    end
+    history[#history + 1] = { agent_id = opts.agent_id, lnum = lnum }
     M.open({
       session_id = opts.session_id,
       session_path = opts.session_path,
@@ -693,12 +751,36 @@ function M.open(opts, done)
       reuse = vim.api.nvim_get_current_win(),
       row_for = opts.row_for,
       on_open = opts.on_open,
+      history = history,
     }, opts.on_open)
   end, { buffer = buf, nowait = true, silent = true, desc = "Open this subagent's transcript" })
 
+  -- Back up the chain this float walked down, one run per press.
+  local history = opts.history or {}
+  if #history > 0 then
+    pcall(vim.keymap.set, "n", "<BS>", function()
+      local back = {}
+      for index = 1, #history - 1 do
+        back[index] = history[index]
+      end
+      local parent = history[#history]
+      M.open({
+        session_id = opts.session_id,
+        session_path = opts.session_path,
+        agent_id = parent.agent_id,
+        reuse = vim.api.nvim_get_current_win(),
+        row_for = opts.row_for,
+        on_open = opts.on_open,
+        history = back,
+        cursor = parent.lnum,
+      }, opts.on_open)
+    end, { buffer = buf, nowait = true, silent = true, desc = "Back to the run that opened this one" })
+  end
+
   pull(buf, function()
     if vim.api.nvim_win_is_valid(win) then
-      pcall(vim.api.nvim_win_set_cursor, win, { 1, 0 })
+      local line = math.max(1, math.min(opts.cursor or 1, vim.api.nvim_buf_line_count(buf)))
+      pcall(vim.api.nvim_win_set_cursor, win, { line, 0 })
     end
   end)
 

@@ -74,6 +74,8 @@ local DEFAULT_HIGHLIGHTS = {
   header = "ClaudeCodeAgentsHelpHeader",
   key = "ClaudeCodeAgentsKey",
   match = "ClaudeCodeAgentsMatch",
+  foldable = "ClaudeCodeAgentsFoldable",
+  prompt = "ClaudeCodeAgentsPrompt",
 }
 
 local HIGHLIGHT_LINKS = {
@@ -105,6 +107,13 @@ local HIGHLIGHT_LINKS = {
   -- What the search picker lights up inside a result. `Search` rather than
   -- `IncSearch`: these are the matches, not the one being stepped onto.
   ClaudeCodeAgentsMatch = "Search",
+  -- The background of a block `<Tab>` opens and closes in a subagent's transcript
+  -- (its reasoning), so what folds is told apart from what does not while it is
+  -- open. A closed fold keeps Neovim's own `Folded`.
+  ClaudeCodeAgentsFoldable = "ColorColumn",
+  -- A message to a subagent — its prompt, or one sent to it later — on a raised
+  -- background, the way Claude Code sets what you typed apart from its replies.
+  ClaudeCodeAgentsPrompt = "CursorLine",
 }
 
 ---Where the panes take their background from.

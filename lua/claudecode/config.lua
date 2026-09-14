@@ -211,6 +211,11 @@ M.defaults = {
       -- a link to Comment.
       deleted = "ClaudeCodeAgentsDeleted",
       float = "ClaudeCodeAgentsFloat", -- defaults to a link to FloatBorder
+      -- A subagent transcript's reasoning blocks (<Tab> folds them); defaults to a
+      -- link to ColorColumn.
+      foldable = "ClaudeCodeAgentsFoldable",
+      -- A message to a subagent, behind its `›`; defaults to a link to CursorLine.
+      prompt = "ClaudeCodeAgentsPrompt",
       -- Terminal pane background: follows SnacksNormal when snacks is loaded,
       -- else NormalFloat. The sidebars keep the editor's own Normal.
       normal = "ClaudeCodeAgentsNormal",
@@ -725,6 +730,8 @@ function M.validate(config)
         "header",
         "key",
         "match",
+        "foldable",
+        "prompt",
       }
       for _, field in ipairs(highlight_fields) do
         checker(ag.highlights, "agents.highlights")(field, function(v)
