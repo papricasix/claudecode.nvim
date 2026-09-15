@@ -290,6 +290,42 @@ local function is_terminal_visible(bufnr)
   return bufinfo and #bufinfo > 0 and #bufinfo[1].windows > 0
 end
 
+---Builds a `no_proxy` value that is guaranteed to exclude the loopback hosts
+---(localhost, 127.0.0.1, ::1), merging the given existing values -- each a
+---comma-separated list, nils allowed -- order-preserving and de-duplicated.
+---@param ... string? Existing no_proxy/NO_PROXY values to merge ahead of the loopback hosts
+---@return string combined
+local function no_proxy_with_loopback(...)
+  local entries = {}
+  local seen = {}
+
+  local function add_entry(entry)
+    entry = entry:gsub("^%s+", ""):gsub("%s+$", "")
+    if entry ~= "" and not seen[entry] then
+      seen[entry] = true
+      entries[#entries + 1] = entry
+    end
+  end
+
+  -- select(), not ipairs over {...}, so a nil source does not truncate the rest.
+  for i = 1, select("#", ...) do
+    local value = select(i, ...)
+    if type(value) == "string" then
+      for entry in value:gmatch("[^,]+") do
+        add_entry(entry)
+      end
+    end
+  end
+
+  for _, host in ipairs({ "localhost", "127.0.0.1", "::1" }) do
+    add_entry(host)
+  end
+
+  return table.concat(entries, ",")
+end
+
+M._no_proxy_with_loopback = no_proxy_with_loopback
+
 ---Gets the claude command string and necessary environment variables
 ---@param cmd_args string? Optional arguments to append to the command
 ---@param effective_config table? The built terminal config (for the spawn cwd)
@@ -351,6 +387,17 @@ local function get_claude_command_and_env(cmd_args, effective_config, instance)
   for key, value in pairs(defaults.env) do
     env_table[key] = value
   end
+
+  -- Claude honours http_proxy/all_proxy with proxy-from-env semantics, and without a
+  -- loopback exclusion it tunnels even its own ws://127.0.0.1:<port> IDE connection
+  -- through the proxy, so the handshake never reaches our server and queued @ mentions
+  -- time out (upstream issue #70). This runs after the config merge and regardless of
+  -- the inherited environment (termopen layers env_table over the parent's), and merges
+  -- rather than clobbers every existing source.
+  local combined_no_proxy =
+    no_proxy_with_loopback(os.getenv("no_proxy"), os.getenv("NO_PROXY"), env_table["no_proxy"], env_table["NO_PROXY"])
+  env_table["no_proxy"] = combined_no_proxy
+  env_table["NO_PROXY"] = combined_no_proxy
 
   -- Session persistence: name this tab's conversation (`--session-id`), or pick
   -- the one a restored Neovim session handed back (`--resume`). No-op when the
