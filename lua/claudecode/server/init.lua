@@ -42,7 +42,8 @@ local function create_instance(tab_id, opts)
           capabilities = {
             logging = vim.empty_dict(),
             prompts = { listChanged = true },
-            resources = { subscribe = true, listChanged = true },
+            -- No `resources` capability: we implement none, and advertising it
+            -- invites resources/list calls we answer with an error.
             tools = { listChanged = true },
           },
           serverInfo = {

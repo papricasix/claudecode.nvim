@@ -66,16 +66,19 @@ describe("Tool: get_diagnostics", function()
     -- as they are checked for existence.
   end)
 
-  it("should return an empty list if no diagnostics are found", function()
+  it("should return an empty file list if no diagnostics are found", function()
     local success, result = pcall(get_diagnostics_handler, {})
     expect(success).to_be_true()
     expect(result).to_be_table()
     expect(result.content).to_be_table()
-    expect(#result.content).to_be(0)
+    -- One text block always, holding the (here empty) list of files.
+    expect(#result.content).to_be(1)
+    expect(result.content[1].type).to_be("text")
+    expect(#_G.vim.json.encode.calls[1].vals[1]).to_be(0)
     assert.spy(_G.vim.diagnostic.get).was_called_with(nil)
   end)
 
-  it("should return formatted diagnostics if available", function()
+  it("should group diagnostics by file in the VS Code shape", function()
     local mock_diagnostics = {
       { bufnr = 1, lnum = 10, col = 5, severity = 1, message = "Error message 1", source = "linter1" },
       { bufnr = 2, lnum = 20, col = 15, severity = 2, message = "Warning message 2", source = "linter2" },
@@ -87,23 +90,25 @@ describe("Tool: get_diagnostics", function()
     local success, result = pcall(get_diagnostics_handler, {})
     expect(success).to_be_true()
     expect(result.content).to_be_table()
-    expect(#result.content).to_be(2)
-
-    -- Check that results are MCP content items
+    expect(#result.content).to_be(1)
     expect(result.content[1].type).to_be("text")
-    expect(result.content[2].type).to_be("text")
 
-    -- Verify JSON encoding was called with correct structure
-    assert.spy(_G.vim.json.encode).was_called(2)
+    assert.spy(_G.vim.json.encode).was_called(1)
+    local files = _G.vim.json.encode.calls[1].vals[1]
+    expect(#files).to_be(2)
 
-    -- Check the first diagnostic was encoded with 1-indexed values
-    local first_call_args = _G.vim.json.encode.calls[1].vals[1]
-    expect(first_call_args.filePath).to_be("/path/to/file_for_buf_1.lua")
-    expect(first_call_args.line).to_be(11) -- 10 + 1 for 1-indexing
-    expect(first_call_args.character).to_be(6) -- 5 + 1 for 1-indexing
-    expect(first_call_args.severity).to_be(1)
-    expect(first_call_args.message).to_be("Error message 1")
-    expect(first_call_args.source).to_be("linter1")
+    expect(files[1].uri).to_be("file:///path/to/file_for_buf_1.lua")
+    expect(#files[1].diagnostics).to_be(1)
+    local first = files[1].diagnostics[1]
+    expect(first.message).to_be("Error message 1")
+    expect(first.severity).to_be("Error") -- name, not the numeric severity
+    expect(first.source).to_be("linter1")
+    -- LSP ranges stay 0-based, as VS Code reports them.
+    expect(first.range.start.line).to_be(10)
+    expect(first.range.start.character).to_be(5)
+
+    expect(files[2].uri).to_be("file:///path/to/file_for_buf_2.lua")
+    expect(files[2].diagnostics[1].severity).to_be("Warning")
 
     assert.spy(_G.vim.api.nvim_buf_get_name).was_called_with(1)
     assert.spy(_G.vim.api.nvim_buf_get_name).was_called_with(2)
@@ -133,8 +138,9 @@ describe("Tool: get_diagnostics", function()
 
     -- Verify only the diagnostic with a file path was included
     assert.spy(_G.vim.json.encode).was_called(1)
-    local encoded_args = _G.vim.json.encode.calls[1].vals[1]
-    expect(encoded_args.filePath).to_be("/path/to/file1.lua")
+    local files = _G.vim.json.encode.calls[1].vals[1]
+    expect(#files).to_be(1)
+    expect(files[1].uri).to_be("file:///path/to/file1.lua")
   end)
 
   it("should error if vim.diagnostic.get is not available", function()
