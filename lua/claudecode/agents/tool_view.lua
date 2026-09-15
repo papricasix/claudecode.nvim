@@ -104,8 +104,13 @@ local function show(session_id, body, title, name, reuse)
 end
 
 ---Show one tool call: what was run, and what came back.
+---
+---A shell command that went to the background came back with nothing but the
+---place its output is going, so it is shown as that shell instead — its output
+---read from there, and followed while it runs (`shell_view`).
 ---@param opts { session_id: string?, transcript: string?, tool_id: string?, tool: string?,
----             label: string?, status: string?, reuse: integer? }
+---             label: string?, status: string?, reuse: integer?,
+---             row_for: (fun(id: string): ClaudeCodeSubagentRow|nil)? }
 ---@param done fun(win: integer|nil)|nil Called once the float is up (the read is async).
 function M.open(opts, done)
   opts = opts or {}
@@ -130,6 +135,20 @@ function M.open(opts, done)
     end
 
     local tool = call.tool or opts.tool
+    local task_id = type(call.result) == "table" and call.result.backgroundTaskId or nil
+    if transcript.SHELL_TOOLS[tool] and type(task_id) == "string" and task_id ~= "" then
+      local input = type(call.input) == "table" and call.input or {}
+      return require("claudecode.agents.shell_view").open({
+        session_id = opts.session_id,
+        transcript = opts.transcript,
+        task_id = task_id,
+        tool_id = tool_id,
+        -- Already read here; saves the shell view reading the transcript again.
+        command = type(input.command) == "string" and input.command or nil,
+        reuse = opts.reuse,
+        row_for = opts.row_for,
+      }, done)
+    end
     local body = tools.body(tool, call.input, call.result)
     -- The row's status is what the pane folded; a result that has landed since is
     -- the newer answer, and the title should not still say "running".

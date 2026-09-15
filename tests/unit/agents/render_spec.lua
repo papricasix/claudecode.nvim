@@ -605,6 +605,36 @@ describe("agents.render", function()
       expect(lines_of(pane)[1]:find("✓ general-purpose", 1, true) ~= nil).to_be_true()
     end)
 
+    it("marks a background shell with $, names it by description or command, and leaves tokens blank", function()
+      local rows = {
+        { id = "a", kind = "subagent", agent_type = "Explore", prefix = "", state = "running", runtime_s = 60 },
+        {
+          id = "b1",
+          kind = "shell",
+          agent_type = "Bash",
+          description = "Build it",
+          command = "make build",
+          tool_id = "toolu_b",
+          transcript = "/s.jsonl",
+          prefix = "└─",
+          state = "failed",
+          runtime_s = 13,
+        },
+      }
+      render.subagents(pane, rows, { width = 40 })
+      local lines = lines_of(pane)
+      expect(lines[2]).to_be(" └─✗ $ Build it" .. string.rep(" ", 12) .. "         0:13")
+      expect(vim.fn.strdisplaywidth(lines[2])).to_be(40)
+      local payload = render.payload_at(pane, 2)
+      expect(payload.kind).to_be("shell")
+      expect(payload.task_id).to_be("b1")
+      expect(payload.tool_id).to_be("toolu_b")
+      expect(payload.transcript).to_be("/s.jsonl")
+
+      render.subagents(pane, rows, { width = 40, label = "type" })
+      expect(lines_of(pane)[2]:find("✗ $ make build", 1, true) ~= nil).to_be_true()
+    end)
+
     it("keeps the numbers inside a pane too narrow for any name", function()
       render.subagents(pane, {
         {

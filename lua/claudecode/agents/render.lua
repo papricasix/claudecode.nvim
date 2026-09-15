@@ -751,7 +751,10 @@ local SUBAGENT_MARK = {
   stopped = { text = "⊘", hl = "stopped" },
 }
 
----Draw the selected session's subagents as a tree.
+--- What sets a background shell's name apart from a subagent's.
+local SHELL_MARK = "$ "
+
+---Draw the selected session's subagents and background shells as a tree.
 ---
 ---One row per run: the tree's connectors, a state glyph, its name, and at the
 ---right edge what it cost and how long it ran. A run that has ended is drawn
@@ -762,6 +765,10 @@ local SUBAGENT_MARK = {
 ---ellipsis to whatever the tree and the numbers leave: a description is a
 ---sentence and the pane is a sidebar, and a name running under the numbers would
 ---push them past the window edge, where Neovim cuts without saying so.
+---
+---A background shell is a row of the same tree, marked `$` before its name. Its
+---name is its description, or with `label = "type"` the command itself — the
+---shell's answer to "what kind of worker is this". It has no token count.
 ---@param buf integer
 ---@param rows ClaudeCodeSubagentRow[]
 ---@param opts { width: integer?, label: "type"|"description"|nil }|nil
@@ -771,7 +778,7 @@ function M.subagents(buf, rows, opts)
   local lines, marks, payload_map = {}, {}, {}
 
   if #rows == 0 then
-    paint(buf, { "  no subagents" }, {}, {})
+    paint(buf, { "  no subagents or background shells" }, {}, {})
     return
   end
 
@@ -785,13 +792,17 @@ function M.subagents(buf, rows, opts)
   for index, row in ipairs(rows) do
     local mark = SUBAGENT_MARK[row.state] or SUBAGENT_MARK.stopped
     local ended = row.state ~= "running"
+    local is_shell = row.kind == "shell"
     -- Fixed fields, so every row's numbers line up however deep the tree goes.
-    local right = lpad(subagents.format_tokens(row.tokens), 5)
+    local right = lpad(is_shell and "" or subagents.format_tokens(row.tokens), 5)
       .. " "
       .. lpad(subagents.format_runtime(row.runtime_s), 7)
-    local head = GUTTER .. row.prefix .. mark.text .. " "
+    local head = GUTTER .. row.prefix .. mark.text .. " " .. (is_shell and SHELL_MARK or "")
     local room = math.max(1, width - vim.fn.strdisplaywidth(head) - vim.fn.strdisplaywidth(right) - 1)
     local text = row.agent_type or "agent"
+    if is_shell then
+      text = row.command or text
+    end
     if opts.label ~= "type" and type(row.description) == "string" then
       -- One line, whatever the launching call wrote.
       local described = row.description:gsub("%s+", " "):gsub("^ ", ""):gsub(" $", "")
@@ -804,7 +815,17 @@ function M.subagents(buf, rows, opts)
 
     local lnum = index - 1
     lines[#lines + 1] = line
-    payload_map[index] = { kind = "subagent", agent_id = row.id, description = row.description }
+    if is_shell then
+      payload_map[index] = {
+        kind = "shell",
+        task_id = row.id,
+        tool_id = row.tool_id,
+        transcript = row.transcript,
+        description = row.description,
+      }
+    else
+      payload_map[index] = { kind = "subagent", agent_id = row.id, description = row.description }
+    end
 
     local prefix_at = #GUTTER
     local mark_at = prefix_at + #row.prefix
@@ -814,6 +835,10 @@ function M.subagents(buf, rows, opts)
     local mark_group = mark.hl and hl(mark.hl) or busy_group
     if mark_group then
       marks[#marks + 1] = { row = lnum, col = mark_at, end_col = mark_at + #mark.text, hl = mark_group }
+    end
+    if is_shell then
+      local shell_at = mark_at + #mark.text + 1
+      marks[#marks + 1] = { row = lnum, col = shell_at, end_col = shell_at + #SHELL_MARK, hl = hl("time") }
     end
     marks[#marks + 1] = {
       row = lnum,

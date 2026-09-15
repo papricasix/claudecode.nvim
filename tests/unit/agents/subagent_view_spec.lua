@@ -252,6 +252,47 @@ describe("agents.subagent_view", function()
       expect(calls[bash_line].status).to_be("error")
     end)
 
+    it("draws a background shell's call with how the shell stands, and opens the shell", function()
+      local doc = fold({
+        user("go"),
+        assistant({
+          { type = "tool_use", id = "t3", name = "Bash", input = { command = "npm test", run_in_background = true } },
+        }),
+        result("t3", "Command running in background with ID: b3.", { stdout = "", backgroundTaskId = "b3" }),
+      })
+      local shell = { kind = "shell", id = "b3", tool_id = "t3", state = "running", runtime_s = 42, transcript = "/t" }
+      local lines, _, links, _, calls = view.render(doc, ctx({ row = { state = "running" }, shells = { t3 = shell } }))
+      local bash_line
+      for index, line in ipairs(lines) do
+        if line:find("`bash`", 1, true) then
+          bash_line = index
+        end
+      end
+      expect(lines[bash_line]).to_be("- ● `bash` npm test · in the background · 0:42")
+      expect(links[bash_line]).to_be(nil)
+      expect(calls[bash_line].shell).to_be(shell)
+
+      local opened
+      package.loaded["claudecode.agents.shell_view"] = {
+        open = function(opts)
+          opened = opts
+        end,
+      }
+      view.open_call("sess", { path = "/agent.jsonl", opts = {} }, calls[bash_line])
+      package.loaded["claudecode.agents.shell_view"] = nil
+      expect(opened.task_id).to_be("b3")
+      expect(opened.tool_id).to_be("t3")
+      expect(opened.transcript).to_be("/t")
+    end)
+
+    it("says a command went to the background rather than that it printed nothing", function()
+      local summary = view.summarize_result(
+        { content = "Command running in background" },
+        { stdout = "", backgroundTaskId = "b" }
+      )
+      expect(summary.summary).to_be("started in the background")
+    end)
+
     it("opens a call the way the Activity pane opens its row", function()
       local opened = {}
       package.loaded["claudecode.agents.file_view"] = {

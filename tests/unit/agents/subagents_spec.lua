@@ -245,6 +245,177 @@ describe("agents.subagents", function()
     end)
   end)
 
+  describe("background shells", function()
+    local TASKS = "/tmp/claude-501/-proj/sess/tasks"
+
+    local function shell_call(id, ts, input)
+      return vim.json.encode({
+        type = "assistant",
+        timestamp = iso(ts),
+        message = { role = "assistant", content = { { type = "tool_use", id = id, name = "Bash", input = input } } },
+      })
+    end
+
+    local function shell_result(id, ts, task_id, extra)
+      local text = task_id
+          and ("Command running in background with ID: " .. task_id .. ". Output is being written to: " .. TASKS .. "/" .. task_id .. ".output. You will be notified when it completes.")
+        or "hello"
+      local result =
+        { stdout = task_id and "" or "hello", stderr = "", interrupted = false, backgroundTaskId = task_id }
+      for key, value in pairs(extra or {}) do
+        result[key] = value
+      end
+      return vim.json.encode({
+        type = "user",
+        timestamp = iso(ts),
+        message = { role = "user", content = { { type = "tool_result", tool_use_id = id, content = text } } },
+        toolUseResult = result,
+      })
+    end
+
+    local function shell_note(task_id, tool_id, ts, status, summary)
+      return vim.json.encode({
+        type = "queue-operation",
+        operation = "enqueue",
+        timestamp = iso(ts),
+        content = table.concat({
+          "<task-notification>",
+          "<task-id>" .. task_id .. "</task-id>",
+          "<tool-use-id>" .. tool_id .. "</tool-use-id>",
+          "<output-file>" .. TASKS .. "/" .. task_id .. ".output</output-file>",
+          "<status>" .. status .. "</status>",
+          "<summary>" .. summary .. "</summary>",
+          "</task-notification>",
+        }, "\n"),
+      })
+    end
+
+    it("lists a command sent to the background, with where its output goes", function()
+      put(SESSION, {
+        shell_call(
+          "toolu_bg",
+          NOW - 100,
+          { command = "make   build", description = "Build it", run_in_background = true }
+        ),
+        shell_result("toolu_bg", NOW - 99, "b1"),
+      })
+      fs[TASKS .. "/b1.output"] = { data = "compiling\n", mtime = NOW - 2, ino = 9 }
+      local out = rows({ live = true })
+      expect(#out).to_be(1)
+      expect(out[1].kind).to_be("shell")
+      expect(out[1].id).to_be("b1")
+      expect(out[1].description).to_be("Build it")
+      expect(out[1].command).to_be("make build")
+      expect(out[1].tool_id).to_be("toolu_bg")
+      expect(out[1].state).to_be("running")
+      expect(out[1].runtime_s).to_be(99)
+      expect(out[1].output_path).to_be(TASKS .. "/b1.output")
+      expect(out[1].transcript).to_be(SESSION)
+    end)
+
+    it("leaves out a command that ran in the foreground", function()
+      put(SESSION, {
+        shell_call("toolu_fg", NOW - 100, { command = "ls" }),
+        shell_result("toolu_fg", NOW - 99, nil),
+      })
+      expect(#rows({ live = true })).to_be(0)
+    end)
+
+    it("takes the end and the exit code from its notification", function()
+      put(SESSION, {
+        shell_call("toolu_ok", NOW - 100, { command = "true", run_in_background = true }),
+        shell_result("toolu_ok", NOW - 100, "bok"),
+        shell_call("toolu_bad", NOW - 90, { command = "false", run_in_background = true }),
+        shell_result("toolu_bad", NOW - 90, "bbad"),
+        shell_call("toolu_kill", NOW - 80, { command = "sleep 99", run_in_background = true }),
+        shell_result("toolu_kill", NOW - 80, "bkill"),
+        shell_note("bok", "toolu_ok", NOW - 40, "completed", 'Background command "true" completed (exit code 0)'),
+        shell_note("bbad", "toolu_bad", NOW - 80, "failed", 'Background command "false" failed with exit code 144'),
+        shell_note("bkill", "toolu_kill", NOW - 20, "killed", 'Background command "sleep 99" was stopped'),
+      })
+      local by_id = {}
+      for _, row in ipairs(rows({ live = true })) do
+        by_id[row.id] = row
+      end
+      expect(by_id.bok.state).to_be("done")
+      expect(by_id.bok.exit_code).to_be(0)
+      expect(by_id.bok.runtime_s).to_be(60)
+      expect(by_id.bok.ended).to_be(true)
+      expect(by_id.bbad.state).to_be("failed")
+      expect(by_id.bbad.exit_code).to_be(144)
+      expect(by_id.bkill.state).to_be("stopped")
+    end)
+
+    it("nests a subagent's shells under it, in start order with its own subagents", function()
+      agent("worker", { first = NOW - 300 })
+      agent("helper", { parent = "worker", first = NOW - 200 })
+      local log = fs[DIR .. "/agent-worker.jsonl"]
+      log.data = log.data
+        .. shell_call("toolu_s", NOW - 250, { command = "npm test", run_in_background = true })
+        .. "\n"
+        .. shell_result("toolu_s", NOW - 250, "bsub")
+        .. "\n"
+      local out = rows({ live = true })
+      local drawn = {}
+      for _, row in ipairs(out) do
+        drawn[#drawn + 1] = row.prefix .. row.id
+      end
+      expect(table.concat(drawn, "|")).to_be("worker|├─bsub|└─helper")
+      expect(out[2].transcript).to_be(DIR .. "/agent-worker.jsonl")
+    end)
+
+    it("records a command sent to the background with Ctrl+B", function()
+      put(SESSION, {
+        shell_call("toolu_b", NOW - 100, { command = "cargo build" }),
+        shell_result("toolu_b", NOW - 60, "bctl", { backgroundedByUser = true }),
+      })
+      fs[TASKS .. "/bctl.output"] = { data = "", mtime = NOW, ino = 9 }
+      local row = rows({ live = true })[1]
+      expect(row.id).to_be("bctl")
+      expect(row.by_user).to_be(true)
+      expect(row.runtime_s).to_be(60)
+    end)
+
+    it("is not running once its output file is gone, even in a live session", function()
+      put(SESSION, {
+        shell_call("toolu_bg", NOW - 100, { command = "sleep 1", run_in_background = true }),
+        shell_result("toolu_bg", NOW - 99, "bgone"),
+      })
+      expect(rows({ live = true })[1].state).to_be("stopped")
+    end)
+
+    it("reads a quiet shell in a session not known to be live as stopped", function()
+      put(SESSION, {
+        shell_call("toolu_bg", NOW - 7200, { command = "watch", run_in_background = true }),
+        shell_result("toolu_bg", NOW - 7200, "bquiet"),
+      })
+      fs[TASKS .. "/bquiet.output"] = { data = "", mtime = NOW - 3600, ino = 9 }
+      expect(rows({ live = false })[1].state).to_be("stopped")
+      fs[TASKS .. "/bquiet.output"].mtime = NOW - 5
+      expect(rows({ live = false })[1].state).to_be("running")
+    end)
+
+    it("unescapes a Windows output path", function()
+      put(SESSION, {
+        vim.json.encode({
+          type = "assistant",
+          timestamp = iso(NOW - 10),
+          message = {
+            role = "assistant",
+            content = { { type = "tool_use", id = "toolu_w", name = "PowerShell", input = { command = "dir" } } },
+          },
+        }),
+        -- As the CLI writes it: the separators JSON-escaped, doubled on disk.
+        '{"type":"user","timestamp":"'
+          .. iso(NOW - 9)
+          .. '","message":{"content":[{"tool_use_id":"toolu_w","type":"tool_result","content":"Command running in background with ID: bw. Output is being written to: C:\\\\Users\\\\me\\\\tasks\\\\bw.output. You will be notified"}]},"toolUseResult":{"stdout":"","backgroundTaskId":"bw"}}',
+      })
+      local row = rows({ live = true })[1]
+      expect(row.output_path).to_be("C:\\Users\\me\\tasks\\bw.output")
+      expect(row.agent_type).to_be("PowerShell")
+    end)
+  end)
+
   describe("formatting", function()
     it("shortens token counts", function()
       expect(subagents.format_tokens(nil)).to_be("·")

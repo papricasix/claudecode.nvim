@@ -399,7 +399,8 @@ end
 ---glance and nothing else on screen says which is in force.
 ---@return string
 local function subagents_title()
-  return subagent_label() == "type" and "Subagents · type" or "Subagents"
+  -- Subagents and background shells: the CLI's two kinds of background task.
+  return subagent_label() == "type" and "Tasks · type/command" or "Tasks"
 end
 
 ---The pane sizes the config asks for, in cells.
@@ -704,8 +705,8 @@ local KEY_SPECS = {
   {
     field = "open",
     panes = { "subagents" },
-    group = "Subagents",
-    desc = "Read its transcript: what it was sent to do, said and ran (<CR> on a subagent in it opens that one)",
+    group = "Tasks",
+    desc = "A subagent: read its transcript (<CR> on a subagent in it opens that one). A shell: its output, followed live",
     run = function()
       M.open_under_cursor()
     end,
@@ -713,8 +714,8 @@ local KEY_SPECS = {
   {
     field = "subagent_label",
     panes = { "subagents" },
-    group = "Subagents",
-    desc = "Name each subagent by what it was sent to do / by its agent type",
+    group = "Tasks",
+    desc = "Name each task by what it was sent to do / by its agent type or command",
     run = function()
       M.toggle_subagent_label()
     end,
@@ -2576,7 +2577,10 @@ local function next_open_row(pane, lnum, delta, action)
     local candidate = ((lnum - 1 + delta * step) % count) + 1
     local payload = render.payload_at(buf, candidate)
     local openable = payload
-      and (payload.path or ((payload.kind == "tool" or payload.kind == "subagent") and action ~= "head"))
+      and (
+        payload.path
+        or ((payload.kind == "tool" or payload.kind == "subagent" or payload.kind == "shell") and action ~= "head")
+      )
     if openable then
       return candidate
     end
@@ -2704,6 +2708,26 @@ local function bind_float_nav(win, pane, lnum, action)
   end
 end
 
+---Look up a Subagents row — a run or a background shell — by id, as the pane has it.
+---
+---The pane's rows know whether the session is live; a row the selection has moved
+---away from is left for the viewer to work out from the files.
+---@param session_path string|nil The session the float was opened for.
+---@return fun(id: string): ClaudeCodeSubagentRow|nil
+local function subagent_row_for(session_path)
+  return function(id)
+    if not session_path or model.transcript_path() ~= session_path then
+      return nil
+    end
+    for _, row in ipairs(model.subagents()) do
+      if row.id == id then
+        return row
+      end
+    end
+    return nil
+  end
+end
+
 ---Open the file on a row, showing what the selected session did to it.
 ---
 ---A row in either pane is a record of work, not a file reference: the Changes pane
@@ -2748,6 +2772,28 @@ function open_row(payload, pane, lnum, action, nav_opts)
       label = payload.label,
       status = payload.status,
       reuse = nav_opts.reuse,
+      -- A command that went to the background opens as that shell, followed live.
+      row_for = subagent_row_for(model.transcript_path()),
+    }, opened)
+    return
+  end
+
+  -- A background shell: its command, how it stands, and its output, followed live.
+  if payload and payload.kind == "shell" then
+    if action ~= "diff" then
+      return opened(nil)
+    end
+    local ok_shell, shell_view = pcall(require, "claudecode.agents.shell_view")
+    if not ok_shell or not payload.transcript then
+      return opened(nil)
+    end
+    shell_view.open({
+      session_id = model.selected(),
+      transcript = payload.transcript,
+      task_id = payload.task_id,
+      tool_id = payload.tool_id,
+      reuse = nav_opts.reuse,
+      row_for = subagent_row_for(model.transcript_path()),
     }, opened)
     return
   end
@@ -2768,19 +2814,7 @@ function open_row(payload, pane, lnum, action, nav_opts)
       session_path = session_path,
       agent_id = payload.agent_id,
       reuse = nav_opts.reuse,
-      -- The pane's rows know whether the session is live; a row the selection has
-      -- moved away from is left for the viewer to work out from the files.
-      row_for = function(id)
-        if model.transcript_path() ~= session_path then
-          return nil
-        end
-        for _, row in ipairs(model.subagents()) do
-          if row.id == id then
-            return row
-          end
-        end
-        return nil
-      end,
+      row_for = subagent_row_for(session_path),
       on_open = function(win)
         bind_float_nav(win, pane, lnum, action)
       end,

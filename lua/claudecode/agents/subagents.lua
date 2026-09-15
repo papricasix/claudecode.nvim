@@ -22,6 +22,12 @@
 ---
 --- `transcript.lua` folds both into every summary, so the answer is the union of
 --- the session's summary and each subagent's.
+---
+--- **Background shells** share the tree, under whoever started them: the session's
+--- own at the top, a subagent's beneath it. They are the CLI's other kind of
+--- background task and are recorded the same way — the call, a result carrying
+--- `backgroundTaskId` and the path its output streams into, and a
+--- `<task-notification>` with status and exit code in the launching transcript.
 ---@brief ]]
 ---@module 'claudecode.agents.subagents'
 
@@ -173,14 +179,22 @@ end
 local ENDED = { completed = "done", killed = "stopped", stopped = "stopped", cancelled = "stopped" }
 
 ---@class ClaudeCodeSubagentRow
----@field id string
----@field agent_type string
+---@field kind "subagent"|"shell"
+---@field id string An agent id, or a shell's task id.
+---@field agent_type string For a shell, the tool that ran it (`Bash`, `PowerShell`).
 ---@field description string|nil
 ---@field depth integer 0 for a subagent the session started itself.
 ---@field prefix string Tree connectors drawn before the icon ("", "├─", "│ └─", …).
 ---@field state "running"|"done"|"failed"|"stopped"
 ---@field tokens integer|nil
 ---@field runtime_s number|nil
+---@field command string|nil Shells: one line of the command.
+---@field tool_id string|nil Shells: the call that started it.
+---@field exit_code integer|nil Shells: how it exited, once it has.
+---@field output_path string|nil Shells: the file its output streams into.
+---@field transcript string|nil Shells: the transcript that launched it.
+---@field by_user boolean|nil Shells: sent to the background with Ctrl+B.
+---@field ended boolean|nil Shells: the CLI recorded how it ended.
 
 ---Where one run stands, from everything that could have recorded its end.
 ---@param agent ClaudeCodeSubagent
@@ -225,24 +239,75 @@ local function classify(agent, index, opts)
   return "stopped", live_tokens, math.max(0, last - first)
 end
 
----The session's subagents as a flattened tree, children under their parent in
----the order they started.
+--- What a shell's notification status means for its row.
+local SHELL_ENDED = { completed = "done", failed = "failed", killed = "stopped", stopped = "stopped" }
+
+---Where one background shell stands.
+---
+---Its notification is the only record of an end, and a shell notifies exactly
+---once. Without one it is running while its output file exists and either the
+---session is live or the file is still being written — a shell that prints
+---nothing for ten minutes in a session not known to be live here reads stopped,
+---the same bargain `classify` makes for a quiet subagent.
+---@param shell ClaudeCodeAgentsShell
+---@param note ClaudeCodeAgentsTaskResult|nil
+---@param opts { live: boolean?, now: number }
+---@return string state
+---@return number|nil runtime_s
+---@return integer|nil exit_code
+function M.shell_state(shell, note, opts)
+  local started = shell.started_ts or shell.ts or 0
+  if note then
+    local state = SHELL_ENDED[note.status] or "failed"
+    -- `completed` with a non-zero code does not happen, but a code is the harder fact.
+    if state == "done" and note.exit_code and note.exit_code ~= 0 then
+      state = "failed"
+    end
+    return state, math.max(0, (note.ts or started) - started), note.exit_code
+  end
+  -- A running shell always has its output file; one that is gone (the temp
+  -- directory was swept, or the CLI cleaned up after itself) is not running,
+  -- whatever else is true. Asked first so a live session does not keep a shell
+  -- its previous process took with it spinning for ever.
+  local written = nil
+  local fs = transcript._io
+  if shell.output_path and fs and fs.stat then
+    local st = fs.stat(shell.output_path)
+    if not st then
+      return "stopped", nil, nil
+    end
+    written = st.mtime or 0
+  end
+  if opts.live or (written and (opts.now - written) < M.STALE_S) then
+    return "running", math.max(0, opts.now - started), nil
+  end
+  return "stopped", math.max(0, math.max(written, started) - started), nil
+end
+
+---The session's subagents and background shells as a flattened tree, children
+---under their parent in the order they started.
 ---@param transcript_path string
 ---@param opts { live: boolean?, now: number? }|nil `live`: the session is running.
 ---@return ClaudeCodeSubagentRow[]
 function M.rows(transcript_path, opts)
   opts = { live = opts and opts.live, now = (opts and opts.now) or os.time() }
   local agents = M.scan(transcript_path)
-  if #agents == 0 then
-    return {}
-  end
 
   local index = { notes = {}, results = {}, calls = {} }
-  local sources = { transcript.get(transcript_path) }
-  for _, agent in ipairs(agents) do
-    sources[#sources + 1] = transcript.get(agent.path)
+  ---@type { sum: table, parent: string|nil, path: string }[]
+  local sources = {}
+  local session = transcript.get(transcript_path)
+  if session then
+    sources[#sources + 1] = { sum = session, path = transcript_path }
   end
-  for _, sum in pairs(sources) do
+  for _, agent in ipairs(agents) do
+    local sum = transcript.get(agent.path)
+    if sum then
+      sources[#sources + 1] = { sum = sum, parent = agent.id, path = agent.path }
+    end
+  end
+  for _, source in ipairs(sources) do
+    local sum = source.sum
     merge_newest(index.notes, sum.task_notes)
     merge_newest(index.results, sum.agent_results)
     for id, call in pairs(sum.agent_calls or {}) do
@@ -250,11 +315,33 @@ function M.rows(transcript_path, opts)
     end
   end
 
+  -- Every node of the tree, subagents and shells alike, sorted and walked as one.
+  ---@type table[]
+  local nodes = {}
+  for _, agent in ipairs(agents) do
+    nodes[#nodes + 1] = agent
+  end
+  for _, source in ipairs(sources) do
+    for task_id, shell in pairs(source.sum.shells or {}) do
+      nodes[#nodes + 1] = {
+        kind = "shell",
+        id = task_id,
+        parent_id = source.parent,
+        started = shell.started_ts or shell.ts or 0,
+        shell = shell,
+        transcript = source.path,
+      }
+    end
+  end
+  if #nodes == 0 then
+    return {}
+  end
+
   local by_id, children, roots = {}, {}, {}
   for _, agent in ipairs(agents) do
     by_id[agent.id] = agent
   end
-  for _, agent in ipairs(agents) do
+  for _, agent in ipairs(nodes) do
     -- A parent we cannot see (its descriptor unreadable) would orphan the whole
     -- branch; it is drawn from the top instead.
     if agent.parent_id and by_id[agent.parent_id] and agent.parent_id ~= agent.id then
@@ -273,7 +360,7 @@ function M.rows(transcript_path, opts)
   end
 
   local out, visited = {}, {}
-  ---@param list ClaudeCodeSubagent[]
+  ---@param list table[] Subagents, and shell nodes (`kind = "shell"`).
   ---@param depth integer
   ---@param stem string Connectors inherited from the ancestors.
   local function walk(list, depth, stem)
@@ -282,17 +369,42 @@ function M.rows(transcript_path, opts)
       if not visited[agent.id] then
         visited[agent.id] = true
         local last = position == #list
-        local state, tokens, runtime = classify(agent, index, opts)
-        out[#out + 1] = {
-          id = agent.id,
-          agent_type = agent.agent_type,
-          description = agent.description,
-          depth = depth,
-          prefix = depth == 0 and "" or (stem .. (last and "└─" or "├─")),
-          state = state,
-          tokens = tokens,
-          runtime_s = runtime,
-        }
+        local prefix = depth == 0 and "" or (stem .. (last and "└─" or "├─"))
+        if agent.kind == "shell" then
+          local shell = agent.shell
+          local note = index.notes[agent.id]
+          local state, runtime, exit_code = M.shell_state(shell, note, opts)
+          out[#out + 1] = {
+            kind = "shell",
+            id = agent.id,
+            agent_type = shell.tool,
+            description = shell.description,
+            command = shell.command,
+            tool_id = shell.tool_id,
+            depth = depth,
+            prefix = prefix,
+            state = state,
+            runtime_s = runtime,
+            exit_code = exit_code,
+            output_path = shell.output_path or (note and note.output_file) or nil,
+            by_user = shell.by_user,
+            ended = note ~= nil,
+            transcript = agent.transcript,
+          }
+        else
+          local state, tokens, runtime = classify(agent, index, opts)
+          out[#out + 1] = {
+            kind = "subagent",
+            id = agent.id,
+            agent_type = agent.agent_type,
+            description = agent.description,
+            depth = depth,
+            prefix = prefix,
+            state = state,
+            tokens = tokens,
+            runtime_s = runtime,
+          }
+        end
         if children[agent.id] then
           walk(children[agent.id], depth + 1, depth == 0 and "" or (stem .. (last and "  " or "│ ")))
         end

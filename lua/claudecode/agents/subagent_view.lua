@@ -142,7 +142,7 @@ function M.summarize_result(block, result)
     if tonumber(result.totalTokens) then
       return { status = "done", summary = subagents.format_tokens(tonumber(result.totalTokens)) .. " tokens" }
     end
-    if result.status == "async_launched" then
+    if result.status == "async_launched" or type(result.backgroundTaskId) == "string" then
       return { status = "done", summary = "started in the background" }
     end
     if tonumber(result.numFiles) then
@@ -316,6 +316,7 @@ end
 ---@class ClaudeCodeSubagentViewContext
 ---@field row ClaudeCodeSubagentRow|nil The run being shown.
 ---@field children table<string, ClaudeCodeSubagentRow> Runs it started, by the tool_use id that started them.
+---@field shells table<string, ClaudeCodeSubagentRow>|nil Background shells of the session, by the tool_use id that started them.
 ---@field by_id table<string, ClaudeCodeSubagentRow> Every run of the session, by agent id.
 ---@field cwd string|nil Where the session ran, which file paths are shown relative to.
 ---@field back string|nil What `<BS>` returns to, when this run was opened from another's transcript.
@@ -405,10 +406,23 @@ function M.render(doc, ctx)
       add("> ⊘ interrupted")
     elseif item.kind == "tool" then
       local child = item.id and ctx.children[item.id] or nil
+      local shell = item.id and ctx.shells and ctx.shells[item.id] or nil
       local glyph, summary
       if child then
         glyph = STATE_GLYPH[child.state] or "●"
         summary = cost(child.tokens, child.runtime_s)
+      elseif shell then
+        -- The call's own result only says it went to the background; how the
+        -- command is doing is the shell's.
+        glyph = STATE_GLYPH[shell.state] or "●"
+        local parts = { "in the background" }
+        if shell.exit_code and shell.exit_code ~= 0 then
+          parts[#parts + 1] = "exit " .. shell.exit_code
+        end
+        if shell.runtime_s then
+          parts[#parts + 1] = subagents.format_runtime(shell.runtime_s)
+        end
+        summary = table.concat(parts, " · ")
       else
         local result = item.id and doc.results[item.id] or nil
         local status = result and result.status or "running"
@@ -431,6 +445,8 @@ function M.render(doc, ctx)
       glyph_mark(glyph, 2)
       if child then
         links[#lines] = child.id
+      elseif shell then
+        calls[#lines] = { tool_id = item.id, tool = item.name, label = item.label, shell = shell }
       elseif item.id then
         -- Everything the Activity pane's row for this call would carry, so `<CR>`
         -- can open the same float it opens.
@@ -447,7 +463,7 @@ function M.render(doc, ctx)
     elseif item.kind == "note" then
       local target = ctx.by_id[item.id]
       local glyph = item.status == "completed" and "✓" or (item.status == "killed" and "⊘" or "✗")
-      local name = target and (target.description or target.agent_type) or item.summary or item.id
+      local name = target and (target.description or target.command or target.agent_type) or item.summary or item.id
       local line = "- " .. glyph .. " finished: " .. name
       local spent_child = cost(item.tokens, item.duration_ms and item.duration_ms / 1000 or nil)
       if spent_child ~= "" then
@@ -455,7 +471,10 @@ function M.render(doc, ctx)
       end
       add(line)
       glyph_mark(glyph, 2)
-      if target then
+      if target and target.kind == "shell" then
+        calls[#lines] =
+          { tool_id = target.tool_id, tool = target.agent_type, label = target.description, shell = target }
+      elseif target then
         links[#lines] = item.id
       end
     end
@@ -514,6 +533,12 @@ local function context(session_path, agent_id, row_for, history)
       children[agent.tool_use_id] = by_id[agent.id]
     end
   end
+  local shells = {}
+  for _, row in pairs(by_id) do
+    if row.kind == "shell" and row.tool_id then
+      shells[row.tool_id] = row
+    end
+  end
   local summary = transcript.get(session_path)
   local back = nil
   local parent = history and history[#history]
@@ -524,6 +549,7 @@ local function context(session_path, agent_id, row_for, history)
   return {
     row = by_id[agent_id],
     children = children,
+    shells = shells,
     by_id = by_id,
     cwd = summary and summary.cwd or nil,
     back = back,
@@ -695,8 +721,24 @@ local TOOL_VIEW_STATUS = { error = "error", rejected = "rejected", interrupted =
 ---session from. A new float, stacked over this one, so `q` comes back here.
 ---@param session_id string|nil
 ---@param view table The viewer the call was chosen in.
----@param call { tool_id: string, tool: string, label: string?, path: string?, read: table?, status: string? }
+---
+---A background shell opens as that shell, its output followed live.
+---@param call { tool_id: string, tool: string, label: string?, path: string?, read: table?, status: string?,
+---             shell: ClaudeCodeSubagentRow? }
 function M.open_call(session_id, view, call)
+  if call.shell then
+    local ok, shell_view = pcall(require, "claudecode.agents.shell_view")
+    if ok then
+      shell_view.open({
+        session_id = session_id,
+        transcript = call.shell.transcript or view.path,
+        task_id = call.shell.id,
+        tool_id = call.shell.tool_id,
+        row_for = view.opts and view.opts.row_for,
+      })
+    end
+    return
+  end
   if tools.FILE_TOOLS[call.tool] and call.path then
     local ok, file_view = pcall(require, "claudecode.agents.file_view")
     if ok then
@@ -721,6 +763,7 @@ function M.open_call(session_id, view, call)
       tool = call.tool,
       label = call.label,
       status = call.status and TOOL_VIEW_STATUS[call.status] or (call.status == nil and "running" or nil),
+      row_for = view.opts and view.opts.row_for,
     })
   end
 end

@@ -71,6 +71,15 @@ M.REJECTION_MARKER = REJECTION_MARKER
 --- The tools that start a subagent. `Task` is the name older CLIs used.
 local AGENT_TOOLS = { Agent = true, Task = true }
 
+--- The tools that run a shell command, and so can leave one running in the
+--- background. `PowerShell` is the same tool on Windows.
+local SHELL_TOOLS = { Bash = true, PowerShell = true }
+M.SHELL_TOOLS = SHELL_TOOLS
+
+--- Longest command kept on a background shell's record. The record names a row;
+--- the whole command is read back out of the transcript when a float asks.
+local SHELL_COMMAND_LIMIT = 512
+
 --- Live summaries: [path] = ClaudeCodeAgentsSummary.
 local cache = {}
 
@@ -131,7 +140,9 @@ local config = nil
 ---@field tokens integer|nil Context size of the newest assistant turn: input, both cache reads/writes and output.
 ---@field agent_calls table<string, ClaudeCodeAgentsEvent> `Agent`/`Task` tool events, by tool_use id.
 ---@field agent_results table<string, ClaudeCodeAgentsTaskResult> Foreground subagent results, by tool_use id.
----@field task_notes table<string, ClaudeCodeAgentsTaskResult> Background task completions, by agent id.
+---@field task_notes table<string, ClaudeCodeAgentsTaskResult> Background task completions, by task id (an agent id, or a shell's `b…` id).
+---@field shell_calls table<string, { tool: string, description: string|nil, command: string|nil, ts: number }> Shell calls with no result yet, by tool_use id.
+---@field shells table<string, ClaudeCodeAgentsShell> Shells this transcript sent to the background, by task id.
 ---@field interrupted_ts number|nil Set when the CLI recorded a user interrupt; see INTERRUPT_MARKER.
 ---@field size integer Bytes of the file when last folded.
 ---@field mtime integer
@@ -140,12 +151,26 @@ local config = nil
 ---@field skipped integer Lines that decoded but matched no known shape.
 ---@field partial boolean|nil Counts came from the warm cache; no fold state yet.
 
----@class ClaudeCodeAgentsTaskResult How a subagent run ended, as its parent was told.
----@field id string Agent id (notifications) or tool_use id (foreground results).
+---@class ClaudeCodeAgentsTaskResult How a background task ended, as its launcher was told.
+---@field id string Task id (notifications) or tool_use id (foreground results).
 ---@field status string The CLI's own word: `completed`, `failed`, `killed`, ….
 ---@field tokens integer|nil
 ---@field duration_ms integer|nil
+---@field tool_use_id string|nil The call that started it (notifications).
+---@field output_file string|nil Where its output was written (notifications).
+---@field exit_code integer|nil A shell's exit code, from the notification's summary.
 ---@field ts number Epoch seconds the parent recorded it.
+
+---@class ClaudeCodeAgentsShell A shell command left running in the background.
+---@field task_id string The CLI's id for it (`b4mk05121`), which its notification and output file are named by.
+---@field tool_id string|nil The `toolu_…` call that started it.
+---@field tool string `Bash` or `PowerShell`.
+---@field description string|nil
+---@field command string|nil One line of it, cut to SHELL_COMMAND_LIMIT.
+---@field ts number Epoch seconds the call was made.
+---@field started_ts number Epoch seconds it went to the background (the result's timestamp).
+---@field output_path string|nil The file its output streams into, as the CLI stated it.
+---@field by_user boolean|nil Sent to the background with Ctrl+B rather than asked for.
 
 --------------------------------------------------------------------------------
 -- I/O seam
@@ -621,10 +646,15 @@ end
 ---
 ---File tools are skipped: their results already produce rows, and a second one for
 ---the call would say the same thing twice.
+---
+---A shell call is also remembered on its own until its result lands, whether or
+---not the pane wants tool rows: whether it went to the background is only said by
+---the result, and by then the call — what it runs, what it is for — is behind us.
 ---@param sum ClaudeCodeAgentsSummary
 ---@param entry table Decoded transcript line.
+---@param want_events boolean Whether the Activity pane wants rows for tool calls.
 ---@return boolean handled
-local function fold_tool_use(sum, entry)
+local function fold_tool_use(sum, entry, want_events)
   local message = entry.message
   local content = type(message) == "table" and message.content or nil
   if type(content) ~= "table" then
@@ -639,6 +669,22 @@ local function fold_tool_use(sum, entry)
   for _, block in ipairs(content) do
     if
       type(block) == "table"
+      and block.type == "tool_use"
+      and SHELL_TOOLS[block.name]
+      and type(block.id) == "string"
+    then
+      local input = type(block.input) == "table" and block.input or {}
+      local command = type(input.command) == "string" and input.command:gsub("%s+", " ") or nil
+      sum.shell_calls[block.id] = {
+        tool = block.name,
+        description = type(input.description) == "string" and input.description or nil,
+        command = command and command:sub(1, SHELL_COMMAND_LIMIT) or nil,
+        ts = ts,
+      }
+    end
+    if
+      want_events
+      and type(block) == "table"
       and block.type == "tool_use"
       and type(block.name) == "string"
       and not tools.FILE_TOOLS[block.name]
@@ -712,6 +758,51 @@ local function resolve_tool(sum, line)
   else
     event.status = "error"
   end
+end
+
+---Settle a shell call from its result line, recording it when it went to the
+---background.
+---
+---Matched raw, never decoded, for the reason `resolve_tool` is: a foreground
+---command's result carries its whole output. Inside that output a quote is
+---escaped, so an unescaped `"backgroundTaskId":"` is the result's own field.
+---Every way a command ends up in the background says so with that field — asked
+---for with `run_in_background`, sent there with Ctrl+B, or moved there when it
+---outlived its timeout — and every one of them states where its output goes in
+---the same sentence, which is read rather than derived: the CLI's temp root
+---depends on the platform, `CLAUDE_CODE_TMPDIR` and a symlink resolution this
+---side cannot repeat reliably.
+---@param sum ClaudeCodeAgentsSummary
+---@param line string
+local function settle_shell(sum, line)
+  local id = line:match('"tool_use_id":"([^"]+)"')
+  local call = id and sum.shell_calls[id]
+  if not call then
+    return
+  end
+  sum.shell_calls[id] = nil
+  local task_id = line:match('"backgroundTaskId":"([^"]+)"')
+  if not task_id then
+    return
+  end
+  local path = line:match("Output is being written to: (.-%.output)")
+  if path then
+    -- Still JSON-escaped: a Windows path has its separators doubled.
+    path = path:gsub("\\\\", "\\"):gsub("\\/", "/")
+  end
+  local at = line:find('"timestamp":"', 1, true)
+  local started = at and M._iso_to_epoch(line:sub(at + 13, at + 40)) or 0
+  sum.shells[task_id] = {
+    task_id = task_id,
+    tool_id = id,
+    tool = call.tool,
+    description = call.description,
+    command = call.command,
+    ts = call.ts,
+    started_ts = started > 0 and started or call.ts,
+    output_path = path,
+    by_user = line:find('"backgroundedByUser":true', 1, true) ~= nil or nil,
+  }
 end
 
 ---Fold one decoded `toolUseResult` entry into the summary.
@@ -908,11 +999,17 @@ function M._task_notification(line)
   if not id then
     return nil
   end
+  -- A shell's exit code is only in the sentence summarising it: `… completed
+  -- (exit code 0)`, `… failed with exit code 144`.
+  local summary = body:match("<summary>([^<]*)</summary>")
   return {
     id = id,
     status = body:match("<status>([^<]+)</status>") or "completed",
     tokens = tonumber(body:match("<subagent_tokens>(%d+)</subagent_tokens>")),
     duration_ms = tonumber(body:match("<duration_ms>(%d+)</duration_ms>")),
+    tool_use_id = body:match("<tool%-use%-id>([^<]+)</tool%-use%-id>"),
+    output_file = body:match("<output%-file>([^<]+)</output%-file>"),
+    exit_code = summary and tonumber(summary:match("exit code (%-?%d+)")) or nil,
     ts = M._iso_to_epoch(entry.timestamp),
   }
 end
@@ -981,6 +1078,9 @@ function M._fold_line(sum, line)
       event.status = "interrupted"
       sum.pending[id] = nil
     end
+    -- A shell cut off here never reached the background (one that did has its
+    -- result already), so it will never be one.
+    sum.shell_calls = {}
     return
   end
 
@@ -1025,10 +1125,15 @@ function M._fold_line(sum, line)
   -- cheap in a way worth stating: measured on this project's largest transcript
   -- (11.9MB, 2628 lines), 451 lines carry a `tool_use` block, 1.26MB in total,
   -- 20ms to decode all of them once.
-  if tools_wanted() and line:find('"type":"tool_use"', 1, true) then
-    local ok, entry = pcall(vim.json.decode, line)
-    if ok and type(entry) == "table" then
-      pcall(fold_tool_use, sum, entry)
+  if line:find('"type":"tool_use"', 1, true) then
+    -- Decoded for the pane's rows, or for a shell call that may go to the
+    -- background; with tool rows off, only the second.
+    local want_events = tools_wanted()
+    if want_events or line:find('"name":"Bash"', 1, true) or line:find('"name":"PowerShell"', 1, true) then
+      local ok, entry = pcall(vim.json.decode, line)
+      if ok and type(entry) == "table" then
+        pcall(fold_tool_use, sum, entry, want_events)
+      end
     end
     return
   end
@@ -1040,6 +1145,9 @@ function M._fold_line(sum, line)
     -- that is never decoded (see `resolve_tool`).
     if tools_wanted() then
       resolve_tool(sum, line)
+    end
+    if next(sum.shell_calls) ~= nil then
+      settle_shell(sum, line)
     end
     -- A foreground subagent's result says what the run cost. The keys are matched
     -- raw for the same reason the rest of this branch is: the line also carries
@@ -1117,6 +1225,8 @@ local function new_summary(path)
     agent_calls = {},
     agent_results = {},
     task_notes = {},
+    shell_calls = {},
+    shells = {},
     last_ts = 0,
     first_ts = 0,
     size = 0,

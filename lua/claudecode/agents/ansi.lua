@@ -239,12 +239,17 @@ end
 ---
 ---SGR state carries across lines, the way it does in a terminal: a command that
 ---opens a colour and writes several lines before closing it is common.
+---
+---Output read a piece at a time carries it across pieces too: pass the same
+---`state` table to each call and it is continued, and left as the last line
+---closed it.
 ---@param lines string[]
+---@param state table|nil SGR state to start from, updated in place.
 ---@return string[] clean
 ---@return { row: integer, col: integer, end_col: integer, hl: string }[] marks 0-based rows and byte columns.
-function M.parse(lines)
+function M.parse(lines, state)
   local clean, marks = {}, {}
-  local state = {}
+  state = state or {}
 
   for row, raw in ipairs(lines) do
     local out = {}

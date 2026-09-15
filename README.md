@@ -309,7 +309,8 @@ there too.
 - The view **opens already pointed at your newest session**, as though you had
   pressed `<C-n>` once — so `i` from any pane starts that one, and nothing has to
   be chosen before the panes have something to show.
-- The **Subagents** pane, under Changes, shows the subagents the selected session started as a tree — a nested subagent under the one that launched it — with what each one was sent to do, tokens used and runtime. A running one is marked `●` and its runtime counts up; one that finished is marked `✓` (with the tokens and duration the CLI reported), one that failed `✗`, and one that was stopped or abandoned `⊘`. Everything comes from the CLI's own per-subagent transcripts, so it works for conversations that ran anywhere. Rows are named by what each subagent was sent to do (its description), cut with `…` to fit the pane; `g.` switches them to the agent type and back, and the pane's title reads `Subagents · type` while types are showing.
+- The **Tasks** pane, under Changes, shows the subagents the selected session started as a tree — a nested subagent under the one that launched it — with what each one was sent to do, tokens used and runtime. A running one is marked `●` and its runtime counts up; one that finished is marked `✓` (with the tokens and duration the CLI reported), one that failed `✗`, and one that was stopped or abandoned `⊘`. Everything comes from the CLI's own per-subagent transcripts, so it works for conversations that ran anywhere. Rows are named by what each subagent was sent to do (its description), cut with `…` to fit the pane; `g.` switches them to the agent type and back, and the pane's title reads `Tasks · type/command` while types are showing.
+- **Background shells** are in the same tree, marked `$`, under whoever started them — the session's own at the top, a subagent's beneath it: commands run with `run_in_background`, sent to the background with Ctrl+B, or moved there when they outlived their timeout. Each shows its state and runtime (`✗` for a non-zero exit); `g.` names them by the command instead of the description. `<CR>` opens the shell in a float: the command, how it stands (`● running · 0:42`, `✗ exit 144 · 0:13`), and its output, read from the file the CLI streams it into and **followed live** while the command runs — colours kept, progress bars that redraw with `\r` shown as they end up. With the cursor on the last line the float follows new output; move up and it stays put. Very long output starts from its last megabyte, and the rule above the output says when something was left out or the file is no longer on disk. A background command's row in the Activity pane, and its line in a subagent's transcript, open the same float.
 - `<CR>` on a subagent opens its **transcript in a float**: the whole purpose as the headline with its type, state, tokens and runtime, then the prompt it was given, what it said, its reasoning folded away on its own background (`<Tab>` opens and closes a block), and one line per tool call saying how it went — `✓ 12 lines`, `+3 -1`, `✗ Exit code 1`. Tool output itself is left out (it is almost all of a subagent's transcript); `<CR>` on an Activity row is where one call's output is read. A subagent it started is a line of its own, and `<CR>` there opens that one in the same float; `<BS>` goes back to the one you came from, onto the line you left. `<CR>` on any other tool line opens that call the way the Activity pane does — what the subagent did to the file, or the command and its output — in a float of its own that `q` closes. While the run is working the float follows it, and `<C-n>`/`<C-p>` step to the next or previous subagent.
 - The Activity pane lists the selected agent's tool calls **newest first**, so
   what it is doing now is at the top rather than scrolled off the bottom.
@@ -409,7 +410,7 @@ opts = {
     poll_ms = 500,
     layout = { left_width = 0.23, right_width = 0.23, sessions_height = 0.55 },
                                   -- the terminal absorbs the rest (0.54 by default);
-                                  -- sessions_height also splits Changes from Subagents
+                                  -- sessions_height also splits Changes from Tasks
     sessions = {
       -- How far back the list reaches: a span ("1d", "3d", "2w", "1m" — a month
       -- is thirty days — or "all"), or a plain number for the newest N however
@@ -493,7 +494,7 @@ opts = {
       sort = "gs",                -- choose what the list is ordered by
       close = "q", open = "<CR>", git_diff = ".", goto_file = "gf", help = "?",
       filter = "f",               -- Activity: everything / files / commands
-      subagent_label = "g.",      -- Subagents: description / agent type
+      subagent_label = "g.",      -- Tasks: description / agent type or command
       next_pane = "<Tab>", focus_term = "i",
       -- Cycle the selected session from any pane, and from inside the agent's
       -- terminal (bound there in terminal mode too). Inside a file float the same

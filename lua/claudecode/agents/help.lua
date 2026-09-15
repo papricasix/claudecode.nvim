@@ -25,7 +25,7 @@ local PANE_LABEL = {
   sessions = "Sessions",
   feed = "Activity",
   changes = "Changes",
-  subagents = "Subagents",
+  subagents = "Tasks",
   center = "Agent",
 }
 

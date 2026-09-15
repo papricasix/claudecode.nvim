@@ -429,6 +429,11 @@ local function command_lines(tool, input)
   return lines
 end
 
+-- Shared with `shell_view`, which draws a background shell's command and output
+-- the way a finished one is drawn here.
+M.rule = rule
+M.command_lines = command_lines
+
 --------------------------------------------------------------------------------
 -- What a command's output is
 --------------------------------------------------------------------------------
