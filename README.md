@@ -203,6 +203,7 @@ Configure the plugin with the detected path:
 - `:ClaudeCodePlanView [on|off]` - Toggle showing Claude's plan-mode plan in an editor split (see [Plan View](#plan-view))
 - `:ClaudeCodeAgents [on|off]` - Toggle the agents view: several Claudes on one project, side by side (see [Agents Mode](#agents-mode))
 - `:ClaudeCodeAgentNew` - Start a new agent in the agents view
+- `:checkhealth claudecode` - Report the prerequisites (Neovim version, Claude CLI, terminal provider) and every running instance's port, lock file and connection
 
 ## Agents Mode
 

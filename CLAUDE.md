@@ -449,6 +449,16 @@ All tools return MCP-compliant `{content: [{type: "text", text: "JSON-stringifie
 
 Tools with `schema = nil` are internal-only; see `lua/claudecode/tools/init.lua` for registration.
 
+- JSON payloads are encoded compactly — no `indent`, which only spent tokens.
+- `getDiagnostics` answers in VS Code's shape: one text block holding `[{uri, diagnostics: [{message, severity, range, source, code}]}]`, grouped per file, with **LSP ranges** (0-based lines and characters) and severity **names**, not Neovim's numbers. Claude parses that shape.
+- `openFile` applies its selection inside the window the file landed in, which is not the current one for a background open (`makeFrontmost = false`) or a float.
+- A path is expanded with `utils.expand_tilde`, never `vim.fn.expand`, which reads `$name` as an environment variable and drops undefined ones — mangling a literal `$` in a path (`src/routes/$post.tsx`). `:ClaudeCodeAdd` still expands the `%`/`#`/`<cfile>` token forms, since `:ClaudeCodeAdd %` is the documented "add this buffer" keymap.
+- The `initialize` response advertises no `resources` capability: we implement none.
+
+### Health Check
+
+`:checkhealth claudecode` (`lua/claudecode/health.lua`) reports the prerequisites (Neovim version, `setup()` called, the CLI on `$PATH` and its version, terminal provider, unified.nvim) and then **every running instance** — a tab's own Claude and each agent — with its port, lock file and connected clients. It launches nothing.
+
 ### Terminal Integration
 
 - **Snacks.nvim**: `terminal/snacks.lua`
