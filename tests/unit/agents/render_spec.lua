@@ -635,6 +635,23 @@ describe("agents.render", function()
       expect(lines_of(pane)[2]:find("✗ $ make build", 1, true) ~= nil).to_be_true()
     end)
 
+    it("marks a monitor with ~ and shows its event count where tokens go", function()
+      render.subagents(pane, {
+        {
+          id = "bm",
+          kind = "shell",
+          task_type = "monitor",
+          agent_type = "Monitor",
+          description = "errors",
+          prefix = "",
+          state = "running",
+          events = 12,
+          runtime_s = 42,
+        },
+      }, { width = 40 })
+      expect(lines_of(pane)[1]).to_be(" ● ~ errors" .. string.rep(" ", 16) .. " 12ev    0:42")
+    end)
+
     it("keeps the numbers inside a pane too narrow for any name", function()
       render.subagents(pane, {
         {

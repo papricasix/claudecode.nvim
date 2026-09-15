@@ -69,6 +69,23 @@ describe("agents.shell_view", function()
       expect(text:find("Ctrl+B", 1, true) ~= nil).to_be_true()
     end)
 
+    it("words a monitor as watching, with its events, and an expired one as expired", function()
+      expect((view.status_text({ task_type = "monitor", state = "running", runtime_s = 14, events = 7 }))).to_be(
+        "● watching · 0:14 · 7 events"
+      )
+      expect((view.status_text({ task_type = "monitor", state = "stopped", how = "expired", events = 1 }))).to_be(
+        "⊘ expired · 1 event"
+      )
+      expect(view.title({ task_type = "monitor", description = "errors" }):sub(1, 2)).to_be("~ ")
+    end)
+
+    it("knows what the CLI wrote into the output rather than the command", function()
+      expect(view.harness_span("[stderr] warn")).to_be(8)
+      expect(view.harness_span("[exited with code 3]")).to_be(#"[exited with code 3]")
+      expect(view.harness_span("[killed]")).to_be(8)
+      expect(view.harness_span("plain [killed]")).to_be(nil)
+    end)
+
     it("says on the rule what the output leaves out", function()
       local base = { done = 0, dropped = 0, skipped_bytes = 0 }
       expect(view.rule_text(base):find("output", 1, true) ~= nil).to_be_true()

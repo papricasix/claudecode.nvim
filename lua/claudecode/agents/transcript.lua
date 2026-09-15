@@ -76,6 +76,11 @@ local AGENT_TOOLS = { Agent = true, Task = true }
 local SHELL_TOOLS = { Bash = true, PowerShell = true }
 M.SHELL_TOOLS = SHELL_TOOLS
 
+--- The tool that streams a command's output lines back as events; a background
+--- task like a shell, recorded beside them.
+local MONITOR_TOOL = "Monitor"
+M.MONITOR_TOOL = MONITOR_TOOL
+
 --- Longest command kept on a background shell's record. The record names a row;
 --- the whole command is read back out of the transcript when a float asks.
 local SHELL_COMMAND_LIMIT = 512
@@ -141,8 +146,10 @@ local config = nil
 ---@field agent_calls table<string, ClaudeCodeAgentsEvent> `Agent`/`Task` tool events, by tool_use id.
 ---@field agent_results table<string, ClaudeCodeAgentsTaskResult> Foreground subagent results, by tool_use id.
 ---@field task_notes table<string, ClaudeCodeAgentsTaskResult> Background task completions, by task id (an agent id, or a shell's `b…` id).
----@field shell_calls table<string, { tool: string, description: string|nil, command: string|nil, ts: number }> Shell calls with no result yet, by tool_use id.
----@field shells table<string, ClaudeCodeAgentsShell> Shells this transcript sent to the background, by task id.
+---@field task_calls table<string, { tool: string, description: string|nil, command: string|nil, ts: number }> Shell and monitor calls with no result yet, by tool_use id.
+---@field tasks table<string, ClaudeCodeAgentsShell> Background tasks this transcript started — shells and monitors — by task id.
+---@field task_stops table<string, number> Tasks a `TaskStop` call stopped: task id -> epoch seconds.
+---@field task_events table<string, { count: integer, last_ts: number, expired_ts: number|nil }> Monitor events, by task id.
 ---@field interrupted_ts number|nil Set when the CLI recorded a user interrupt; see INTERRUPT_MARKER.
 ---@field size integer Bytes of the file when last folded.
 ---@field mtime integer
@@ -158,10 +165,12 @@ local config = nil
 ---@field duration_ms integer|nil
 ---@field tool_use_id string|nil The call that started it (notifications).
 ---@field output_file string|nil Where its output was written (notifications).
+---@field event string|nil A monitor event's lines; such a notification is not an end.
+---@field queued boolean|nil The `queue-operation` copy (each notification is also written when delivered).
 ---@field exit_code integer|nil A shell's exit code, from the notification's summary.
 ---@field ts number Epoch seconds the parent recorded it.
 
----@class ClaudeCodeAgentsShell A shell command left running in the background.
+---@class ClaudeCodeAgentsShell A background task: a shell command or a monitor.
 ---@field task_id string The CLI's id for it (`b4mk05121`), which its notification and output file are named by.
 ---@field tool_id string|nil The `toolu_…` call that started it.
 ---@field tool string `Bash` or `PowerShell`.
@@ -171,6 +180,9 @@ local config = nil
 ---@field started_ts number Epoch seconds it went to the background (the result's timestamp).
 ---@field output_path string|nil The file its output streams into, as the CLI stated it.
 ---@field by_user boolean|nil Sent to the background with Ctrl+B rather than asked for.
+---@field task_type "shell"|"monitor"
+---@field timeout_ms integer|nil Monitors: when it expires.
+---@field persistent boolean|nil Monitors: never expires.
 
 --------------------------------------------------------------------------------
 -- I/O seam
@@ -244,6 +256,26 @@ M._io = {
         cb(data or "", nil)
       end)
     end)
+  end,
+
+  ---Read the last `len` bytes of a file, blocking. Bounded by the caller; used for
+  ---the one line the CLI appends to a background task's output when it ends.
+  ---@param path string
+  ---@param len integer
+  ---@return string|nil
+  read_tail_sync = function(path, len)
+    if not uv then
+      return nil
+    end
+    local fd = uv.fs_open(path, "r", 438)
+    if not fd then
+      return nil
+    end
+    local st = uv.fs_fstat(fd)
+    local size = st and st.size or 0
+    local data = uv.fs_read(fd, math.min(len, size), math.max(0, size - len))
+    uv.fs_close(fd)
+    return data
   end,
 
   ---Read the first `len` bytes of a file, blocking.
@@ -670,12 +702,17 @@ local function fold_tool_use(sum, entry, want_events)
     if
       type(block) == "table"
       and block.type == "tool_use"
-      and SHELL_TOOLS[block.name]
+      and (SHELL_TOOLS[block.name] or block.name == MONITOR_TOOL)
       and type(block.id) == "string"
     then
       local input = type(block.input) == "table" and block.input or {}
-      local command = type(input.command) == "string" and input.command:gsub("%s+", " ") or nil
-      sum.shell_calls[block.id] = {
+      local command = type(input.command) == "string" and input.command or nil
+      -- A monitor may watch a WebSocket instead of running a command.
+      if not command and type(input.ws) == "table" and type(input.ws.url) == "string" then
+        command = input.ws.url
+      end
+      command = command and command:gsub("%s+", " ") or nil
+      sum.task_calls[block.id] = {
         tool = block.name,
         description = type(input.description) == "string" and input.description or nil,
         command = command and command:sub(1, SHELL_COMMAND_LIMIT) or nil,
@@ -772,16 +809,21 @@ end
 ---the same sentence, which is read rather than derived: the CLI's temp root
 ---depends on the platform, `CLAUDE_CODE_TMPDIR` and a symlink resolution this
 ---side cannot repeat reliably.
+---
+---A **monitor** is always in the background; its result is `{taskId, timeoutMs,
+---persistent}` and, unlike a shell's, does not say where its output goes (the
+---same `tasks/` directory — `subagents.tasks_dir` finds it).
 ---@param sum ClaudeCodeAgentsSummary
 ---@param line string
 local function settle_shell(sum, line)
   local id = line:match('"tool_use_id":"([^"]+)"')
-  local call = id and sum.shell_calls[id]
+  local call = id and sum.task_calls[id]
   if not call then
     return
   end
-  sum.shell_calls[id] = nil
-  local task_id = line:match('"backgroundTaskId":"([^"]+)"')
+  sum.task_calls[id] = nil
+  local monitor = call.tool == MONITOR_TOOL
+  local task_id = monitor and line:match('"taskId":"([^"]+)"') or line:match('"backgroundTaskId":"([^"]+)"')
   if not task_id then
     return
   end
@@ -792,8 +834,9 @@ local function settle_shell(sum, line)
   end
   local at = line:find('"timestamp":"', 1, true)
   local started = at and M._iso_to_epoch(line:sub(at + 13, at + 40)) or 0
-  sum.shells[task_id] = {
+  sum.tasks[task_id] = {
     task_id = task_id,
+    task_type = monitor and "monitor" or "shell",
     tool_id = id,
     tool = call.tool,
     description = call.description,
@@ -802,7 +845,24 @@ local function settle_shell(sum, line)
     started_ts = started > 0 and started or call.ts,
     output_path = path,
     by_user = line:find('"backgroundedByUser":true', 1, true) ~= nil or nil,
+    timeout_ms = monitor and tonumber(line:match('"timeoutMs":(%d+)')) or nil,
+    persistent = monitor and line:find('"persistent":true', 1, true) ~= nil or nil,
   }
+end
+
+---Record a `TaskStop` result: the only record a background shell stopped this way
+---leaves in the transcript (it gets no notification — measured, CLI 2.1.270).
+---@param sum ClaudeCodeAgentsSummary
+---@param line string
+local function note_task_stop(sum, line)
+  if not line:find('"message":"Successfully stopped task', 1, true) then
+    return
+  end
+  local task_id = line:match('"task_id":"([^"]+)"')
+  if task_id then
+    local at = line:find('"timestamp":"', 1, true)
+    sum.task_stops[task_id] = at and M._iso_to_epoch(line:sub(at + 13, at + 40)) or sum.last_ts
+  end
 end
 
 ---Fold one decoded `toolUseResult` entry into the summary.
@@ -1000,16 +1060,24 @@ function M._task_notification(line)
     return nil
   end
   -- A shell's exit code is only in the sentence summarising it: `… completed
-  -- (exit code 0)`, `… failed with exit code 144`.
+  -- (exit code 0)`, `… failed with exit code 144`; a monitor's `… script failed
+  -- (exit 2)`.
   local summary = body:match("<summary>([^<]*)</summary>")
+  -- A monitor notifies once per event, with the lines in `<event>` and no status:
+  -- that is not an end, so it must not default to `completed`.
+  local event = body:match("<event>(.-)</event>")
+  local status = body:match("<status>([^<]+)</status>")
+  local exit_code = summary and (summary:match("exit code (%-?%d+)") or summary:match("%(exit (%-?%d+)%)"))
   return {
     id = id,
-    status = body:match("<status>([^<]+)</status>") or "completed",
+    status = status or (not event and "completed" or nil),
+    event = event,
+    queued = entry.type == "queue-operation" or nil,
     tokens = tonumber(body:match("<subagent_tokens>(%d+)</subagent_tokens>")),
     duration_ms = tonumber(body:match("<duration_ms>(%d+)</duration_ms>")),
     tool_use_id = body:match("<tool%-use%-id>([^<]+)</tool%-use%-id>"),
     output_file = body:match("<output%-file>([^<]+)</output%-file>"),
-    exit_code = summary and tonumber(summary:match("exit code (%-?%d+)")) or nil,
+    exit_code = tonumber(exit_code),
     ts = M._iso_to_epoch(entry.timestamp),
   }
 end
@@ -1080,7 +1148,7 @@ function M._fold_line(sum, line)
     end
     -- A shell cut off here never reached the background (one that did has its
     -- result already), so it will never be one.
-    sum.shell_calls = {}
+    sum.task_calls = {}
     return
   end
 
@@ -1088,6 +1156,20 @@ function M._fold_line(sum, line)
   -- that is too big to decode for nothing.
   if line:find("<task-notification>", 1, true) and not line:find('"toolUseResult"', 1, true) then
     local note = M._task_notification(line)
+    if note and note.event then
+      -- A monitor's event. Counted from the queued copy only: each is written
+      -- again when delivered. Expiry arrives as one last event, not a status.
+      local seen = sum.task_events[note.id] or { count = 0, last_ts = 0 }
+      sum.task_events[note.id] = seen
+      local expired = note.event:find("^%[Monitor expired") or note.event:find("^%[Monitor timed out")
+      if expired then
+        seen.expired_ts = math.max(seen.expired_ts or 0, note.ts)
+      elseif note.queued then
+        seen.count = seen.count + 1
+        seen.last_ts = math.max(seen.last_ts, note.ts)
+      end
+      return
+    end
     if note then
       -- The same run can notify more than once (a resumed agent stops again), and
       -- a notification is written twice (queued, then delivered); the newest wins.
@@ -1129,7 +1211,12 @@ function M._fold_line(sum, line)
     -- Decoded for the pane's rows, or for a shell call that may go to the
     -- background; with tool rows off, only the second.
     local want_events = tools_wanted()
-    if want_events or line:find('"name":"Bash"', 1, true) or line:find('"name":"PowerShell"', 1, true) then
+    if
+      want_events
+      or line:find('"name":"Bash"', 1, true)
+      or line:find('"name":"PowerShell"', 1, true)
+      or line:find('"name":"Monitor"', 1, true)
+    then
       local ok, entry = pcall(vim.json.decode, line)
       if ok and type(entry) == "table" then
         pcall(fold_tool_use, sum, entry, want_events)
@@ -1146,9 +1233,10 @@ function M._fold_line(sum, line)
     if tools_wanted() then
       resolve_tool(sum, line)
     end
-    if next(sum.shell_calls) ~= nil then
+    if next(sum.task_calls) ~= nil then
       settle_shell(sum, line)
     end
+    note_task_stop(sum, line)
     -- A foreground subagent's result says what the run cost. The keys are matched
     -- raw for the same reason the rest of this branch is: the line also carries
     -- the subagent's whole reply. Inside that reply a quote is escaped, so an
@@ -1225,8 +1313,10 @@ local function new_summary(path)
     agent_calls = {},
     agent_results = {},
     task_notes = {},
-    shell_calls = {},
-    shells = {},
+    task_calls = {},
+    tasks = {},
+    task_stops = {},
+    task_events = {},
     last_ts = 0,
     first_ts = 0,
     size = 0,

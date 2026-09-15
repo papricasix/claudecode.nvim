@@ -395,6 +395,155 @@ describe("agents.subagents", function()
       expect(rows({ live = false })[1].state).to_be("running")
     end)
 
+    it("calls a shell stopped with TaskStop stopped, though no notification comes", function()
+      put(SESSION, {
+        shell_call("toolu_bg", NOW - 100, { command = "sleep 300", run_in_background = true }),
+        shell_result("toolu_bg", NOW - 100, "bstop"),
+        vim.json.encode({
+          type = "user",
+          timestamp = iso(NOW - 90),
+          message = { role = "user", content = { { type = "tool_result", tool_use_id = "toolu_s", content = "ok" } } },
+          toolUseResult = {
+            message = "Successfully stopped task: bstop (sleep 300)",
+            task_id = "bstop",
+            task_type = "local_bash",
+          },
+        }),
+      })
+      fs[TASKS .. "/bstop.output"] = { data = "", mtime = NOW, ino = 9 }
+      local row = rows({ live = true })[1]
+      expect(row.state).to_be("stopped")
+      expect(row.how).to_be("killed")
+      expect(row.runtime_s).to_be(10)
+      expect(row.ended).to_be(true)
+    end)
+
+    it("reads how a task ended from the line the CLI closes its output with", function()
+      put(SESSION, {
+        shell_call("toolu_a", NOW - 100, { command = "a", run_in_background = true }),
+        shell_result("toolu_a", NOW - 100, "bexit"),
+        shell_call("toolu_k", NOW - 100, { command = "k", run_in_background = true }),
+        shell_result("toolu_k", NOW - 100, "bkilled"),
+      })
+      transcript._io.read_tail_sync = function(path, len)
+        local f = fs[path]
+        return f and f.data:sub(-len) or nil
+      end
+      fs[TASKS .. "/bexit.output"] = { data = "out\n\n[exited with code 7]\n", mtime = NOW - 50, ino = 9 }
+      fs[TASKS .. "/bkilled.output"] = { data = "out\n\n[killed]\n", mtime = NOW - 40, ino = 10 }
+      local by_id = {}
+      for _, row in ipairs(rows({ live = true })) do
+        by_id[row.id] = row
+      end
+      expect(by_id.bexit.state).to_be("failed")
+      expect(by_id.bexit.exit_code).to_be(7)
+      expect(by_id.bexit.runtime_s).to_be(50)
+      expect(by_id.bkilled.state).to_be("stopped")
+      expect(by_id.bkilled.ended).to_be(true)
+    end)
+
+    describe("monitors", function()
+      local function monitor_call(id, ts, input)
+        return vim.json.encode({
+          type = "assistant",
+          timestamp = iso(ts),
+          message = {
+            role = "assistant",
+            content = { { type = "tool_use", id = id, name = "Monitor", input = input } },
+          },
+        })
+      end
+
+      local function monitor_result(id, ts, task_id)
+        return vim.json.encode({
+          type = "user",
+          timestamp = iso(ts),
+          message = {
+            role = "user",
+            content = {
+              { type = "tool_result", tool_use_id = id, content = "Monitor started (task " .. task_id .. ")" },
+            },
+          },
+          toolUseResult = { taskId = task_id, timeoutMs = 60000, persistent = false },
+        })
+      end
+
+      local function event(task_id, ts, text, queued)
+        local body = table.concat({
+          "<task-notification>",
+          "<task-id>" .. task_id .. "</task-id>",
+          '<summary>Monitor event: "x"</summary>',
+          "<event>" .. text .. "</event>",
+          "</task-notification>",
+        }, "\n")
+        if queued == false then
+          return vim.json.encode({ type = "user", timestamp = iso(ts), message = { role = "user", content = body } })
+        end
+        return vim.json.encode({ type = "queue-operation", operation = "enqueue", timestamp = iso(ts), content = body })
+      end
+
+      it("lists a monitor, counts its events, and does not end it on one", function()
+        put(SESSION, {
+          shell_call("toolu_bg", NOW - 200, { command = "make", run_in_background = true }),
+          shell_result("toolu_bg", NOW - 200, "bshell"),
+          monitor_call(
+            "toolu_m",
+            NOW - 100,
+            { command = "tail -f log | grep ERROR", description = "errors in log", timeout_ms = 60000 }
+          ),
+          monitor_result("toolu_m", NOW - 100, "bmon"),
+          event("bmon", NOW - 80, "ERROR one"),
+          event("bmon", NOW - 80, "ERROR one", false), -- the delivered copy is not a second event
+          event("bmon", NOW - 60, "ERROR two"),
+        })
+        -- The monitor's result names no output path; the shell's does, and it is the same directory.
+        fs[TASKS .. "/bmon.output"] = { data = "ERROR one\n", mtime = NOW - 1, ino = 11 }
+        local out = rows({ live = true })
+        local mon = out[2]
+        expect(mon.id).to_be("bmon")
+        expect(mon.task_type).to_be("monitor")
+        expect(mon.description).to_be("errors in log")
+        expect(mon.command).to_be("tail -f log | grep ERROR")
+        expect(mon.events).to_be(2)
+        expect(mon.state).to_be("running")
+        expect(mon.output_path).to_be(TASKS .. "/bmon.output")
+        expect(out[1].task_type).to_be("shell")
+      end)
+
+      it("calls a monitor that expired stopped, and one whose script failed failed", function()
+        put(SESSION, {
+          monitor_call("toolu_e", NOW - 100, { command = "sleep 100", description = "e" }),
+          monitor_result("toolu_e", NOW - 100, "bexp"),
+          event(
+            "bexp",
+            NOW - 40,
+            "[Monitor expired after 1m with 0 events delivered. Re-arm it if you still need the watch.]"
+          ),
+          monitor_call("toolu_f", NOW - 100, { command = "false", description = "f" }),
+          monitor_result("toolu_f", NOW - 100, "bfail"),
+          shell_note("bfail", "toolu_f", NOW - 90, "failed", 'Monitor "f" script failed (exit 2)'),
+        })
+        local by_id = {}
+        for _, row in ipairs(rows({ live = true })) do
+          by_id[row.id] = row
+        end
+        expect(by_id.bexp.state).to_be("stopped")
+        expect(by_id.bexp.how).to_be("expired")
+        expect(by_id.bexp.events).to_be(0)
+        expect(by_id.bexp.runtime_s).to_be(60)
+        expect(by_id.bfail.state).to_be("failed")
+        expect(by_id.bfail.exit_code).to_be(2)
+      end)
+
+      it("names a WebSocket monitor by its URL", function()
+        put(SESSION, {
+          monitor_call("toolu_w", NOW - 10, { ws = { url = "wss://events.example/stream" }, description = "deploys" }),
+          monitor_result("toolu_w", NOW - 10, "bws"),
+        })
+        expect(rows({ live = true })[1].command).to_be("wss://events.example/stream")
+      end)
+    end)
+
     it("unescapes a Windows output path", function()
       put(SESSION, {
         vim.json.encode({

@@ -77,6 +77,20 @@ function M.collapse_cr(raw)
   return raw:match("([^\r]*)$") or raw
 end
 
+---How much of a line the CLI wrote rather than the command: the `[stderr] ` a
+---monitor's file prefixes stderr with, or the whole closing line.
+---@param line string
+---@return integer|nil end_col
+function M.harness_span(line)
+  if line:sub(1, 9) == "[stderr] " then
+    return 8
+  end
+  if line:match("^%[exited with code %-?%d+%]$") or line == "[killed]" then
+    return #line
+  end
+  return nil
+end
+
 ---A reader of streamed output.
 ---@return { carry: string, sgr: table, skip_partial: boolean }
 function M.new_stream()
@@ -154,17 +168,20 @@ function M.status_text(row)
   local glyph = STATE_GLYPH[row.state] or "⊘"
   local word
   if row.state == "running" then
-    word = "running"
+    word = row.task_type == "monitor" and "watching" or "running"
   elseif row.exit_code then
     word = "exit " .. row.exit_code
   elseif row.state == "stopped" then
-    word = "stopped"
+    word = row.how == "expired" and "expired" or "stopped"
   else
     word = row.state
   end
   local parts = { glyph .. " " .. word }
   if row.runtime_s then
     parts[#parts + 1] = subagents.format_runtime(row.runtime_s)
+  end
+  if row.task_type == "monitor" and row.events then
+    parts[#parts + 1] = row.events == 1 and "1 event" or (row.events .. " events")
   end
   if row.by_user then
     parts[#parts + 1] = "sent to the background with Ctrl+B"
@@ -201,12 +218,13 @@ end
 ---@return string
 function M.title(row)
   row = row or {}
-  local name = row.description or row.command or "background shell"
+  local name = row.description or row.command or (row.task_type == "monitor" and "monitor" or "background shell")
   name = name:gsub("%s+", " ")
   local status = M.status_text(row)
   local budget = math.max(10, float.title_width())
   local room = budget - (status ~= "" and (vim.fn.strdisplaywidth(status) + 2) or 0)
-  local text = "$ " .. utils.truncate(name, math.max(8, room - 2))
+  local mark = row.task_type == "monitor" and "~ " or "$ "
+  local text = mark .. utils.truncate(name, math.max(8, room - 2))
   return status ~= "" and (text .. "  " .. status) or text
 end
 
@@ -301,6 +319,19 @@ local function paint_output(buf, view, drawn)
       hl_group = mark.hl,
       priority = 100,
     })
+  end
+  -- What the CLI itself writes into the file — a monitor's `[stderr] ` prefix, the
+  -- closing `[exited with code N]` / `[killed]` — is drawn quietly.
+  local quiet = require("claudecode.agents.render").highlight("time")
+  for index, line in ipairs(drawn.lines) do
+    local span = M.harness_span(line)
+    if span then
+      pcall(vim.api.nvim_buf_set_extmark, buf, ns_out, start + index - 1, 0, {
+        end_col = span,
+        hl_group = quiet,
+        priority = 90,
+      })
+    end
   end
   view.done = view.done + drawn.complete
   view.has_tail = #drawn.lines > drawn.complete

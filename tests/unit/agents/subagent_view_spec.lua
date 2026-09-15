@@ -285,6 +285,29 @@ describe("agents.subagent_view", function()
       expect(opened.transcript).to_be("/t")
     end)
 
+    it("draws a monitor's events as lines that open the monitor", function()
+      local monitor =
+        { kind = "shell", task_type = "monitor", id = "bm", tool_id = "tm", state = "running", events = 1 }
+      local doc = fold({
+        user("go"),
+        user(
+          '<task-notification>\n<task-id>bm</task-id>\n<summary>Monitor event: "x"</summary>\n<event>ERROR boom\nmore</event>\n</task-notification>'
+        ),
+      })
+      local lines, _, _, _, calls = view.render(doc, ctx({ by_id = { bm = monitor } }))
+      local at
+      for index, line in ipairs(lines) do
+        if line:find("ERROR boom", 1, true) then
+          at = index
+        end
+      end
+      expect(lines[at]).to_be("- ~ ERROR boom")
+      expect(calls[at].shell).to_be(monitor)
+      expect(view.summarize_result({ content = "Monitor started" }, { taskId = "bm", timeoutMs = 1000 }).summary).to_be(
+        "started watching"
+      )
+    end)
+
     it("says a command went to the background rather than that it printed nothing", function()
       local summary = view.summarize_result(
         { content = "Command running in background" },

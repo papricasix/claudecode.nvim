@@ -107,7 +107,7 @@ end
 ---
 ---A shell command that went to the background came back with nothing but the
 ---place its output is going, so it is shown as that shell instead — its output
----read from there, and followed while it runs (`shell_view`).
+---read from there, and followed while it runs (`shell_view`). A monitor likewise.
 ---@param opts { session_id: string?, transcript: string?, tool_id: string?, tool: string?,
 ---             label: string?, status: string?, reuse: integer?,
 ---             row_for: (fun(id: string): ClaudeCodeSubagentRow|nil)? }
@@ -135,8 +135,14 @@ function M.open(opts, done)
     end
 
     local tool = call.tool or opts.tool
-    local task_id = type(call.result) == "table" and call.result.backgroundTaskId or nil
-    if transcript.SHELL_TOOLS[tool] and type(task_id) == "string" and task_id ~= "" then
+    local result = type(call.result) == "table" and call.result or {}
+    local task_id = nil
+    if transcript.SHELL_TOOLS[tool] then
+      task_id = result.backgroundTaskId
+    elseif tool == transcript.MONITOR_TOOL then
+      task_id = result.taskId
+    end
+    if type(task_id) == "string" and task_id ~= "" then
       local input = type(call.input) == "table" and call.input or {}
       return require("claudecode.agents.shell_view").open({
         session_id = opts.session_id,

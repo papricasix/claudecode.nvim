@@ -145,6 +145,9 @@ function M.summarize_result(block, result)
     if result.status == "async_launched" or type(result.backgroundTaskId) == "string" then
       return { status = "done", summary = "started in the background" }
     end
+    if type(result.taskId) == "string" and tonumber(result.timeoutMs) then
+      return { status = "done", summary = "started watching" }
+    end
     if tonumber(result.numFiles) then
       return { status = "done", summary = plural(tonumber(result.numFiles), "file") }
     end
@@ -253,6 +256,12 @@ function M.fold_line(doc, line)
 
   if type(message.content) == "string" then
     local note = transcript._task_notification(line)
+    if note and note.event then
+      -- A monitor's event: what it saw, one line of it.
+      local first = (note.event:gsub("^%s+", "")):match("^([^\n]*)") or ""
+      doc.items[#doc.items + 1] = { kind = "event", id = note.id, text = first }
+      return
+    end
     if note then
       doc.items[#doc.items + 1] = {
         kind = "note",
@@ -363,9 +372,11 @@ function M.render(doc, ctx)
 
   local previous = nil
   for _, item in ipairs(doc.items) do
-    local is_list = item.kind == "tool" or item.kind == "note" or item.kind == "interrupt"
+    local is_list = item.kind == "tool" or item.kind == "note" or item.kind == "event" or item.kind == "interrupt"
     -- One blank line between blocks, none inside a run of tool lines.
-    if not (is_list and previous and (previous.kind == "tool" or previous.kind == "note")) then
+    if
+      not (is_list and previous and (previous.kind == "tool" or previous.kind == "note" or previous.kind == "event"))
+    then
       add("")
     end
 
@@ -415,9 +426,15 @@ function M.render(doc, ctx)
         -- The call's own result only says it went to the background; how the
         -- command is doing is the shell's.
         glyph = STATE_GLYPH[shell.state] or "●"
-        local parts = { "in the background" }
+        local monitor = shell.task_type == "monitor"
+        local parts = { monitor and "watching" or "in the background" }
         if shell.exit_code and shell.exit_code ~= 0 then
           parts[#parts + 1] = "exit " .. shell.exit_code
+        elseif shell.how == "expired" then
+          parts[#parts + 1] = "expired"
+        end
+        if monitor and shell.events then
+          parts[#parts + 1] = shell.events == 1 and "1 event" or (shell.events .. " events")
         end
         if shell.runtime_s then
           parts[#parts + 1] = subagents.format_runtime(shell.runtime_s)
@@ -476,6 +493,20 @@ function M.render(doc, ctx)
           { tool_id = target.tool_id, tool = target.agent_type, label = target.description, shell = target }
       elseif target then
         links[#lines] = item.id
+      end
+    elseif item.kind == "event" then
+      -- What a monitor saw; `<CR>` opens the monitor itself.
+      local target = ctx.by_id[item.id]
+      add("- ~ " .. utils.truncate(item.text ~= "" and item.text or "event", TOOL_LABEL_LIMIT))
+      marks[#marks + 1] = {
+        row = #lines - 1,
+        col = 2,
+        end_col = 3,
+        hl = require("claudecode.agents.render").highlight("time"),
+      }
+      if target and target.kind == "shell" then
+        calls[#lines] =
+          { tool_id = target.tool_id, tool = target.agent_type, label = target.description, shell = target }
       end
     end
     previous = item

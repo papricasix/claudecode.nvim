@@ -195,6 +195,9 @@ local ENDED = { completed = "done", killed = "stopped", stopped = "stopped", can
 ---@field transcript string|nil Shells: the transcript that launched it.
 ---@field by_user boolean|nil Shells: sent to the background with Ctrl+B.
 ---@field ended boolean|nil Shells: the CLI recorded how it ended.
+---@field task_type "shell"|"monitor"|nil Shells: which kind of background command.
+---@field how "expired"|"killed"|nil Shells: why a stopped one stopped.
+---@field events integer|nil Monitors: how many events it has delivered.
 
 ---Where one run stands, from everything that could have recorded its end.
 ---@param agent ClaudeCodeSubagent
@@ -242,49 +245,176 @@ end
 --- What a shell's notification status means for its row.
 local SHELL_ENDED = { completed = "done", failed = "failed", killed = "stopped", stopped = "stopped" }
 
----Where one background shell stands.
+--- How much of an output file's end is read for the line the CLI closes it with.
+local FOOTER_BYTES = 128
+
+--- Footers already read, [path] = { size, mtime, footer }.
+local footer_cache = {}
+
+---The line the CLI appends to a background task's output when the task ends —
+---`[exited with code N]`, or `[killed]` (stopped, or a monitor that expired) —
+---read from the file's last bytes, and only again when the file changed.
+---@param path string
+---@param st { size: integer, mtime: integer }
+---@return { exit_code: integer|nil, killed: boolean|nil }|nil
+function M.output_footer(path, st)
+  local hit = footer_cache[path]
+  if hit and hit.size == st.size and hit.mtime == st.mtime then
+    return hit.footer
+  end
+  local read_tail = transcript._io.read_tail_sync
+  local tail = type(read_tail) == "function" and st.size > 0 and read_tail(path, FOOTER_BYTES) or nil
+  local footer = nil
+  if type(tail) == "string" then
+    local code = tail:match("\n%[exited with code (%-?%d+)%]\n?$") or tail:match("^%[exited with code (%-?%d+)%]\n?$")
+    if code then
+      footer = { exit_code = tonumber(code) }
+    elseif tail:match("\n%[killed%]\n?$") or tail:match("^%[killed%]\n?$") then
+      footer = { killed = true }
+    end
+  end
+  footer_cache[path] = { size = st.size, mtime = st.mtime, footer = footer }
+  return footer
+end
+
+---@class ClaudeCodeTaskFacts Everything that could have recorded how a background task went.
+---@field note ClaudeCodeAgentsTaskResult|nil Its end notification.
+---@field stop_ts number|nil When a `TaskStop` call stopped it.
+---@field events { count: integer, last_ts: number, expired_ts: number|nil }|nil A monitor's events.
+---@field output_path string|nil
+
+---@class ClaudeCodeTaskState
+---@field state "running"|"done"|"failed"|"stopped"
+---@field runtime_s number|nil
+---@field exit_code integer|nil
+---@field ended boolean The CLI recorded the end (rather than it being inferred).
+---@field how "expired"|"killed"|nil Why a stopped task stopped, when known.
+
+---Where one background shell or monitor stands.
 ---
----Its notification is the only record of an end, and a shell notifies exactly
----once. Without one it is running while its output file exists and either the
----session is live or the file is still being written — a shell that prints
----nothing for ten minutes in a session not known to be live here reads stopped,
----the same bargain `classify` makes for a quiet subagent.
+---Four records can say it ended, strongest first: its notification (status and
+---exit code); a `TaskStop` result, which is all a stopped shell gets; a monitor's
+---expiry, which arrives as a last event; and the line the CLI appends to the
+---output file (`[exited with code N]` / `[killed]`), which covers anything the
+---transcript missed. Without any, it is running while its output file exists and
+---either the session is live or the file is still being written — a task that
+---prints nothing for ten minutes in a session not known to be live here reads
+---stopped, the same bargain `classify` makes for a quiet subagent.
 ---@param shell ClaudeCodeAgentsShell
----@param note ClaudeCodeAgentsTaskResult|nil
+---@param facts ClaudeCodeTaskFacts
 ---@param opts { live: boolean?, now: number }
----@return string state
----@return number|nil runtime_s
----@return integer|nil exit_code
-function M.shell_state(shell, note, opts)
+---@return ClaudeCodeTaskState
+function M.shell_state(shell, facts, opts)
   local started = shell.started_ts or shell.ts or 0
-  if note then
+  local function since(ts)
+    return math.max(0, (ts or started) - started)
+  end
+  local note = facts.note
+  if note and note.status then
     local state = SHELL_ENDED[note.status] or "failed"
+    local code = note.exit_code
+    -- A monitor whose stream simply ended says so without a code; the file's
+    -- closing line has one.
+    if code == nil and state ~= "stopped" and facts.output_path and transcript._io.stat then
+      local st = transcript._io.stat(facts.output_path)
+      local footer = st and M.output_footer(facts.output_path, st)
+      code = footer and footer.exit_code or nil
+    end
     -- `completed` with a non-zero code does not happen, but a code is the harder fact.
-    if state == "done" and note.exit_code and note.exit_code ~= 0 then
+    if state == "done" and code and code ~= 0 then
       state = "failed"
     end
-    return state, math.max(0, (note.ts or started) - started), note.exit_code
+    return {
+      state = state,
+      runtime_s = since(note.ts),
+      exit_code = code,
+      ended = true,
+      how = state == "stopped" and "killed" or nil,
+    }
   end
-  -- A running shell always has its output file; one that is gone (the temp
+  if facts.stop_ts then
+    return { state = "stopped", runtime_s = since(facts.stop_ts), ended = true, how = "killed" }
+  end
+  local expired = facts.events and facts.events.expired_ts
+  if expired then
+    return { state = "stopped", runtime_s = since(expired), ended = true, how = "expired" }
+  end
+
+  -- A running task always has its output file; one that is gone (the temp
   -- directory was swept, or the CLI cleaned up after itself) is not running,
-  -- whatever else is true. Asked first so a live session does not keep a shell
+  -- whatever else is true. Asked first so a live session does not keep a task
   -- its previous process took with it spinning for ever.
   local written = nil
   local fs = transcript._io
-  if shell.output_path and fs and fs.stat then
-    local st = fs.stat(shell.output_path)
+  local path = facts.output_path
+  if path and fs and fs.stat then
+    local st = fs.stat(path)
     if not st then
-      return "stopped", nil, nil
+      return { state = "stopped", ended = false }
     end
     written = st.mtime or 0
+    local footer = M.output_footer(path, st)
+    if footer then
+      local code = footer.exit_code
+      return {
+        state = footer.killed and "stopped" or (code == 0 and "done" or "failed"),
+        runtime_s = since(math.max(written, started)),
+        exit_code = code,
+        ended = true,
+        how = footer.killed and (shell.task_type == "monitor" and "expired" or "killed") or nil,
+      }
+    end
   end
   if opts.live or (written and (opts.now - written) < M.STALE_S) then
-    return "running", math.max(0, opts.now - started), nil
+    return { state = "running", runtime_s = since(opts.now), ended = false }
   end
-  return "stopped", math.max(0, math.max(written, started) - started), nil
+  return { state = "stopped", runtime_s = since(math.max(written or 0, started)), ended = false }
 end
 
----The session's subagents and background shells as a flattened tree, children
+---The `tasks/` directory a session's background output is written to.
+---
+---Taken from any path the session's records already state (a shell's result, a
+---notification's `<output-file>`), since a monitor's result states none. Failing
+---that, the CLI's rule, read out of the binary (2.1.270):
+---`<realpath($CLAUDE_CODE_TMPDIR or /tmp)>/claude-<uid>/<slug of cwd>/<session>/tasks`.
+---Not applied on Windows, where the rule was not verified.
+---@param transcript_path string
+---@param sums table[] The session's summary and its subagents'.
+---@return string|nil
+function M.tasks_dir(transcript_path, sums)
+  for _, sum in ipairs(sums) do
+    for _, shell in pairs(sum.tasks or {}) do
+      local dir = shell.output_path and shell.output_path:match("^(.*)[/\\][^/\\]+%.output$")
+      if dir then
+        return dir
+      end
+    end
+    for _, note in pairs(sum.task_notes or {}) do
+      local dir = note.output_file and note.output_file:match("^(.*)[/\\][^/\\]+%.output$")
+      if dir then
+        return dir
+      end
+    end
+  end
+  local session = sums[1]
+  local uv = vim.loop
+  if not session or not session.cwd or not uv or vim.fn.has("win32") == 1 then
+    return nil
+  end
+  local id = transcript_path:match("([^/\\]+)%.jsonl$")
+  if not id then
+    return nil
+  end
+  local root = os.getenv("CLAUDE_CODE_TMPDIR")
+  if not root or root == "" then
+    root = "/tmp"
+  end
+  root = (uv.fs_realpath and uv.fs_realpath(root)) or root
+  local uid = uv.getuid and uv.getuid() or 0
+  return ("%s/claude-%d/%s/%s/tasks"):format(root, uid, transcript.slugify(session.cwd), id)
+end
+
+---The session's subagents and background tasks as a flattened tree, children
 ---under their parent in the order they started.
 ---@param transcript_path string
 ---@param opts { live: boolean?, now: number? }|nil `live`: the session is running.
@@ -293,7 +423,7 @@ function M.rows(transcript_path, opts)
   opts = { live = opts and opts.live, now = (opts and opts.now) or os.time() }
   local agents = M.scan(transcript_path)
 
-  local index = { notes = {}, results = {}, calls = {} }
+  local index = { notes = {}, results = {}, calls = {}, stops = {}, events = {} }
   ---@type { sum: table, parent: string|nil, path: string }[]
   local sources = {}
   local session = transcript.get(transcript_path)
@@ -306,6 +436,7 @@ function M.rows(transcript_path, opts)
       sources[#sources + 1] = { sum = sum, parent = agent.id, path = agent.path }
     end
   end
+
   for _, source in ipairs(sources) do
     local sum = source.sum
     merge_newest(index.notes, sum.task_notes)
@@ -313,6 +444,34 @@ function M.rows(transcript_path, opts)
     for id, call in pairs(sum.agent_calls or {}) do
       index.calls[id] = call
     end
+    for id, ts in pairs(sum.task_stops or {}) do
+      index.stops[id] = math.max(index.stops[id] or 0, ts)
+    end
+    for id, seen in pairs(sum.task_events or {}) do
+      local into = index.events[id]
+      if not into then
+        index.events[id] = { count = seen.count, last_ts = seen.last_ts, expired_ts = seen.expired_ts }
+      else
+        -- A nested task's events are queued in the session's transcript too.
+        into.count = math.max(into.count, seen.count)
+        into.last_ts = math.max(into.last_ts, seen.last_ts)
+        into.expired_ts = into.expired_ts or seen.expired_ts
+      end
+    end
+  end
+  local tasks_dir = nil
+  local function output_path_for(shell, note)
+    if shell.output_path or (note and note.output_file) then
+      return shell.output_path or note.output_file
+    end
+    if tasks_dir == nil then
+      local sums = {}
+      for _, source in ipairs(sources) do
+        sums[#sums + 1] = source.sum
+      end
+      tasks_dir = M.tasks_dir(transcript_path, sums) or false
+    end
+    return tasks_dir and (tasks_dir .. "/" .. shell.task_id .. ".output") or nil
   end
 
   -- Every node of the tree, subagents and shells alike, sorted and walked as one.
@@ -322,7 +481,7 @@ function M.rows(transcript_path, opts)
     nodes[#nodes + 1] = agent
   end
   for _, source in ipairs(sources) do
-    for task_id, shell in pairs(source.sum.shells or {}) do
+    for task_id, shell in pairs(source.sum.tasks or {}) do
       nodes[#nodes + 1] = {
         kind = "shell",
         id = task_id,
@@ -338,8 +497,8 @@ function M.rows(transcript_path, opts)
   end
 
   local by_id, children, roots = {}, {}, {}
-  for _, agent in ipairs(agents) do
-    by_id[agent.id] = agent
+  for _, node in ipairs(nodes) do
+    by_id[node.id] = by_id[node.id] or node
   end
   for _, agent in ipairs(nodes) do
     -- A parent we cannot see (its descriptor unreadable) would orphan the whole
@@ -373,9 +532,17 @@ function M.rows(transcript_path, opts)
         if agent.kind == "shell" then
           local shell = agent.shell
           local note = index.notes[agent.id]
-          local state, runtime, exit_code = M.shell_state(shell, note, opts)
+          local events = index.events[agent.id]
+          local output_path = output_path_for(shell, note)
+          local st = M.shell_state(shell, {
+            note = note,
+            stop_ts = index.stops[agent.id],
+            events = events,
+            output_path = output_path,
+          }, opts)
           out[#out + 1] = {
             kind = "shell",
+            task_type = shell.task_type or "shell",
             id = agent.id,
             agent_type = shell.tool,
             description = shell.description,
@@ -383,12 +550,14 @@ function M.rows(transcript_path, opts)
             tool_id = shell.tool_id,
             depth = depth,
             prefix = prefix,
-            state = state,
-            runtime_s = runtime,
-            exit_code = exit_code,
-            output_path = shell.output_path or (note and note.output_file) or nil,
+            state = st.state,
+            runtime_s = st.runtime_s,
+            exit_code = st.exit_code,
+            how = st.how,
+            events = events and events.count or nil,
+            output_path = output_path,
             by_user = shell.by_user,
-            ended = note ~= nil,
+            ended = st.ended,
             transcript = agent.transcript,
           }
         else
@@ -451,6 +620,7 @@ end
 function M.reset()
   meta_cache = {}
   seen_size = {}
+  footer_cache = {}
 end
 
 return M

@@ -706,7 +706,7 @@ local KEY_SPECS = {
     field = "open",
     panes = { "subagents" },
     group = "Tasks",
-    desc = "A subagent: read its transcript (<CR> on a subagent in it opens that one). A shell: its output, followed live",
+    desc = "A subagent: read its transcript (<CR> on a subagent in it opens that one). A shell or monitor: its output, followed live",
     run = function()
       M.open_under_cursor()
     end,
