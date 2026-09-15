@@ -631,7 +631,10 @@ local KEY_SPECS = {
   },
   {
     field = "new",
-    panes = { "sessions" },
+    -- "center" reaches only the notice screens (a stopped session, an ended
+    -- agent, an empty project): a live agent's terminal takes no pane keys.
+    -- `apply_notice_keys` binds it there too, so it holds under a bare config.
+    panes = { "sessions", "center" },
     group = "Sessions",
     desc = "Start a new agent",
     run = function()
@@ -933,13 +936,6 @@ local function notice_buf()
   return buf
 end
 
----Keys that belong to one notice screen only.
----
----`new` is a sessions-pane key everywhere else. The empty screen is the one place
----where the centre has nothing to resume, so it carries the key it advertises —
----and gives it back when the screen becomes an offer to resume a conversation,
----since the buffer is reused and a stale mapping there would start a *second*
----conversation from a screen about a particular one.
 ---The key bound to an action, or nothing when the user turned it off.
 ---
 ---An unset field is the default rather than "off": `keymaps()` is the applied
@@ -959,35 +955,35 @@ local function keymap_for(field, default)
   return lhs
 end
 
+---Keys the notice screens carry beyond `bind_keys`.
+---
+---`new` is bound on every screen: whatever the centre is offering, no agent is
+---running in it, so starting one is always an answer.
 ---@param buf integer
 ---@param kind string
 local function apply_notice_keys(buf, kind)
+  local new_lhs = keymap_for("new", "a")
+  if new_lhs then
+    map(buf, new_lhs, function()
+      M.new_agent()
+    end, "Claude agents: start a new agent")
+  end
+
   -- The window screen names `gs`, which is otherwise a list-pane key: a centre
   -- that says "nothing from the last two weeks" has to be answerable where it is
   -- read, or the user is told about a key that does nothing under their cursor.
   local sort_lhs = keymap_for("sort", "gs")
-  if sort_lhs then
-    if kind == "empty" then
-      map(buf, sort_lhs, function()
-        M.show_sort_menu()
-      end, "Claude agents: choose how the session list is ordered and how far back it reaches")
-    else
-      pcall(vim.keymap.del, "n", sort_lhs, { buffer = buf })
-    end
-  end
-
-  local lhs = keymap_for("new", "a")
-  if not lhs then
+  if not sort_lhs then
     return
   end
   if kind == "empty" then
-    map(buf, lhs, function()
-      M.new_agent()
-    end, "Claude agents: start a new agent")
+    map(buf, sort_lhs, function()
+      M.show_sort_menu()
+    end, "Claude agents: choose how the session list is ordered and how far back it reaches")
   else
     -- Errors when there is nothing to delete, which is the usual case: every
     -- other screen reaches here having never bound it.
-    pcall(vim.keymap.del, "n", lhs, { buffer = buf })
+    pcall(vim.keymap.del, "n", sort_lhs, { buffer = buf })
   end
 end
 
@@ -1053,6 +1049,10 @@ local function show_start_prompt(session_id)
   else
     lines[#lines + 1] = "  This conversation is not running."
     hints = { { start_key, "start it here" } }
+  end
+  local new_key = keymap_for("new", "a")
+  if new_key then
+    hints[#hints + 1] = { new_key, "start a new agent" }
   end
   hints[#hints + 1] = {
     tostring(keymaps().next_session or "<C-n>") .. "/" .. tostring(keymaps().prev_session or "<C-p>"),

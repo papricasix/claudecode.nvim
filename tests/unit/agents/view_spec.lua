@@ -849,17 +849,18 @@ describe("agents_view", function()
       expect(text:find("show more of them", 1, true) ~= nil).to_be_true()
     end)
 
-    it("binds the new-agent key on that screen, and nowhere else", function()
-      -- `new` is a sessions-pane key otherwise, and the notice buffer is reused:
-      -- left bound, it would start a *second* conversation from a screen offering
-      -- to resume a particular one.
-      local function has_new_key()
+    it("binds the new-agent key on every notice screen", function()
+      -- No agent runs in the centre while it shows a notice, so `a` starts one
+      -- whether the screen is the empty project or an offer to resume.
+      local function new_key()
         for _, keymap in ipairs(vim.api.nvim_buf_get_keymap(agents_view._state().notice_buf, "n")) do
           if keymap.lhs == "a" then
-            return true
+            return keymap
           end
         end
-        return false
+      end
+      local function has_new_key()
+        return new_key() ~= nil
       end
 
       rows = {}
@@ -869,7 +870,10 @@ describe("agents_view", function()
       rows = { { session_id = "aaa", title = "First" } }
       notify_change()
       expect(agents_view._state().notice_kind).to_be("offer")
-      expect(has_new_key()).to_be_false()
+      expect(has_new_key()).to_be_true()
+      expect(center_lines():find("start a new agent", 1, true) ~= nil).to_be_true()
+      new_key().callback()
+      expect(#launched).to_be(1)
     end)
 
     it("starts a new agent when the terminal is focused in an empty project", function()
