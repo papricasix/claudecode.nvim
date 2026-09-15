@@ -136,6 +136,21 @@ function M.open(opts, done)
 
     local tool = call.tool or opts.tool
     local result = type(call.result) == "table" and call.result or {}
+    -- A workflow launch is the run itself, shown as the run.
+    if
+      tool == transcript.WORKFLOW_TOOL
+      and result.taskType == "local_workflow"
+      and type(result.taskId) == "string"
+      and opts.transcript
+    then
+      return require("claudecode.agents.workflow_view").open({
+        session_id = opts.session_id,
+        session_path = require("claudecode.agents.shell_view").session_path(opts.transcript),
+        task_id = result.taskId,
+        reuse = opts.reuse,
+        row_for = opts.row_for,
+      }, done)
+    end
     local task_id = nil
     if transcript.SHELL_TOOLS[tool] then
       task_id = result.backgroundTaskId

@@ -428,6 +428,12 @@ function M.render(doc, ctx)
         glyph = STATE_GLYPH[shell.state] or "●"
         local monitor = shell.task_type == "monitor"
         local parts = { monitor and "watching" or "in the background" }
+        if shell.kind == "workflow" then
+          parts = { shell.agents == 1 and "1 agent" or ((shell.agents or 0) .. " agents") }
+          if shell.tokens then
+            parts[#parts + 1] = subagents.format_tokens(shell.tokens) .. " tokens"
+          end
+        end
         if shell.exit_code and shell.exit_code ~= 0 then
           parts[#parts + 1] = "exit " .. shell.exit_code
         elseif shell.how == "expired" then
@@ -488,7 +494,7 @@ function M.render(doc, ctx)
       end
       add(line)
       glyph_mark(glyph, 2)
-      if target and target.kind == "shell" then
+      if target and (target.kind == "shell" or target.kind == "workflow") then
         calls[#lines] =
           { tool_id = target.tool_id, tool = target.agent_type, label = target.description, shell = target }
       elseif target then
@@ -566,7 +572,7 @@ local function context(session_path, agent_id, row_for, history)
   end
   local shells = {}
   for _, row in pairs(by_id) do
-    if row.kind == "shell" and row.tool_id then
+    if (row.kind == "shell" or row.kind == "workflow") and row.tool_id then
       shells[row.tool_id] = row
     end
   end
@@ -757,6 +763,15 @@ local TOOL_VIEW_STATUS = { error = "error", rejected = "rejected", interrupted =
 ---@param call { tool_id: string, tool: string, label: string?, path: string?, read: table?, status: string?,
 ---             shell: ClaudeCodeSubagentRow? }
 function M.open_call(session_id, view, call)
+  if call.shell and call.shell.kind == "workflow" then
+    require("claudecode.agents.workflow_view").open({
+      session_id = session_id,
+      session_path = view.session_path,
+      task_id = call.shell.id,
+      row_for = view.opts and view.opts.row_for,
+    })
+    return
+  end
   if call.shell then
     local ok, shell_view = pcall(require, "claudecode.agents.shell_view")
     if ok then
@@ -807,9 +822,11 @@ end
 ---Open (or swap into `opts.reuse`) the transcript of one subagent run.
 ---@param opts { session_id: string?, session_path: string, agent_id: string, reuse: integer?,
 ---             row_for: (fun(id: string): ClaudeCodeSubagentRow|nil)?, on_open: (fun(win: integer|nil))?,
----             history: { agent_id: string, lnum: integer }[]?, cursor: integer? }
+---             history: { agent_id: string, lnum: integer, path: string? }[]?, cursor: integer?,
+---             path: string? }
 ---             `history` is the chain of runs this float came down through; `cursor`
----             the line to land on.
+---             the line to land on; `path` the transcript, for a run that is not one of the
+---             session's own subagents (a workflow's agent).
 ---@param done fun(win: integer|nil)|nil
 function M.open(opts, done)
   local function finish(win)
@@ -818,7 +835,7 @@ function M.open(opts, done)
     end
   end
   local dir = subagents.dir(opts.session_path)
-  if not dir or type(opts.agent_id) ~= "string" then
+  if (not dir and not opts.path) or type(opts.agent_id) ~= "string" then
     return finish(nil)
   end
 
@@ -830,7 +847,8 @@ function M.open(opts, done)
   pcall(vim.api.nvim_set_option_value, "undolevels", -1, { buf = buf })
 
   local view = {
-    path = dir .. "/agent-" .. opts.agent_id .. ".jsonl",
+    -- A workflow's agent lives in its run's directory, and says so.
+    path = opts.path or (dir .. "/agent-" .. opts.agent_id .. ".jsonl"),
     session_path = opts.session_path,
     agent_id = opts.agent_id,
     doc = M.new_doc(),
@@ -888,11 +906,13 @@ function M.open(opts, done)
     for index, entry in ipairs(opts.history or {}) do
       history[index] = entry
     end
-    history[#history + 1] = { agent_id = opts.agent_id, lnum = lnum }
+    history[#history + 1] = { agent_id = opts.agent_id, lnum = lnum, path = opts.path }
+    local target_row = opts.row_for and opts.row_for(target) or nil
     M.open({
       session_id = opts.session_id,
       session_path = opts.session_path,
       agent_id = target,
+      path = target_row and target_row.path or nil,
       reuse = vim.api.nvim_get_current_win(),
       row_for = opts.row_for,
       on_open = opts.on_open,
@@ -913,6 +933,7 @@ function M.open(opts, done)
         session_id = opts.session_id,
         session_path = opts.session_path,
         agent_id = parent.agent_id,
+        path = parent.path,
         reuse = vim.api.nvim_get_current_win(),
         row_for = opts.row_for,
         on_open = opts.on_open,

@@ -571,6 +571,136 @@ describe("agents.subagents", function()
         expect(by_id.bquiet.runtime_s).to_be(30)
       end)
 
+      describe("workflow runs", function()
+        local BASE = "/store/proj/sess"
+        local RUN = BASE .. "/subagents/workflows/wf_1"
+
+        local function launch(ts)
+          return {
+            vim.json.encode({
+              type = "assistant",
+              timestamp = iso(ts),
+              message = {
+                role = "assistant",
+                content = { { type = "tool_use", id = "toolu_wf", name = "Workflow", input = { script = "…" } } },
+              },
+            }),
+            vim.json.encode({
+              type = "user",
+              timestamp = iso(ts),
+              message = {
+                role = "user",
+                content = {
+                  { type = "tool_result", tool_use_id = "toolu_wf", content = "Workflow launched in background." },
+                },
+              },
+              toolUseResult = {
+                status = "async_launched",
+                taskId = "wtask",
+                taskType = "local_workflow",
+                workflowName = "review-changes",
+                runId = "wf_1",
+                summary = "Review the diff",
+                transcriptDir = RUN,
+              },
+            }),
+          }
+        end
+
+        local function run_agent(id, label, phase, ts)
+          dirs[RUN] = dirs[RUN] or {}
+          table.insert(dirs[RUN], "agent-" .. id .. ".meta.json")
+          put(RUN .. "/agent-" .. id .. ".meta.json", {
+            vim.json.encode({ agentType = "workflow-subagent", description = label, workflowPhase = phase }),
+          }, ts)
+          put(RUN .. "/agent-" .. id .. ".jsonl", {
+            vim.json.encode({ type = "user", timestamp = iso(ts), agentId = id }),
+          }, ts)
+        end
+
+        it("lists a running run with its agents under it, from the journal", function()
+          put(SESSION, launch(NOW - 60))
+          run_agent("a1", "find bugs", "Review", NOW - 50)
+          run_agent("a2", "verify", "Verify", NOW - 40)
+          put(RUN .. "/journal.jsonl", {
+            '{"type":"launched"}',
+            '{"type":"started","agentId":"a1","label":"find bugs","phase":"Review"}',
+            '{"type":"result","agentId":"a1","result":"ok"}',
+            '{"type":"started","agentId":"a2","label":"verify","phase":"Verify"}',
+          }, NOW - 5)
+          local out = rows({ live = true })
+          local drawn = {}
+          for _, row in ipairs(out) do
+            drawn[#drawn + 1] = row.prefix .. row.id .. ":" .. row.state
+          end
+          expect(table.concat(drawn, "|")).to_be("wtask:running|├─a1:done|└─a2:running")
+          expect(out[1].kind).to_be("workflow")
+          expect(out[1].agent_type).to_be("review-changes")
+          expect(out[1].description).to_be("Review the diff")
+          expect(out[1].agents).to_be(2)
+          expect(out[2].description).to_be("find bugs")
+          expect(out[2].phase).to_be("Review")
+          expect(out[2].workflow).to_be("wtask")
+          expect(out[2].path).to_be(RUN .. "/agent-a1.jsonl")
+        end)
+
+        it("takes the end from the run record, and calls an agent it cut off stopped", function()
+          put(SESSION, launch(NOW - 60))
+          run_agent("a1", "count", "Count", NOW - 50)
+          put(RUN .. "/journal.jsonl", {
+            '{"type":"started","agentId":"a1","label":"count","phase":"Count"}',
+          }, NOW - 40)
+          put(BASE .. "/workflows/wf_1.json", {
+            vim.json.encode({
+              status = "killed",
+              durationMs = 29000,
+              totalTokens = 62531,
+              workflowProgress = {
+                { type = "workflow_agent", agentId = "a1", state = "progress", tokens = 62531 },
+              },
+            }),
+          }, NOW - 30)
+          local out = rows({ live = true })
+          expect(out[1].state).to_be("stopped")
+          expect(out[1].runtime_s).to_be(29)
+          expect(out[1].tokens).to_be(62531)
+          expect(out[2].state).to_be("stopped")
+          expect(out[2].tokens).to_be(62531)
+        end)
+
+        it("prefers the notification's figures, and reads a stop with no record from TaskStop", function()
+          local lines = launch(NOW - 60)
+          lines[#lines + 1] = vim.json.encode({
+            type = "queue-operation",
+            operation = "enqueue",
+            timestamp = iso(NOW - 10),
+            content = '<task-notification>\n<task-id>wtask</task-id>\n<status>failed</status>\n<summary>Dynamic workflow "x" failed: boom</summary>\n<usage><subagent_tokens>900</subagent_tokens><duration_ms>12000</duration_ms></usage>\n</task-notification>',
+          })
+          put(SESSION, lines)
+          local row = rows({ live = true })[1]
+          expect(row.state).to_be("failed")
+          expect(row.tokens).to_be(900)
+          expect(row.runtime_s).to_be(12)
+
+          local stopped = launch(NOW - 60)
+          stopped[#stopped + 1] = vim.json.encode({
+            type = "user",
+            timestamp = iso(NOW - 20),
+            message = { role = "user", content = { { type = "tool_result", tool_use_id = "toolu_s", content = "ok" } } },
+            toolUseResult = {
+              message = "Successfully stopped task: wtask (x)",
+              task_id = "wtask",
+              task_type = "local_workflow",
+            },
+          })
+          put(SESSION, stopped)
+          transcript.reset()
+          row = rows({ live = true })[1]
+          expect(row.state).to_be("stopped")
+          expect(row.how).to_be("killed")
+        end)
+      end)
+
       it("names a WebSocket monitor by its URL", function()
         put(SESSION, {
           monitor_call("toolu_w", NOW - 10, { ws = { url = "wss://events.example/stream" }, description = "deploys" }),

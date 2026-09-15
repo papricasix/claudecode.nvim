@@ -652,6 +652,38 @@ describe("agents.render", function()
       expect(lines_of(pane)[1]).to_be(" ● ~ errors" .. string.rep(" ", 16) .. " 12ev    0:42")
     end)
 
+    it("marks a workflow run with » and carries what opens it and its agents", function()
+      render.subagents(pane, {
+        {
+          id = "wtask",
+          kind = "workflow",
+          task_type = "workflow",
+          agent_type = "review-changes",
+          description = "Review",
+          prefix = "",
+          state = "running",
+          tokens = 125000,
+          runtime_s = 9,
+        },
+        {
+          id = "a1",
+          kind = "subagent",
+          agent_type = "Phase",
+          description = "find bugs",
+          path = "/run/agent-a1.jsonl",
+          prefix = "└─",
+          state = "done",
+          tokens = 62000,
+          runtime_s = 1,
+        },
+      }, { width = 40 })
+      local lines = lines_of(pane)
+      expect(lines[1]).to_be(" ● » Review" .. string.rep(" ", 16) .. " 125k    0:09")
+      expect(render.payload_at(pane, 1).kind).to_be("workflow")
+      expect(render.payload_at(pane, 1).task_id).to_be("wtask")
+      expect(render.payload_at(pane, 2).path).to_be("/run/agent-a1.jsonl")
+    end)
+
     it("keeps the numbers inside a pane too narrow for any name", function()
       render.subagents(pane, {
         {

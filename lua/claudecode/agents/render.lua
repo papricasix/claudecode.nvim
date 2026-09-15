@@ -751,10 +751,12 @@ local SUBAGENT_MARK = {
   stopped = { text = "⊘", hl = "stopped" },
 }
 
---- What sets a background shell's name apart from a subagent's, and a monitor's
---- from a shell's.
+--- What sets a background shell's name apart from a subagent's, a monitor's from a
+--- shell's, and a workflow run's from both. A workflow's own agents are plain
+--- subagent rows under it.
 local SHELL_MARK = "$ "
 local MONITOR_MARK = "~ "
+local WORKFLOW_MARK = "» "
 
 ---Draw the selected session's subagents and background shells as a tree.
 ---
@@ -795,9 +797,10 @@ function M.subagents(buf, rows, opts)
   for index, row in ipairs(rows) do
     local mark = SUBAGENT_MARK[row.state] or SUBAGENT_MARK.stopped
     local ended = row.state ~= "running"
+    local is_workflow = row.kind == "workflow"
     local is_shell = row.kind == "shell"
     local is_monitor = is_shell and row.task_type == "monitor"
-    local kind_mark = is_monitor and MONITOR_MARK or SHELL_MARK
+    local kind_mark = is_workflow and WORKFLOW_MARK or (is_monitor and MONITOR_MARK or SHELL_MARK)
     -- A monitor's figure is how many events it has delivered; a shell has none.
     local figure = ""
     if is_monitor and row.events then
@@ -807,7 +810,8 @@ function M.subagents(buf, rows, opts)
     end
     -- Fixed fields, so every row's numbers line up however deep the tree goes.
     local right = lpad(figure, 5) .. " " .. lpad(subagents.format_runtime(row.runtime_s), 7)
-    local head = GUTTER .. row.prefix .. mark.text .. " " .. (is_shell and kind_mark or "")
+    local marked = is_shell or is_workflow
+    local head = GUTTER .. row.prefix .. mark.text .. " " .. (marked and kind_mark or "")
     local room = math.max(1, width - vim.fn.strdisplaywidth(head) - vim.fn.strdisplaywidth(right) - 1)
     local text = row.agent_type or "agent"
     if is_shell then
@@ -833,8 +837,12 @@ function M.subagents(buf, rows, opts)
         transcript = row.transcript,
         description = row.description,
       }
+    elseif is_workflow then
+      payload_map[index] = { kind = "workflow", task_id = row.id, description = row.description }
     else
-      payload_map[index] = { kind = "subagent", agent_id = row.id, description = row.description }
+      -- `path` is set for a workflow's agent, whose transcript is not where a
+      -- session's own subagents are.
+      payload_map[index] = { kind = "subagent", agent_id = row.id, path = row.path, description = row.description }
     end
 
     local prefix_at = #GUTTER
@@ -846,7 +854,7 @@ function M.subagents(buf, rows, opts)
     if mark_group then
       marks[#marks + 1] = { row = lnum, col = mark_at, end_col = mark_at + #mark.text, hl = mark_group }
     end
-    if is_shell then
+    if marked then
       local shell_at = mark_at + #mark.text + 1
       marks[#marks + 1] = { row = lnum, col = shell_at, end_col = shell_at + #kind_mark, hl = hl("time") }
     end

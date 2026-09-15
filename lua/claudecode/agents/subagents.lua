@@ -150,6 +150,23 @@ function M.refresh(transcript_path, on_change)
   for _, agent in ipairs(M.scan(transcript_path)) do
     paths[#paths + 1] = agent.path
   end
+  -- A workflow's agents, from whatever is already folded: a run launched since the
+  -- last fold is picked up on the next refresh, once its launch has been read.
+  local seen_runs = {}
+  local index = 1
+  while index <= #paths do
+    local sum = transcript.get(paths[index])
+    for task_id, task in pairs(sum and sum.tasks or {}) do
+      if task.task_type == "workflow" and not seen_runs[task_id] then
+        seen_runs[task_id] = true
+        local run = M.scan_workflow(transcript_path, task)
+        for _, agent in ipairs(run and run.agents or {}) do
+          paths[#paths + 1] = agent.path
+        end
+      end
+    end
+    index = index + 1
+  end
   for _, path in ipairs(paths) do
     transcript.summary(path, function(sum)
       local size = sum and sum.size or nil
@@ -198,6 +215,11 @@ local ENDED = { completed = "done", killed = "stopped", stopped = "stopped", can
 ---@field task_type "shell"|"monitor"|nil Shells: which kind of background command.
 ---@field how "expired"|"killed"|"orphaned"|nil Shells: why a stopped one stopped.
 ---@field events integer|nil Monitors: how many events it has delivered.
+---@field run_id string|nil Workflows: the run.
+---@field agents integer|nil Workflows: how many agents it has started.
+---@field workflow string|nil A workflow's agent: the task id of the run it belongs to.
+---@field phase string|nil A workflow's agent: the phase it ran in.
+---@field path string|nil A workflow's agent: its transcript.
 
 ---Where one run stands, from everything that could have recorded its end.
 ---@param agent ClaudeCodeSubagent
@@ -430,6 +452,301 @@ function M.tasks_dir(transcript_path, sums)
   return ("%s/claude-%d/%s/%s/tasks"):format(root, uid, transcript.slugify(session.cwd), id)
 end
 
+--------------------------------------------------------------------------------
+-- Workflow runs
+--------------------------------------------------------------------------------
+
+--- Past this a run record or journal is not read (a record carries the whole
+--- script; the probes here were 1–2KB).
+local RECORD_LIMIT = 4 * 1024 * 1024
+
+--- Files already read, [path] = { size, mtime, value }.
+local file_cache = {}
+
+---Read a small file whole, blocking, parsed and cached until it changes.
+---@param path string
+---@param parse fun(data: string): any
+---@return any|nil value
+---@return integer|nil mtime
+local function read_cached(path, parse)
+  local fs = transcript._io
+  local st = fs and fs.stat and fs.stat(path)
+  if not st then
+    file_cache[path] = nil
+    return nil, nil
+  end
+  local hit = file_cache[path]
+  if hit and hit.size == st.size and hit.mtime == st.mtime then
+    return hit.value, st.mtime
+  end
+  local value = nil
+  if st.size > 0 and st.size <= RECORD_LIMIT and type(fs.read_sync) == "function" then
+    local data = fs.read_sync(path, st.size)
+    if type(data) == "string" then
+      local ok, parsed = pcall(parse, data)
+      value = ok and parsed or nil
+    end
+  end
+  file_cache[path] = { size = st.size, mtime = st.mtime, value = value }
+  return value, st.mtime
+end
+
+---@param data string
+---@return table
+local function parse_journal(data)
+  local out = { order = {}, results = {}, failed = {} }
+  for line in data:gmatch("[^\n]+") do
+    local ok, entry = pcall(vim.json.decode, line)
+    if ok and type(entry) == "table" and type(entry.agentId) == "string" then
+      if entry.type == "started" and not out.results[entry.agentId] then
+        out.order[#out.order + 1] = entry.agentId
+      elseif entry.type == "result" then
+        out.results[entry.agentId] = true
+      elseif entry.type == "failed" then
+        out.failed[entry.agentId] = true
+      end
+    end
+  end
+  return out
+end
+
+---@param data string
+---@return table|nil
+local function parse_record(data)
+  local ok, value = pcall(vim.json.decode, data)
+  return ok and type(value) == "table" and value or nil
+end
+
+---The session directory a transcript's workflow files live under.
+---@param transcript_path string
+---@return string|nil
+local function session_base(transcript_path)
+  return type(transcript_path) == "string" and transcript_path:match("^(.*)%.jsonl$") or nil
+end
+
+---@class ClaudeCodeWorkflowAgent
+---@field id string
+---@field label string|nil What the script called it (`agent(…, {label})`).
+---@field phase string|nil
+---@field path string Its transcript.
+---@field started number
+---@field mtime number
+---@field returned boolean|nil The journal recorded its result.
+---@field failed boolean|nil The journal recorded it failing.
+---@field progress table|nil Its entry in the run record's `workflowProgress`.
+
+---@class ClaudeCodeWorkflowRun
+---@field dir string Where its agents' transcripts and journal are.
+---@field agents ClaudeCodeWorkflowAgent[] In the order the journal saw them start.
+---@field record table|nil The run record, written once the run has ended.
+---@field written number Epoch seconds anything of the run was last written.
+
+---Everything on disk about one workflow run.
+---
+---Layout (verified against CLI 2.1.272): the agents are subagents of their own
+---under `<session>/subagents/workflows/<runId>/` — `agent-<id>.jsonl` plus a
+---descriptor (`agentType = "workflow-subagent"`, `description` = the label,
+---`workflowPhase`) — beside a `journal.jsonl` of `launched` / `started` /
+---`result` / `failed` lines, the one record that moves while the run does. The
+---run record `<session>/workflows/<runId>.json` (status, error, per-agent
+---`workflowProgress` with state, tokens and duration) is written only when the
+---run ends, however it ends.
+---@param transcript_path string The session's transcript.
+---@param task ClaudeCodeAgentsShell
+---@return ClaudeCodeWorkflowRun|nil
+function M.scan_workflow(transcript_path, task)
+  local base = session_base(transcript_path)
+  if not base or not task.run_id then
+    return nil
+  end
+  local dir = task.transcript_dir or (base .. "/subagents/workflows/" .. task.run_id)
+  local fs = transcript._io
+  local run = { dir = dir, agents = {}, written = task.started_ts or 0 }
+
+  local record = read_cached(base .. "/workflows/" .. task.run_id .. ".json", parse_record)
+  run.record = record
+  local progress = {}
+  if record and type(record.workflowProgress) == "table" then
+    for _, item in ipairs(record.workflowProgress) do
+      if type(item) == "table" and item.type == "workflow_agent" and type(item.agentId) == "string" then
+        progress[item.agentId] = item
+      end
+    end
+  end
+
+  local journal, journal_mtime = read_cached(dir .. "/journal.jsonl", parse_journal)
+  journal = journal or { order = {}, results = {}, failed = {} }
+  run.written = math.max(run.written, journal_mtime or 0)
+
+  local seen = {}
+  local function add(id)
+    if seen[id] then
+      return
+    end
+    seen[id] = true
+    local meta_path = dir .. "/agent-" .. id .. ".meta.json"
+    local st = fs.stat and fs.stat(meta_path)
+    local meta = st and read_meta(meta_path, st) or {}
+    local path = dir .. "/agent-" .. id .. ".jsonl"
+    local log = fs.stat and fs.stat(path)
+    run.written = math.max(run.written, log and log.mtime or 0)
+    run.agents[#run.agents + 1] = {
+      id = id,
+      label = type(meta.description) == "string" and meta.description or (progress[id] and progress[id].label) or nil,
+      phase = type(meta.workflowPhase) == "string" and meta.workflowPhase or (progress[id] and progress[id].phaseTitle),
+      path = path,
+      started = st and st.mtime or run.written,
+      mtime = log and log.mtime or 0,
+      returned = journal.results[id] or nil,
+      failed = journal.failed[id] or nil,
+      progress = progress[id],
+    }
+  end
+  for _, id in ipairs(journal.order) do
+    add(id)
+  end
+  -- A descriptor the journal has not caught up with yet is an agent all the same.
+  for _, name in ipairs(fs.scandir and fs.scandir(dir) or {}) do
+    local id = name:match("^agent%-(.+)%.meta%.json$")
+    if id then
+      add(id)
+    end
+  end
+  return run
+end
+
+---Find a background task's record — a shell, monitor or workflow run — in the
+---session's transcript or one of its subagents'.
+---@param transcript_path string
+---@param task_id string
+---@return ClaudeCodeAgentsShell|nil
+function M.find_task(transcript_path, task_id)
+  local paths = { transcript_path }
+  for _, agent in ipairs(M.scan(transcript_path)) do
+    paths[#paths + 1] = agent.path
+  end
+  for _, path in ipairs(paths) do
+    local sum = transcript.get(path)
+    local task = sum and sum.tasks and sum.tasks[task_id]
+    if task then
+      return task
+    end
+  end
+  return nil
+end
+
+--- What a run record's or a notification's status word means for the row.
+local WORKFLOW_ENDED = { completed = "done", failed = "failed", killed = "stopped", stopped = "stopped" }
+
+---Where one workflow run stands: its notification, else its run record, else a
+---`TaskStop` (a stopped run gets no notification — measured), else a resumed
+---CLI's guess; without any, running while the session is live or the run's files
+---are still being written.
+---@param task ClaudeCodeAgentsShell
+---@param facts { note: ClaudeCodeAgentsTaskResult|nil, stop_ts: number|nil, run: ClaudeCodeWorkflowRun|nil }
+---@param opts { live: boolean?, now: number }
+---@return ClaudeCodeTaskState|{ tokens: integer|nil }
+function M.workflow_state(task, facts, opts)
+  local started = task.started_ts or task.ts or 0
+  local note = facts.note
+  local record = facts.run and facts.run.record
+  local written = facts.run and facts.run.written or started
+  local function live_tokens()
+    local total, any = 0, false
+    for _, agent in ipairs(facts.run and facts.run.agents or {}) do
+      local tokens = agent.progress and tonumber(agent.progress.tokens)
+      if not tokens then
+        local sum = transcript.get(agent.path)
+        tokens = sum and sum.tokens or nil
+      end
+      if tokens then
+        total, any = total + tokens, true
+      end
+    end
+    return any and total or nil
+  end
+
+  if note and note.status and not note.orphaned then
+    local state = WORKFLOW_ENDED[note.status] or "failed"
+    return {
+      state = state,
+      tokens = note.tokens or (record and tonumber(record.totalTokens)) or live_tokens(),
+      runtime_s = note.duration_ms and note.duration_ms / 1000 or math.max(0, (note.ts or started) - started),
+      ended = true,
+      how = state == "stopped" and "killed" or nil,
+    }
+  end
+  if record and WORKFLOW_ENDED[record.status] then
+    local state = WORKFLOW_ENDED[record.status]
+    return {
+      state = state,
+      tokens = tonumber(record.totalTokens) or live_tokens(),
+      runtime_s = tonumber(record.durationMs) and record.durationMs / 1000 or math.max(0, written - started),
+      ended = true,
+      how = state == "stopped" and "killed" or nil,
+    }
+  end
+  if facts.stop_ts then
+    return {
+      state = "stopped",
+      tokens = live_tokens(),
+      runtime_s = math.max(0, facts.stop_ts - started),
+      ended = true,
+      how = "killed",
+    }
+  end
+  if note and note.orphaned then
+    return {
+      state = "stopped",
+      tokens = live_tokens(),
+      runtime_s = math.max(0, written - started),
+      ended = true,
+      how = "orphaned",
+    }
+  end
+  if opts.live or (opts.now - written) < M.STALE_S then
+    return { state = "running", tokens = live_tokens(), runtime_s = math.max(0, opts.now - started), ended = false }
+  end
+  return { state = "stopped", tokens = live_tokens(), runtime_s = math.max(0, written - started), ended = false }
+end
+
+--- A run record's agent state, for the agent's row.
+local AGENT_PROGRESS = { done = "done", error = "failed", failed = "failed", skipped = "stopped" }
+
+---Where one of a workflow's agents stands, given how the run stands.
+---@param agent ClaudeCodeWorkflowAgent
+---@param run_state string
+---@param opts { now: number }
+---@return string state
+---@return integer|nil tokens
+---@return number|nil runtime_s
+function M.workflow_agent_state(agent, run_state, opts)
+  local sum = transcript.get(agent.path)
+  local first = (sum and sum.first_ts and sum.first_ts > 0) and sum.first_ts or agent.started
+  local last = (sum and sum.last_ts and sum.last_ts > 0) and sum.last_ts or agent.mtime
+  local progress = agent.progress
+  local tokens = progress and tonumber(progress.tokens) or (sum and sum.tokens) or nil
+  local measured = progress and tonumber(progress.durationMs) and progress.durationMs / 1000 or nil
+
+  local state = progress and AGENT_PROGRESS[progress.state] or nil
+  if not state then
+    if agent.failed then
+      state = "failed"
+    elseif agent.returned then
+      state = "done"
+    elseif run_state == "running" then
+      state = "running"
+    else
+      -- The run ended with this agent still working: it was cut off.
+      state = "stopped"
+    end
+  end
+  if state == "running" then
+    return state, tokens, math.max(0, opts.now - first)
+  end
+  return state, tokens, measured or math.max(0, last - first)
+end
+
 ---The session's subagents and background tasks as a flattened tree, children
 ---under their parent in the order they started.
 ---@param transcript_path string
@@ -451,6 +768,40 @@ function M.rows(transcript_path, opts)
     if sum then
       sources[#sources + 1] = { sum = sum, parent = agent.id, path = agent.path }
     end
+  end
+
+  -- Workflow runs, wherever they were launched from. Their agents are nodes of the
+  -- tree under the run, and their transcripts are sources in turn, so a task an
+  -- agent started nests under that agent. Walked by index: the list grows.
+  ---@type table<string, ClaudeCodeWorkflowRun>
+  local runs = {}
+  ---@type table[]
+  local run_agents = {}
+  local next_source = 1
+  while next_source <= #sources do
+    local source = sources[next_source]
+    for task_id, task in pairs(source.sum.tasks or {}) do
+      if task.task_type == "workflow" and not runs[task_id] then
+        local run = M.scan_workflow(transcript_path, task)
+        if run then
+          runs[task_id] = run
+          for _, agent in ipairs(run.agents) do
+            run_agents[#run_agents + 1] = {
+              kind = "workflow_agent",
+              id = agent.id,
+              parent_id = task_id,
+              started = agent.started,
+              agent = agent,
+            }
+            local sum = transcript.get(agent.path)
+            if sum then
+              sources[#sources + 1] = { sum = sum, parent = agent.id, path = agent.path }
+            end
+          end
+        end
+      end
+    end
+    next_source = next_source + 1
   end
 
   for _, source in ipairs(sources) do
@@ -496,10 +847,13 @@ function M.rows(transcript_path, opts)
   for _, agent in ipairs(agents) do
     nodes[#nodes + 1] = agent
   end
+  for _, node in ipairs(run_agents) do
+    nodes[#nodes + 1] = node
+  end
   for _, source in ipairs(sources) do
     for task_id, shell in pairs(source.sum.tasks or {}) do
       nodes[#nodes + 1] = {
-        kind = "shell",
+        kind = shell.task_type == "workflow" and "workflow" or "shell",
         id = task_id,
         parent_id = source.parent,
         started = shell.started_ts or shell.ts or 0,
@@ -516,6 +870,8 @@ function M.rows(transcript_path, opts)
   for _, node in ipairs(nodes) do
     by_id[node.id] = by_id[node.id] or node
   end
+  -- How each run stands, which its agents' rows are read against.
+  local run_states = {}
   for _, agent in ipairs(nodes) do
     -- A parent we cannot see (its descriptor unreadable) would orphan the whole
     -- branch; it is drawn from the top instead.
@@ -545,7 +901,51 @@ function M.rows(transcript_path, opts)
         visited[agent.id] = true
         local last = position == #list
         local prefix = depth == 0 and "" or (stem .. (last and "└─" or "├─"))
-        if agent.kind == "shell" then
+        if agent.kind == "workflow" then
+          local task = agent.shell
+          local run = runs[agent.id]
+          local st = M.workflow_state(task, {
+            note = index.notes[agent.id],
+            stop_ts = index.stops[agent.id],
+            run = run,
+          }, opts)
+          run_states[agent.id] = st.state
+          out[#out + 1] = {
+            kind = "workflow",
+            task_type = "workflow",
+            id = agent.id,
+            agent_type = task.name or "workflow",
+            description = task.description,
+            tool_id = task.tool_id,
+            run_id = task.run_id,
+            depth = depth,
+            prefix = prefix,
+            state = st.state,
+            tokens = st.tokens,
+            runtime_s = st.runtime_s,
+            how = st.how,
+            ended = st.ended,
+            agents = run and #run.agents or nil,
+            transcript = agent.transcript,
+          }
+        elseif agent.kind == "workflow_agent" then
+          local wa = agent.agent
+          local state, tokens, runtime = M.workflow_agent_state(wa, run_states[agent.parent_id] or "stopped", opts)
+          out[#out + 1] = {
+            kind = "subagent",
+            id = agent.id,
+            agent_type = wa.phase or "workflow agent",
+            description = wa.label,
+            phase = wa.phase,
+            workflow = agent.parent_id,
+            path = wa.path,
+            depth = depth,
+            prefix = prefix,
+            state = state,
+            tokens = tokens,
+            runtime_s = runtime,
+          }
+        elseif agent.kind == "shell" then
           local shell = agent.shell
           local note = index.notes[agent.id]
           local events = index.events[agent.id]
@@ -637,6 +1037,7 @@ function M.reset()
   meta_cache = {}
   seen_size = {}
   footer_cache = {}
+  file_cache = {}
 end
 
 return M

@@ -706,7 +706,7 @@ local KEY_SPECS = {
     field = "open",
     panes = { "subagents" },
     group = "Tasks",
-    desc = "A subagent: read its transcript (<CR> on a subagent in it opens that one). A shell or monitor: its output, followed live",
+    desc = "A subagent: read its transcript (<CR> on a subagent in it opens that one). A shell or monitor: its output, followed live. A workflow: its agents by phase and result",
     run = function()
       M.open_under_cursor()
     end,
@@ -2579,7 +2579,14 @@ local function next_open_row(pane, lnum, delta, action)
     local openable = payload
       and (
         payload.path
-        or ((payload.kind == "tool" or payload.kind == "subagent" or payload.kind == "shell") and action ~= "head")
+        or (
+          (
+            payload.kind == "tool"
+            or payload.kind == "subagent"
+            or payload.kind == "shell"
+            or payload.kind == "workflow"
+          ) and action ~= "head"
+        )
       )
     if openable then
       return candidate
@@ -2778,6 +2785,27 @@ function open_row(payload, pane, lnum, action, nav_opts)
     return
   end
 
+  -- A workflow run: its agents phase by phase, followed live; an agent line opens
+  -- that agent's transcript on top.
+  if payload and payload.kind == "workflow" then
+    local session_path = model.transcript_path()
+    if action ~= "diff" or not session_path then
+      return opened(nil)
+    end
+    require("claudecode.agents.workflow_view").open({
+      session_id = model.selected(),
+      session_path = session_path,
+      task_id = payload.task_id,
+      reuse = nav_opts.reuse,
+      rows = function()
+        return model.transcript_path() == session_path and model.subagents()
+          or require("claudecode.agents.subagents").rows(session_path, { live = nil })
+      end,
+      row_for = subagent_row_for(session_path),
+    }, opened)
+    return
+  end
+
   -- A background shell: its command, how it stands, and its output, followed live.
   if payload and payload.kind == "shell" then
     if action ~= "diff" then
@@ -2813,6 +2841,7 @@ function open_row(payload, pane, lnum, action, nav_opts)
       session_id = model.selected(),
       session_path = session_path,
       agent_id = payload.agent_id,
+      path = payload.path,
       reuse = nav_opts.reuse,
       row_for = subagent_row_for(session_path),
       on_open = function(win)

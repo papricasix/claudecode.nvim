@@ -81,6 +81,14 @@ M.SHELL_TOOLS = SHELL_TOOLS
 local MONITOR_TOOL = "Monitor"
 M.MONITOR_TOOL = MONITOR_TOOL
 
+--- The tool that runs a workflow script in the background: its agents are
+--- subagents of their own, and the run is a task like a shell.
+local WORKFLOW_TOOL = "Workflow"
+M.WORKFLOW_TOOL = WORKFLOW_TOOL
+
+--- Past this a workflow's launch result is not decoded (the real ones are ~1KB).
+local WORKFLOW_RESULT_LIMIT = 64 * 1024
+
 --- Longest command kept on a background shell's record. The record names a row;
 --- the whole command is read back out of the transcript when a float asks.
 local SHELL_COMMAND_LIMIT = 512
@@ -146,8 +154,8 @@ local config = nil
 ---@field agent_calls table<string, ClaudeCodeAgentsEvent> `Agent`/`Task` tool events, by tool_use id.
 ---@field agent_results table<string, ClaudeCodeAgentsTaskResult> Foreground subagent results, by tool_use id.
 ---@field task_notes table<string, ClaudeCodeAgentsTaskResult> Background task completions, by task id (an agent id, or a shell's `b…` id).
----@field task_calls table<string, { tool: string, description: string|nil, command: string|nil, ts: number }> Shell and monitor calls with no result yet, by tool_use id.
----@field tasks table<string, ClaudeCodeAgentsShell> Background tasks this transcript started — shells and monitors — by task id.
+---@field task_calls table<string, { tool: string, description: string|nil, command: string|nil, ts: number }> Shell, monitor and workflow calls with no result yet, by tool_use id.
+---@field tasks table<string, ClaudeCodeAgentsShell> Background tasks this transcript started — shells, monitors, workflow runs — by task id.
 ---@field task_stops table<string, number> Tasks a `TaskStop` call stopped: task id -> epoch seconds.
 ---@field task_events table<string, { count: integer, last_ts: number, expired_ts: number|nil }> Monitor events, by task id.
 ---@field interrupted_ts number|nil Set when the CLI recorded a user interrupt; see INTERRUPT_MARKER.
@@ -171,7 +179,7 @@ local config = nil
 ---@field exit_code integer|nil A shell's exit code, from the notification's summary.
 ---@field ts number Epoch seconds the parent recorded it.
 
----@class ClaudeCodeAgentsShell A background task: a shell command or a monitor.
+---@class ClaudeCodeAgentsShell A background task: a shell command, a monitor, or a workflow run.
 ---@field task_id string The CLI's id for it (`b4mk05121`), which its notification and output file are named by.
 ---@field tool_id string|nil The `toolu_…` call that started it.
 ---@field tool string `Bash` or `PowerShell`.
@@ -181,9 +189,12 @@ local config = nil
 ---@field started_ts number Epoch seconds it went to the background (the result's timestamp).
 ---@field output_path string|nil The file its output streams into, as the CLI stated it.
 ---@field by_user boolean|nil Sent to the background with Ctrl+B rather than asked for.
----@field task_type "shell"|"monitor"
+---@field task_type "shell"|"monitor"|"workflow"
 ---@field timeout_ms integer|nil Monitors: when it expires.
 ---@field persistent boolean|nil Monitors: never expires.
+---@field run_id string|nil Workflows: the run (`wf_…`), which names its record and agent directory.
+---@field name string|nil Workflows: the script's `meta.name`.
+---@field transcript_dir string|nil Workflows: where its agents' transcripts and journal live.
 
 --------------------------------------------------------------------------------
 -- I/O seam
@@ -703,7 +714,7 @@ local function fold_tool_use(sum, entry, want_events)
     if
       type(block) == "table"
       and block.type == "tool_use"
-      and (SHELL_TOOLS[block.name] or block.name == MONITOR_TOOL)
+      and (SHELL_TOOLS[block.name] or block.name == MONITOR_TOOL or block.name == WORKFLOW_TOOL)
       and type(block.id) == "string"
     then
       local input = type(block.input) == "table" and block.input or {}
@@ -814,6 +825,11 @@ end
 ---A **monitor** is always in the background; its result is `{taskId, timeoutMs,
 ---persistent}` and, unlike a shell's, does not say where its output goes (the
 ---same `tasks/` directory — `subagents.tasks_dir` finds it).
+---
+---A **workflow** launch answers `{status = "async_launched", taskId, taskType =
+---"local_workflow", workflowName, runId, summary, transcriptDir, scriptPath}`
+---(CLI 2.1.272). That line is small and decoded; a remote launch
+---(`remote_launched`) has no local run to show and is left out.
 ---@param sum ClaudeCodeAgentsSummary
 ---@param line string
 local function settle_shell(sum, line)
@@ -823,6 +839,30 @@ local function settle_shell(sum, line)
     return
   end
   sum.task_calls[id] = nil
+  if call.tool == WORKFLOW_TOOL then
+    if #line > WORKFLOW_RESULT_LIMIT or not line:find('"taskType":"local_workflow"', 1, true) then
+      return
+    end
+    local ok, entry = pcall(vim.json.decode, line)
+    local result = ok and type(entry) == "table" and entry.toolUseResult or nil
+    if type(result) ~= "table" or type(result.taskId) ~= "string" or result.status ~= "async_launched" then
+      return
+    end
+    local started = M._iso_to_epoch(entry.timestamp)
+    sum.tasks[result.taskId] = {
+      task_id = result.taskId,
+      task_type = "workflow",
+      tool_id = id,
+      tool = call.tool,
+      description = type(result.summary) == "string" and result.summary or nil,
+      name = type(result.workflowName) == "string" and result.workflowName or nil,
+      run_id = type(result.runId) == "string" and result.runId or nil,
+      transcript_dir = type(result.transcriptDir) == "string" and result.transcriptDir or nil,
+      ts = call.ts,
+      started_ts = started > 0 and started or call.ts,
+    }
+    return
+  end
   local monitor = call.tool == MONITOR_TOOL
   local task_id = monitor and line:match('"taskId":"([^"]+)"') or line:match('"backgroundTaskId":"([^"]+)"')
   if not task_id then
@@ -1220,6 +1260,7 @@ function M._fold_line(sum, line)
       or line:find('"name":"Bash"', 1, true)
       or line:find('"name":"PowerShell"', 1, true)
       or line:find('"name":"Monitor"', 1, true)
+      or line:find('"name":"Workflow"', 1, true)
     then
       local ok, entry = pcall(vim.json.decode, line)
       if ok and type(entry) == "table" then
