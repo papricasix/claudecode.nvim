@@ -65,7 +65,18 @@ describe("ClaudeCodeAdd command", function()
     vim.notify = spy.new(function() end)
 
     _G.require = function(mod)
-      if mod == "claudecode.logger" then
+      if mod == "claudecode.utils" then
+        -- Tilde-only expansion, which is what a plain path now goes through. The
+        -- point of the real one is that it leaves a literal `$` alone.
+        return {
+          expand_tilde = function(path)
+            if path == "~/test.lua" then
+              return "/home/user/test.lua"
+            end
+            return path
+          end,
+        }
+      elseif mod == "claudecode.logger" then
         return mock_logger
       elseif mod == "claudecode.config" then
         return {
@@ -193,15 +204,48 @@ describe("ClaudeCodeAdd command", function()
       it("should expand tilde paths", function()
         command_handler({ args = "~/test.lua" })
 
-        assert.spy(vim.fn.expand).was_called_with("~/test.lua")
-        assert.spy(mock_server.broadcast).was_called()
+        assert.spy(mock_server.broadcast).was_called_with("at_mentioned", {
+          filePath = "/home/user/test.lua",
+          lineStart = nil,
+          lineEnd = nil,
+        })
       end)
 
-      it("should expand relative paths", function()
-        command_handler({ args = "./relative.lua" })
+      it("should keep a literal $ in the path (TanStack $param files)", function()
+        -- vim.fn.expand read `$post` as an undefined environment variable and
+        -- dropped it, so the file was reported missing.
+        vim.fn.filereadable = spy.new(function(path)
+          return path == "/current/dir/src/routes/$post.tsx" and 1 or 0
+        end)
 
-        assert.spy(vim.fn.expand).was_called_with("./relative.lua")
+        command_handler({ args = "/current/dir/src/routes/$post.tsx" })
+
+        assert.spy(mock_server.broadcast).was_called_with("at_mentioned", {
+          filePath = "src/routes/$post.tsx",
+          lineStart = nil,
+          lineEnd = nil,
+        })
+        assert.spy(mock_logger.error).was_not_called()
+      end)
+
+      it("should still expand the current-buffer token %", function()
+        -- `:ClaudeCodeAdd %` is the documented "add this buffer" keymap, so the
+        -- token forms keep going through vim.fn.expand.
+        vim.fn.expand = spy.new(function(path)
+          if path == "%" then
+            return "/current/dir/buffer.lua"
+          end
+          return path
+        end)
+        vim.fn.filereadable = spy.new(function(path)
+          return path == "/current/dir/buffer.lua" and 1 or 0
+        end)
+
+        command_handler({ args = "%" })
+
+        assert.spy(vim.fn.expand).was_called_with("%")
         assert.spy(mock_server.broadcast).was_called()
+        assert.spy(mock_logger.error).was_not_called()
       end)
 
       it("should handle absolute paths", function()
@@ -414,7 +458,6 @@ describe("ClaudeCodeAdd command", function()
         it("should expand tilde paths with line numbers", function()
           command_handler({ args = "~/test.lua 10 20" })
 
-          assert.spy(vim.fn.expand).was_called_with("~/test.lua")
           assert.spy(mock_server.broadcast).was_called_with("at_mentioned", {
             filePath = "/home/user/test.lua",
             lineStart = 9,
@@ -422,12 +465,15 @@ describe("ClaudeCodeAdd command", function()
           })
         end)
 
-        it("should expand relative paths with line numbers", function()
-          command_handler({ args = "./relative.lua 5" })
+        it("should keep a $ path with line numbers", function()
+          vim.fn.filereadable = spy.new(function(path)
+            return path == "/current/dir/src/routes/$post.tsx" and 1 or 0
+          end)
 
-          assert.spy(vim.fn.expand).was_called_with("./relative.lua")
+          command_handler({ args = "/current/dir/src/routes/$post.tsx 5" })
+
           assert.spy(mock_server.broadcast).was_called_with("at_mentioned", {
-            filePath = "relative.lua",
+            filePath = "src/routes/$post.tsx",
             lineStart = 4,
             lineEnd = nil,
           })

@@ -1162,17 +1162,19 @@ function M._create_commands()
   end
 
   local function handle_send_normal(opts)
+    -- A file explorer is recognised by its filetype alone. Matching the buffer
+    -- name -- an absolute path -- called an ordinary file a tree whenever its
+    -- path merely contained "neo-tree" or "NvimTree" (upstream issue #289), and
+    -- the extractors below (integrations.get_selected_files_from_tree,
+    -- visual_commands.get_tree_state) are filetype-keyed anyway, so a name-only
+    -- match could never have extracted anything.
     local current_ft = (vim.bo and vim.bo.filetype) or ""
-    local current_bufname = (vim.api and vim.api.nvim_buf_get_name and vim.api.nvim_buf_get_name(0)) or ""
 
     local is_tree_buffer = current_ft == "NvimTree"
       or current_ft == "neo-tree"
       or current_ft == "oil"
       or current_ft == "minifiles"
       or current_ft == "netrw"
-      or string.match(current_bufname, "neo%-tree")
-      or string.match(current_bufname, "NvimTree")
-      or string.match(current_bufname, "minifiles://")
 
     if is_tree_buffer then
       local integrations = require("claudecode.integrations")
@@ -1214,24 +1216,21 @@ function M._create_commands()
   end
 
   local function handle_send_visual(visual_data, opts)
+    -- Filetype only, for the reason given in handle_send_normal.
     local current_ft = (vim.bo and vim.bo.filetype) or ""
-    local current_bufname = (vim.api and vim.api.nvim_buf_get_name and vim.api.nvim_buf_get_name(0)) or ""
 
     local is_tree_buffer = current_ft == "NvimTree"
       or current_ft == "neo-tree"
       or current_ft == "oil"
       or current_ft == "minifiles"
       or current_ft == "netrw"
-      or string.match(current_bufname, "neo%-tree")
-      or string.match(current_bufname, "NvimTree")
-      or string.match(current_bufname, "minifiles://")
 
     if is_tree_buffer then
       local integrations = require("claudecode.integrations")
       local visual_cmd_module = require("claudecode.visual_commands")
       local files, error
 
-      if current_ft == "minifiles" or string.match(current_bufname, "minifiles://") then
+      if current_ft == "minifiles" then
         local start_line = vim.fn.line("'<")
         local end_line = vim.fn.line("'>")
 
@@ -1456,7 +1455,18 @@ function M._create_commands()
       return
     end
 
-    file_path = vim.fn.expand(file_path)
+    -- Vim's current/alternate-file tokens (`%`, `%:p`, `#`, `<cfile>`) still have
+    -- to be expanded -- `:ClaudeCodeAdd %` is the documented "add this buffer"
+    -- keymap. A plain filesystem path must not be, because `vim.fn.expand` reads
+    -- `$name` as an environment variable and drops undefined ones, mangling a
+    -- literal `$` in a path (TanStack Router's `src/routes/$post.tsx` and the
+    -- like) so the existence check below fails. So expand only the token forms,
+    -- and otherwise just the leading `~`.
+    if file_path:match("^[%%#<]") then
+      file_path = vim.fn.expand(file_path)
+    else
+      file_path = require("claudecode.utils").expand_tilde(file_path)
+    end
     if vim.fn.filereadable(file_path) == 0 and vim.fn.isdirectory(file_path) == 0 then
       logger.error("command", "ClaudeCodeAdd: File or directory does not exist: " .. file_path)
       return
