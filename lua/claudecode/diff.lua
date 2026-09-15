@@ -175,6 +175,13 @@ local function find_main_editor_window(windows)
       end
     end
 
+    -- Skip a window that is already part of a diff -- a vimdiff, diffview.nvim or
+    -- fugitive pane, or one of our own. Opening a file into it clears that window's
+    -- 'diff' and destroys the layout the user is reading (upstream issue #277).
+    if is_suitable and vim.api.nvim_win_get_option(win, "diff") then
+      is_suitable = false
+    end
+
     if
       is_suitable
       and (
@@ -656,6 +663,23 @@ local function get_default_terminal_options()
   }
 end
 
+---Mark the buffer `:tabnew` just created as ephemeral, so it wipes itself once
+---hidden instead of being left behind when the diff replaces or closes the tab.
+---Only an untouched buffer qualifies: unnamed, unmodified, at most one line.
+local function mark_tabnew_buffer_ephemeral()
+  local buf = vim.api.nvim_get_current_buf()
+  local ok_name, name = pcall(vim.api.nvim_buf_get_name, buf)
+  local ok_mod, modified = pcall(vim.api.nvim_buf_get_option, buf, "modified")
+  local ok_lc, linecount = pcall(function()
+    return vim.api.nvim_buf_line_count(buf)
+  end)
+  if ok_name and ok_mod and ok_lc then
+    if (name == nil or name == "") and modified == false and linecount <= 1 then
+      pcall(vim.api.nvim_buf_set_option, buf, "bufhidden", "wipe")
+    end
+  end
+end
+
 ---Display existing Claude Code terminal in new tab
 ---@return number original_tab The original tab number
 ---@return number? terminal_win Terminal window in new tab
@@ -668,6 +692,7 @@ local function display_terminal_in_new_tab()
   local terminal_ok, terminal_module = pcall(require, "claudecode.terminal")
   if not terminal_ok then
     vim.cmd("tabnew")
+    mark_tabnew_buffer_ephemeral()
     local new_tab = vim.api.nvim_get_current_tabpage()
     return original_tab, nil, false, new_tab
   end
@@ -675,6 +700,7 @@ local function display_terminal_in_new_tab()
   local terminal_bufnr = terminal_module.get_active_terminal_bufnr()
   if not terminal_bufnr or not vim.api.nvim_buf_is_valid(terminal_bufnr) then
     vim.cmd("tabnew")
+    mark_tabnew_buffer_ephemeral()
     local new_tab = vim.api.nvim_get_current_tabpage()
     return original_tab, nil, false, new_tab
   end
@@ -689,21 +715,8 @@ local function display_terminal_in_new_tab()
   end
 
   vim.cmd("tabnew")
+  mark_tabnew_buffer_ephemeral()
   local new_tab = vim.api.nvim_get_current_tabpage()
-
-  -- Mark the initial, unnamed buffer in the new tab as ephemeral to avoid leaks
-  -- When this buffer gets hidden (replaced or tab closed), wipe it automatically.
-  local initial_buf = vim.api.nvim_get_current_buf()
-  local name_ok, initial_name = pcall(vim.api.nvim_buf_get_name, initial_buf)
-  local mod_ok, initial_modified = pcall(vim.api.nvim_buf_get_option, initial_buf, "modified")
-  local linecount_ok, initial_linecount = pcall(function()
-    return vim.api.nvim_buf_line_count(initial_buf)
-  end)
-  if name_ok and mod_ok and linecount_ok then
-    if (initial_name == nil or initial_name == "") and initial_modified == false and initial_linecount <= 1 then
-      pcall(vim.api.nvim_buf_set_option, initial_buf, "bufhidden", "wipe")
-    end
-  end
 
   local terminal_config = config.terminal or {}
   local split_side = terminal_config.split_side or "right"
@@ -1391,8 +1404,38 @@ local function register_diff_autocmds(tab_name, new_buffer)
     buffer = new_buffer,
     callback = function()
       M._resolve_diff_as_saved(tab_name, new_buffer)
+      -- Leave diff mode before Neovim's post-write redraw. With render-markdown.nvim
+      -- installed, that redraw runs the renderer over a buffer still in diff mode and
+      -- segfaults Neovim (exit 139) on a new-file diff -- upstream issue #218.
+      pcall(vim.cmd, "diffoff")
       -- Prevent actual file write since we're handling it through MCP
       return true
+    end,
+  })
+
+  -- WinClosed: the proposed buffer is scratch with bufhidden="hide", so closing its
+  -- window (`:q`, `:close`, `<C-w>c`, `:tabclose`) only hides a still-loaded buffer
+  -- and none of the Buf* events below fire -- the diff would never resolve and the
+  -- CLI would wait forever (upstream issue #238).
+  --
+  -- The buffer can be shown in several windows (`<C-w>v`), so rejecting because the
+  -- tracked window closed would reject while the user still reads a clone. Reject
+  -- only once it is displayed nowhere. WinClosed fires before the window leaves the
+  -- layout, hence the exclusion of args.match. _resolve_diff_as_rejected no-ops once
+  -- the diff is no longer pending, so this is harmless after an accept.
+  autocmd_ids[#autocmd_ids + 1] = vim.api.nvim_create_autocmd("WinClosed", {
+    group = get_autocmd_group(),
+    callback = function(args)
+      if not vim.api.nvim_buf_is_valid(new_buffer) then
+        return
+      end
+      local closing_win = tonumber(args.match)
+      for _, win in ipairs(vim.fn.win_findbuf(new_buffer)) do
+        if win ~= closing_win then
+          return
+        end
+      end
+      M._resolve_diff_as_rejected(tab_name)
     end,
   })
 
@@ -1430,6 +1473,9 @@ local function register_diff_autocmds(tab_name, new_buffer)
 
   return autocmd_ids
 end
+
+-- Exposed for testing the reject-on-window-close (WinClosed) behaviour.
+M._register_diff_autocmds = register_diff_autocmds
 
 ---Create diff view from a specific window
 ---@param target_window NvimWin|nil The window to use as base for the diff
@@ -2082,6 +2128,11 @@ function M._setup_blocking_diff(params, resolution_callback)
   -- (the state-based cleanup is gated on a registered diff). Issue #231.
   local fallback_window = nil
   local new_buffer = nil
+  -- Same reasoning for the open_in_new_tab path: display_terminal_in_new_tab() runs `:tabnew`
+  -- early, so a failure before registration would strand that tab. Hoist its handle, and the tab
+  -- we came from, so the error handler can close the one and return to the other. Issue #262.
+  local new_tab_handle = nil
+  local original_tab_handle = nil
 
   -- Wrap the setup in error handling to ensure cleanup on failure
   local setup_success, setup_error = pcall(function()
@@ -2104,11 +2155,14 @@ function M._setup_blocking_diff(params, resolution_callback)
     local terminal_win_in_new_tab = nil
     local existing_buffer = nil
     local target_window = nil
-    -- Track new tab handle and original terminal visibility for robust cleanup
-    local new_tab_handle = nil
+    -- new_tab_handle is hoisted above the pcall (issue #262) so the error handler can reach it;
+    -- only the original-terminal visibility flag is local here.
     local had_terminal_in_original = false
 
     if config and config.diff_opts and config.diff_opts.open_in_new_tab then
+      -- Captured before display_terminal_in_new_tab() runs `:tabnew`, so the error handler can
+      -- still return to it if that helper throws partway (Lua then never assigns new_tab_handle).
+      original_tab_handle = vim.api.nvim_get_current_tabpage()
       original_tab_number, terminal_win_in_new_tab, had_terminal_in_original, new_tab_handle =
         display_terminal_in_new_tab()
       created_new_tab = true
@@ -2360,6 +2414,28 @@ function M._setup_blocking_diff(params, resolution_callback)
       end
       if new_buffer and vim.api.nvim_buf_is_valid(new_buffer) then
         pcall(vim.api.nvim_buf_delete, new_buffer, { force = true })
+      end
+      -- Close the tab display_terminal_in_new_tab() opened before registration (issue #262).
+      -- That helper runs `:tabnew` -- switching to the new tab -- and the tab holds nothing of
+      -- the user's. Prefer the returned handle; if the helper itself threw after `:tabnew`, Lua
+      -- never assigned it, so fall back to the current tab when we can tell it from the original.
+      local stranded_tab = new_tab_handle
+      if not (stranded_tab and vim.api.nvim_tabpage_is_valid(stranded_tab)) then
+        local current_tab = vim.api.nvim_get_current_tabpage()
+        if
+          original_tab_handle
+          and vim.api.nvim_tabpage_is_valid(original_tab_handle)
+          and current_tab ~= original_tab_handle
+        then
+          stranded_tab = current_tab
+        end
+      end
+      if stranded_tab and vim.api.nvim_tabpage_is_valid(stranded_tab) and stranded_tab ~= original_tab_handle then
+        pcall(vim.api.nvim_set_current_tabpage, stranded_tab)
+        pcall(vim.cmd, "tabclose")
+        if original_tab_handle and vim.api.nvim_tabpage_is_valid(original_tab_handle) then
+          pcall(vim.api.nvim_set_current_tabpage, original_tab_handle)
+        end
       end
     end
 

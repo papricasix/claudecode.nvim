@@ -456,6 +456,25 @@ local vim = {
       return vim._windows[winid] ~= nil
     end,
 
+    nvim_win_get_option = function(winid, name)
+      -- Window-local options ('diff' and friends). Defaults to false, so a window
+      -- counts as a diff window only where a test says so.
+      if vim._windows[winid] and vim._windows[winid].options then
+        local value = vim._windows[winid].options[name]
+        if value ~= nil then
+          return value
+        end
+      end
+      return false
+    end,
+
+    nvim_win_set_option = function(winid, name, value)
+      if vim._windows[winid] then
+        vim._windows[winid].options = vim._windows[winid].options or {}
+        vim._windows[winid].options[name] = value
+      end
+    end,
+
     nvim_win_close = function(winid, force)
       local existed = vim._windows[winid] ~= nil
       local old_buf = vim._windows[winid] and vim._windows[winid].buf

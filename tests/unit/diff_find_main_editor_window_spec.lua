@@ -14,7 +14,7 @@ describe("diff.find_main_editor_window sidebar exclusion", function()
   -- Build a fake window layout and stub the four vim.api calls the function uses.
   -- `wins` is an ordered list of { ft=, bt=, floating= } describing each window.
   local function with_layout(wins)
-    local win_ids, buf_of, opt_of, cfg_of, w_of = {}, {}, {}, {}, {}
+    local win_ids, buf_of, opt_of, cfg_of, w_of, win_opt_of = {}, {}, {}, {}, {}, {}
     for i, w in ipairs(wins) do
       local win_id = 1000 + i
       local buf_id = 2000 + i
@@ -23,6 +23,11 @@ describe("diff.find_main_editor_window sidebar exclusion", function()
       opt_of[buf_id] = { buftype = w.bt or "", filetype = w.ft or "" }
       cfg_of[win_id] = { relative = w.floating and "editor" or "" }
       w_of[win_id] = { claudecode_live_preview = w.preview or nil }
+      win_opt_of[win_id] = { diff = w.diff or false }
+    end
+
+    _G.vim.api.nvim_win_get_option = function(win, name)
+      return (win_opt_of[win] or {})[name]
     end
 
     _G.vim.w = w_of
@@ -55,6 +60,7 @@ describe("diff.find_main_editor_window sidebar exclusion", function()
 
   before_each(function()
     saved = {
+      nvim_win_get_option = _G.vim.api.nvim_win_get_option,
       nvim_list_wins = _G.vim.api.nvim_list_wins,
       nvim_win_get_buf = _G.vim.api.nvim_win_get_buf,
       nvim_buf_get_option = _G.vim.api.nvim_buf_get_option,
@@ -126,10 +132,23 @@ describe("diff.find_main_editor_window sidebar exclusion", function()
     expect(diff._find_main_editor_window()).to_be(wins[2])
   end)
 
+  it("skips windows belonging to a diff", function()
+    -- A vimdiff/diffview/fugitive pane looks like an ordinary editor window;
+    -- opening a file into it clears its 'diff' and destroys the layout.
+    local wins = with_layout({
+      { ft = "lua", bt = "", diff = true },
+      { ft = "lua", bt = "", diff = true },
+      { ft = "lua", bt = "" }, -- the actual editor
+    })
+
+    expect(diff._find_main_editor_window()).to_be(wins[3])
+  end)
+
   it("returns nil when only excluded windows exist", function()
     with_layout({
       { ft = "snacks_layout_box", bt = "nofile" },
       { ft = "", bt = "terminal" },
+      { ft = "lua", bt = "", diff = true },
     })
 
     expect(diff._find_main_editor_window()).to_be(nil)
