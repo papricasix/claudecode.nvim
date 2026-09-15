@@ -172,7 +172,8 @@ function M.status_text(row)
   elseif row.exit_code then
     word = "exit " .. row.exit_code
   elseif row.state == "stopped" then
-    word = row.how == "expired" and "expired" or "stopped"
+    word = row.how == "expired" and "expired"
+      or (row.how == "orphaned" and "stopped when its session ended" or "stopped")
   else
     word = row.state
   end

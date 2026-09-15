@@ -196,7 +196,7 @@ local ENDED = { completed = "done", killed = "stopped", stopped = "stopped", can
 ---@field by_user boolean|nil Shells: sent to the background with Ctrl+B.
 ---@field ended boolean|nil Shells: the CLI recorded how it ended.
 ---@field task_type "shell"|"monitor"|nil Shells: which kind of background command.
----@field how "expired"|"killed"|nil Shells: why a stopped one stopped.
+---@field how "expired"|"killed"|"orphaned"|nil Shells: why a stopped one stopped.
 ---@field events integer|nil Monitors: how many events it has delivered.
 
 ---Where one run stands, from everything that could have recorded its end.
@@ -288,7 +288,7 @@ end
 ---@field runtime_s number|nil
 ---@field exit_code integer|nil
 ---@field ended boolean The CLI recorded the end (rather than it being inferred).
----@field how "expired"|"killed"|nil Why a stopped task stopped, when known.
+---@field how "expired"|"killed"|"orphaned"|nil Why a stopped task stopped, when known (`orphaned`: its CLI exited first).
 
 ---Where one background shell or monitor stands.
 ---
@@ -310,6 +310,13 @@ function M.shell_state(shell, facts, opts)
     return math.max(0, (ts or started) - started)
   end
   local note = facts.note
+  -- A resumed CLI's `stopped` for a task it found no end for is its weakest claim:
+  -- anything that did record the end (a stop, an expiry, the output's closing
+  -- line) says more, so it is only used when nothing else does.
+  local orphaned = note and note.orphaned and note or nil
+  if orphaned then
+    note = nil
+  end
   if note and note.status then
     local state = SHELL_ENDED[note.status] or "failed"
     local code = note.exit_code
@@ -350,7 +357,7 @@ function M.shell_state(shell, facts, opts)
   if path and fs and fs.stat then
     local st = fs.stat(path)
     if not st then
-      return { state = "stopped", ended = false }
+      return { state = "stopped", ended = orphaned ~= nil, how = orphaned and "orphaned" or nil }
     end
     written = st.mtime or 0
     local footer = M.output_footer(path, st)
@@ -364,6 +371,15 @@ function M.shell_state(shell, facts, opts)
         how = footer.killed and (shell.task_type == "monitor" and "expired" or "killed") or nil,
       }
     end
+  end
+  if orphaned then
+    -- Its time is the resume, not the end; the file's last write is closer.
+    return {
+      state = "stopped",
+      runtime_s = since(math.max(written or 0, started)),
+      ended = true,
+      how = "orphaned",
+    }
   end
   if opts.live or (written and (opts.now - written) < M.STALE_S) then
     return { state = "running", runtime_s = since(opts.now), ended = false }

@@ -535,6 +535,42 @@ describe("agents.subagents", function()
         expect(by_id.bfail.exit_code).to_be(2)
       end)
 
+      it("keeps a recorded end over the stopped a resumed CLI writes for it", function()
+        local resumed = function(task_id, tool_id, ts)
+          return shell_note(
+            task_id,
+            tool_id,
+            ts,
+            "stopped",
+            "Background shell command didn't finish before the previous session ended"
+          )
+        end
+        put(SESSION, {
+          monitor_call("toolu_e", NOW - 100, { command = "sleep 100", description = "e" }),
+          monitor_result("toolu_e", NOW - 100, "bexp"),
+          event(
+            "bexp",
+            NOW - 95,
+            "[Monitor expired after 5s with 1 event delivered. Re-arm it if you still need the watch.]"
+          ),
+          resumed("bexp", "toolu_e", NOW - 10),
+          shell_call("toolu_q", NOW - 100, { command = "watch", run_in_background = true }),
+          shell_result("toolu_q", NOW - 100, "bquiet"),
+          resumed("bquiet", "toolu_q", NOW - 10),
+        })
+        fs[TASKS .. "/bquiet.output"] = { data = "x\n", mtime = NOW - 70, ino = 12 }
+        local by_id = {}
+        for _, row in ipairs(rows({ live = true })) do
+          by_id[row.id] = row
+        end
+        expect(by_id.bexp.how).to_be("expired")
+        expect(by_id.bexp.runtime_s).to_be(5)
+        -- Nothing else recorded its end: the resume's word stands, dated by the file.
+        expect(by_id.bquiet.state).to_be("stopped")
+        expect(by_id.bquiet.how).to_be("orphaned")
+        expect(by_id.bquiet.runtime_s).to_be(30)
+      end)
+
       it("names a WebSocket monitor by its URL", function()
         put(SESSION, {
           monitor_call("toolu_w", NOW - 10, { ws = { url = "wss://events.example/stream" }, description = "deploys" }),
