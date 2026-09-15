@@ -109,7 +109,6 @@ describe("Tool: open_file", function()
     expect(err.code).to_be(-32000) -- File operation error
     assert_contains(err.message, "File operation error")
     assert_contains(err.data, "File not found: non_readable_file.txt")
-    assert.spy(_G.vim.fn.expand).was_called_with("non_readable_file.txt")
     assert.spy(_G.vim.fn.filereadable).was_called_with("non_readable_file.txt")
   end)
 
@@ -124,7 +123,6 @@ describe("Tool: open_file", function()
     expect(result.content[1].type).to_be("text")
     expect(result.content[1].text).to_be("Opened file: readable_file.txt")
 
-    assert.spy(_G.vim.fn.expand).was_called_with("readable_file.txt")
     assert.spy(_G.vim.fn.filereadable).was_called_with("readable_file.txt")
     assert.spy(_G.vim.fn.fnameescape).was_called_with("readable_file.txt")
 
@@ -132,13 +130,8 @@ describe("Tool: open_file", function()
     expect(_G.vim.cmd_history[1]).to_be("edit readable_file.txt")
   end)
 
-  it("should handle filePath needing expansion", function()
-    _G.vim.fn.expand = spy.new(function(path)
-      if path == "~/.config/nvim/init.lua" then
-        return "/Users/testuser/.config/nvim/init.lua"
-      end
-      return path
-    end)
+  it("should expand a leading tilde to $HOME", function()
+    local expanded = os.getenv("HOME") .. "/.config/nvim/init.lua"
     local params = { filePath = "~/.config/nvim/init.lua" }
     local success, result = pcall(open_file_handler, params)
 
@@ -146,11 +139,22 @@ describe("Tool: open_file", function()
     expect(result.content).to_be_table()
     expect(result.content[1]).to_be_table()
     expect(result.content[1].type).to_be("text")
-    expect(result.content[1].text).to_be("Opened file: /Users/testuser/.config/nvim/init.lua")
-    assert.spy(_G.vim.fn.expand).was_called_with("~/.config/nvim/init.lua")
-    assert.spy(_G.vim.fn.filereadable).was_called_with("/Users/testuser/.config/nvim/init.lua")
-    assert.spy(_G.vim.fn.fnameescape).was_called_with("/Users/testuser/.config/nvim/init.lua")
-    expect(_G.vim.cmd_history[1]).to_be("edit /Users/testuser/.config/nvim/init.lua")
+    expect(result.content[1].text).to_be("Opened file: " .. expanded)
+    assert.spy(_G.vim.fn.filereadable).was_called_with(expanded)
+    assert.spy(_G.vim.fn.fnameescape).was_called_with(expanded)
+    expect(_G.vim.cmd_history[1]).to_be("edit " .. expanded)
+  end)
+
+  it("should keep a literal $ in the path (TanStack $param files)", function()
+    -- vim.fn.expand read `$post` as an undefined environment variable and dropped
+    -- it; expand_tilde leaves it alone, so the file is found.
+    local params = { filePath = "src/routes/$post.tsx" }
+    local success, result = pcall(open_file_handler, params)
+
+    expect(success).to_be_true()
+    expect(result.content[1].text).to_be("Opened file: src/routes/$post.tsx")
+    assert.spy(_G.vim.fn.filereadable).was_called_with("src/routes/$post.tsx")
+    expect(_G.vim.cmd_history[1]).to_be("edit src/routes/$post.tsx")
   end)
 
   it("should handle makeFrontmost=false to return detailed JSON", function()
