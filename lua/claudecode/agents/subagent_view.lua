@@ -17,8 +17,8 @@
 --- one in the same float, so a tree of runs is read by walking it.
 ---
 --- While the float is on screen its transcript is followed: appended bytes are
---- folded and only the lines that changed are rewritten, so the reasoning folds a
---- reader opened stay open and a cursor parked at the end follows the run.
+--- folded and only the lines that changed are rewritten; the reasoning folds a
+--- reader opened stay open, and a cursor parked at the end follows the run.
 ---@brief ]]
 ---@module 'claudecode.agents.subagent_view'
 
@@ -593,8 +593,32 @@ local function context(session_path, agent_id, row_for, history)
   }
 end
 
----Rewrite only what changed, so folds above the change survive and a reader's
----place is kept.
+---Put a window's reasoning folds back after a rewrite, each open or closed as the
+---reader left it.
+---
+---All of them, every time: a live run's headline (its runtime) changes on every
+---tick, so a rewrite nearly always starts at line 2. And never on top of the old
+---ones — `:fold` over a range that already holds a fold nests a new closed one
+---inside it, so each tick added a level `<Tab>` had to open again (and the fold
+---text grew a dash per level).
+---@param win integer
+---@param folds { [1]: integer, [2]: integer }[]
+---@param open table<integer, boolean> Fold ordinal -> open before the rewrite.
+local function restore_folds(win, folds, open)
+  utils.set_win_option(win, "foldmethod", "manual")
+  utils.set_win_option(win, "foldenable", true)
+  pcall(vim.api.nvim_win_call, win, function()
+    pcall(vim.cmd, "silent! normal! zE")
+    for index, range in ipairs(folds) do
+      pcall(vim.cmd, ("silent! %d,%dfold"):format(range[1], range[2]))
+      if open[index] then
+        pcall(vim.cmd, ("silent! %dfoldopen"):format(range[1]))
+      end
+    end
+  end)
+end
+
+---Rewrite only what changed, keeping the reader's folds and place.
 ---@param buf integer
 ---@param view table
 local function paint(buf, view)
@@ -619,6 +643,18 @@ local function paint(buf, view)
   end
 
   if changed then
+    -- Read before the rewrite moves anything. Blocks are keyed by their order:
+    -- the transcript only grows, so the nth thinking block stays the nth.
+    local open = {}
+    for _, win in ipairs(wins) do
+      open[win] = {}
+      pcall(vim.api.nvim_win_call, win, function()
+        for index, range in ipairs(view.folds or {}) do
+          open[win][index] = vim.fn.foldclosed(range[1]) == -1
+        end
+      end)
+    end
+
     pcall(vim.api.nvim_set_option_value, "modifiable", true, { buf = buf })
     local tail = {}
     for index = first, #lines do
@@ -635,19 +671,10 @@ local function paint(buf, view)
       end
     end
     view.lines = lines
+    view.folds = folds
 
     for _, win in ipairs(wins) do
-      utils.set_win_option(win, "foldmethod", "manual")
-      utils.set_win_option(win, "foldenable", true)
-      pcall(vim.api.nvim_win_call, win, function()
-        for _, range in ipairs(folds) do
-          -- Only folds the rewrite reached; the ones above it are still there,
-          -- open or closed as the reader left them.
-          if range[2] >= first then
-            pcall(vim.cmd, ("silent! %d,%dfold"):format(range[1], range[2]))
-          end
-        end
-      end)
+      restore_folds(win, folds, open[win])
       if follow[win] then
         pcall(vim.api.nvim_win_set_cursor, win, { #lines, 0 })
       end
