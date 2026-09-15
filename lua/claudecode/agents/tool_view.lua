@@ -103,6 +103,99 @@ local function show(session_id, body, title, name, reuse)
   return win
 end
 
+--- How often a "still running" float looks again for the command's output file,
+--- and for how long.
+M.RETRY_MS = 500
+M.RETRY_FOR_S = 30 * 60
+
+--- Injectable: specs drive the retry by hand.
+M._new_timer = function()
+  return vim.loop and vim.loop.new_timer and vim.loop.new_timer() or nil
+end
+
+---Follow a shell command still running in the foreground, when its output file can
+---be told apart from the others (`subagents.foreground_output`): its output is
+---streaming there, under an id the transcript does not name until it returns.
+---@param opts table `M.open`'s options.
+---@param call ClaudeCodeAgentsToolCall
+---@param tool string
+---@param reuse integer|nil
+---@param done fun(win: integer|nil)|nil
+---@return boolean followed
+local function follow_foreground(opts, call, tool, reuse, done)
+  local shell_view = require("claudecode.agents.shell_view")
+  local session_path = shell_view.session_path(opts.transcript)
+  local output_path =
+    require("claudecode.agents.subagents").foreground_output(session_path, opts.tool_id, call.at or call.ts)
+  if not output_path then
+    return false
+  end
+  local input = type(call.input) == "table" and call.input or {}
+  shell_view.open({
+    session_id = opts.session_id,
+    transcript = opts.transcript,
+    tool_id = opts.tool_id,
+    command = type(input.command) == "string" and input.command or nil,
+    reuse = reuse,
+    row_for = opts.row_for,
+    on_handoff = opts.on_handoff,
+    foreground = {
+      output_path = output_path,
+      started = call.ts,
+      tool = tool,
+      description = type(input.description) == "string" and input.description or nil,
+    },
+  }, done)
+  return true
+end
+
+---Keep a "still running" float looking for its command's output.
+---
+---The call is written about a second before the command is spawned and its file
+---created, so a float opened in between finds nothing. It looks again until the
+---file turns up (and becomes the live view, in the same window), the result lands
+---(and the float shows it), or nothing shows the float any more.
+---@param opts table `M.open`'s options.
+---@param call ClaudeCodeAgentsToolCall
+---@param tool string
+---@param win integer
+local function wait_for_output(opts, call, tool, win)
+  local timer = M._new_timer()
+  if not timer then
+    return
+  end
+  local buf = vim.api.nvim_win_get_buf(win)
+  local deadline = os.time() + M.RETRY_FOR_S
+  local function stop()
+    pcall(function()
+      timer:stop()
+      timer:close()
+    end)
+  end
+  local subagents = require("claudecode.agents.subagents")
+  local session_path = require("claudecode.agents.shell_view").session_path(opts.transcript)
+  timer:start(
+    M.RETRY_MS,
+    M.RETRY_MS,
+    vim.schedule_wrap(function()
+      local shown = vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == buf
+      if not shown or os.time() > deadline then
+        return stop()
+      end
+      subagents.refresh(session_path)
+      local sum = transcript.get(opts.transcript)
+      if sum and sum.task_calls and sum.task_calls[opts.tool_id] == nil then
+        -- Returned while waiting: show the finished call in place.
+        stop()
+        return M.open(vim.tbl_extend("force", opts, { reuse = win, status = nil }), opts.on_handoff)
+      end
+      if follow_foreground(opts, call, tool, win, opts.on_handoff) then
+        stop()
+      end
+    end)
+  )
+end
+
 ---Show one tool call: what was run, and what came back.
 ---
 ---A shell command that went to the background came back with nothing but the
@@ -110,7 +203,10 @@ end
 ---read from there, and followed while it runs (`shell_view`). A monitor likewise.
 ---@param opts { session_id: string?, transcript: string?, tool_id: string?, tool: string?,
 ---             label: string?, status: string?, reuse: integer?,
----             row_for: (fun(id: string): ClaudeCodeSubagentRow|nil)? }
+---             row_for: (fun(id: string): ClaudeCodeSubagentRow|nil)?,
+---             on_handoff: (fun(win: integer|nil))? }
+---             `on_handoff` is called when a running foreground command's float swaps
+---             to the finished call in the same window.
 ---@param done fun(win: integer|nil)|nil Called once the float is up (the read is async).
 function M.open(opts, done)
   opts = opts or {}
@@ -135,6 +231,10 @@ function M.open(opts, done)
     end
 
     local tool = call.tool or opts.tool
+    local running_shell = call.result == nil and transcript.SHELL_TOOLS[tool]
+    if running_shell and follow_foreground(opts, call, tool, opts.reuse, done) then
+      return
+    end
     local result = type(call.result) == "table" and call.result or {}
     -- A workflow launch is the run itself, shown as the run.
     if
@@ -179,6 +279,9 @@ function M.open(opts, done)
     end
     local title = title_for(tool, opts.label or tools.label(tool, call.input), status)
     local win = show(opts.session_id, body, title, "claudecode://tool/" .. tool_id, opts.reuse)
+    if win and running_shell then
+      wait_for_output(opts, call, tool, win)
+    end
     return finish(win)
   end)
 end

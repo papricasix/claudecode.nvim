@@ -747,16 +747,15 @@ function M.workflow_agent_state(agent, run_state, opts)
   return state, tokens, measured or math.max(0, last - first)
 end
 
----The session's subagents and background tasks as a flattened tree, children
----under their parent in the order they started.
+---Every transcript of a session that is already folded — its own, its subagents',
+---and its workflow runs' agents' — with the runs found on the way.
 ---@param transcript_path string
----@param opts { live: boolean?, now: number? }|nil `live`: the session is running.
----@return ClaudeCodeSubagentRow[]
-function M.rows(transcript_path, opts)
-  opts = { live = opts and opts.live, now = (opts and opts.now) or os.time() }
+---@return ClaudeCodeSubagent[] agents The session's own subagents.
+---@return { sum: table, parent: string|nil, path: string }[] sources
+---@return table<string, ClaudeCodeWorkflowRun> runs By task id.
+---@return table[] run_agents Tree nodes for the runs' agents.
+local function collect_sources(transcript_path)
   local agents = M.scan(transcript_path)
-
-  local index = { notes = {}, results = {}, calls = {}, stops = {}, events = {} }
   ---@type { sum: table, parent: string|nil, path: string }[]
   local sources = {}
   local session = transcript.get(transcript_path)
@@ -803,6 +802,118 @@ function M.rows(transcript_path, opts)
     end
     next_source = next_source + 1
   end
+  return agents, sources, runs, run_agents
+end
+
+---Where a foreground shell call that is still running writes its output.
+---
+---The CLI streams every shell's output into `tasks/<id>.output` while it runs —
+---a foreground one too, deleting the file when the command returns — but a
+---foreground call's id reaches the transcript only with its result. So the file is
+---matched to the call instead (measured, CLI 2.1.272): the call is written about a
+---second before its file is created, calls of one conversation run one at a time,
+---and calls of different conversations (a subagent's beside its parent's) are
+---paired with the unclaimed files in the order both started. A file counts as
+---unclaimed when no task, notification or subagent of the session owns its id.
+---
+---Only an unambiguous pairing is answered: as many files as running calls (or one
+---of each), each file created after its call. Without creation times (not every
+---filesystem records them) only the one-and-one case is.
+---@param transcript_path string The session's transcript.
+---@param tool_id string The call.
+---@param at number|nil When the call was made, in case its transcript is not folded yet.
+---@return string|nil path
+function M.foreground_output(transcript_path, tool_id, at)
+  local agents, sources, _, run_agents = collect_sources(transcript_path)
+  local claimed = {}
+  for _, agent in ipairs(agents) do
+    claimed[agent.id] = true
+  end
+  for _, node in ipairs(run_agents) do
+    claimed[node.id] = true
+  end
+  local running, found = {}, false
+  local sums = {}
+  for _, source in ipairs(sources) do
+    local sum = source.sum
+    sums[#sums + 1] = sum
+    for id in pairs(sum.tasks or {}) do
+      claimed[id] = true
+    end
+    for id in pairs(sum.task_notes or {}) do
+      claimed[id] = true
+    end
+    -- Every call still waiting: a background shell, monitor or workflow whose
+    -- launch has not been folded yet has an unclaimed file of its own too.
+    for id, call in pairs(sum.task_calls or {}) do
+      running[#running + 1] = { id = id, at = call.at or call.ts or 0 }
+      found = found or id == tool_id
+    end
+  end
+  if not found then
+    if not at then
+      return nil
+    end
+    running[#running + 1] = { id = tool_id, at = at }
+  end
+
+  local dir = M.tasks_dir(transcript_path, sums)
+  local fs = transcript._io
+  local names = dir and fs.scandir and fs.scandir(dir)
+  if not names then
+    return nil
+  end
+  table.sort(running, function(a, b)
+    return a.at < b.at
+  end)
+  local earliest = running[1].at - 2
+  local candidates, dated = {}, true
+  for _, name in ipairs(names) do
+    local id = name:match("^(.+)%.output$")
+    if id and not claimed[id] then
+      local path = dir .. "/" .. name
+      local st = fs.stat(path)
+      if st then
+        if not st.birth then
+          dated = false
+        end
+        if not st.birth or st.birth >= earliest then
+          candidates[#candidates + 1] = { path = path, birth = st.birth or 0 }
+        end
+      end
+    end
+  end
+
+  if #running == 1 and #candidates == 1 then
+    return candidates[1].path
+  end
+  if not dated or #candidates ~= #running then
+    return nil
+  end
+  table.sort(candidates, function(a, b)
+    return a.birth < b.birth
+  end)
+  for index, call in ipairs(running) do
+    -- A file older than its call cannot be its output: the pairing is off.
+    if candidates[index].birth < call.at - 2 then
+      return nil
+    end
+    if call.id == tool_id then
+      return candidates[index].path
+    end
+  end
+  return nil
+end
+
+---The session's subagents and background tasks as a flattened tree, children
+---under their parent in the order they started.
+---@param transcript_path string
+---@param opts { live: boolean?, now: number? }|nil `live`: the session is running.
+---@return ClaudeCodeSubagentRow[]
+function M.rows(transcript_path, opts)
+  opts = { live = opts and opts.live, now = (opts and opts.now) or os.time() }
+  local agents, sources, runs, run_agents = collect_sources(transcript_path)
+  local index = { notes = {}, results = {}, calls = {}, stops = {}, events = {} }
 
   for _, source in ipairs(sources) do
     local sum = source.sum

@@ -2781,6 +2781,11 @@ function open_row(payload, pane, lnum, action, nav_opts)
       reuse = nav_opts.reuse,
       -- A command that went to the background opens as that shell, followed live.
       row_for = subagent_row_for(model.transcript_path()),
+      -- A running foreground command's float swaps to the finished call in place;
+      -- the stepping keys go with it.
+      on_handoff = function(win)
+        bind_float_nav(win, pane, lnum, action)
+      end,
     }, opened)
     return
   end

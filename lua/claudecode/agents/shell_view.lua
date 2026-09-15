@@ -57,14 +57,16 @@ local STATE_HL = { done = "time", failed = "failed", stopped = "stopped" }
 --------------------------------------------------------------------------------
 
 ---The session transcript a transcript belongs to: itself, or for a subagent's
----(`<session>/subagents/agent-<id>.jsonl`) the session's beside that directory.
+---(`<session>/subagents/agent-<id>.jsonl`, or a workflow agent's under
+---`<session>/subagents/workflows/<run>/`) the session's beside that directory.
 ---@param path string|nil
 ---@return string|nil
 function M.session_path(path)
   if type(path) ~= "string" then
     return nil
   end
-  local base = path:match("^(.*)[/\\]subagents[/\\]agent%-[^/\\]+%.jsonl$")
+  local base = path:match("^(.*)[/\\]subagents[/\\]workflows[/\\][^/\\]+[/\\]agent%-[^/\\]+%.jsonl$")
+    or path:match("^(.*)[/\\]subagents[/\\]agent%-[^/\\]+%.jsonl$")
   return base and (base .. ".jsonl") or path
 end
 
@@ -240,6 +242,21 @@ local views = {}
 ---@param view table
 ---@return ClaudeCodeSubagentRow|nil
 local function lookup_row(view)
+  local fg = view.opts.foreground
+  if fg then
+    -- A foreground command has no task of its own: it is running for as long as
+    -- this float follows it, and the transcript's result is its end.
+    return {
+      kind = "shell",
+      task_type = "shell",
+      agent_type = fg.tool or "Bash",
+      description = fg.description,
+      command = view.command,
+      state = "running",
+      runtime_s = math.max(0, os.time() - (fg.started or os.time())),
+      output_path = fg.output_path,
+    }
+  end
   local from_pane = view.opts.row_for and view.opts.row_for(view.task_id)
   if from_pane then
     return from_pane
@@ -460,6 +477,36 @@ M._new_timer = function()
   return vim.loop and vim.loop.new_timer and vim.loop.new_timer() or nil
 end
 
+---Once a foreground command's result is in its transcript, show the call the way
+---any finished call is shown — its output as the transcript has it, in the same
+---window. The output file is deleted when the command returns, so there is
+---nothing left here to follow.
+---@param buf integer
+---@param view table
+---@return boolean handed
+local function handed_off(buf, view)
+  local opts = view.opts
+  local sum = transcript.get(opts.transcript)
+  local still_running = not sum or (sum.task_calls and sum.task_calls[opts.tool_id] ~= nil)
+  if still_running then
+    return false
+  end
+  local win = vim.fn.win_findbuf(buf)[1]
+  stop_timer(view)
+  local ok, tool_view = pcall(require, "claudecode.agents.tool_view")
+  if ok and win then
+    tool_view.open({
+      session_id = opts.session_id,
+      transcript = opts.transcript,
+      tool_id = opts.tool_id,
+      tool = opts.foreground.tool,
+      reuse = win,
+      row_for = opts.row_for,
+    }, opts.on_handoff)
+  end
+  return true
+end
+
 ---Build the float once the command is known.
 ---@param opts table
 ---@param command string|nil The whole command, when the transcript still had it.
@@ -494,7 +541,7 @@ local function show(opts, command, done)
   head[#head + 1] = "" -- rule
   view.head_rows = #head
 
-  local buf = float.scratch(head, "claudecode://shell/" .. tostring(opts.task_id))
+  local buf = float.scratch(head, "claudecode://shell/" .. tostring(opts.task_id or opts.tool_id))
   if not buf then
     return done(nil)
   end
@@ -543,6 +590,9 @@ local function show(opts, command, done)
         -- The notification that ends the shell lands in a transcript the pane only
         -- keeps folded for the session it has selected.
         subagents.refresh(view.session_path)
+        if view.opts.foreground and handed_off(buf, view) then
+          return
+        end
         view.row = lookup_row(view) or view.row
         view.output_path = view.output_path or (view.row and view.row.output_path)
         pull(buf, function(grew)
@@ -565,10 +615,16 @@ local function show(opts, command, done)
 end
 
 ---Open (or swap into `opts.reuse`) one background shell.
----@param opts { session_id: string?, transcript: string, task_id: string, tool_id: string?, reuse: integer?,
----             command: string?, row_for: (fun(id: string): ClaudeCodeSubagentRow|nil)? }
+---@param opts { session_id: string?, transcript: string, task_id: string?, tool_id: string?, reuse: integer?,
+---             command: string?, row_for: (fun(id: string): ClaudeCodeSubagentRow|nil)?,
+---             foreground: { output_path: string, started: number?, tool: string?, description: string? }?,
+---             on_handoff: (fun(win: integer|nil))? }
 ---             `transcript` is the one that launched the shell (the session's, or a subagent's);
 ---             `command` the whole command, when the caller has already read it.
+---
+---With `foreground = { output_path, started, tool, description }` it follows a
+---foreground command still running instead (`tool_id` names the call, and no
+---task id exists), handing over to the tool view once its result lands.
 ---@param done fun(win: integer|nil)|nil
 function M.open(opts, done)
   local function finish(win)
@@ -576,7 +632,8 @@ function M.open(opts, done)
       done(win)
     end
   end
-  if type(opts) ~= "table" or type(opts.task_id) ~= "string" or type(opts.transcript) ~= "string" then
+  local names_task = type(opts) == "table" and (type(opts.task_id) == "string" or opts.foreground)
+  if not names_task or type(opts.transcript) ~= "string" then
     return finish(nil)
   end
   if opts.command then

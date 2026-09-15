@@ -731,6 +731,106 @@ describe("agents.subagents", function()
     end)
   end)
 
+  describe("a running foreground command's output", function()
+    local TASKS = "/tmp/claude-501/-proj/sess/tasks"
+
+    local function call(id, ts_ms, command)
+      return vim.json.encode({
+        type = "assistant",
+        timestamp = os.date("!%Y-%m-%dT%H:%M:%S", math.floor(ts_ms / 1000)) .. (".%03dZ"):format(ts_ms % 1000),
+        message = {
+          role = "assistant",
+          content = { { type = "tool_use", id = id, name = "Bash", input = { command = command } } },
+        },
+      })
+    end
+
+    local function file(id, birth)
+      dirs[TASKS] = dirs[TASKS] or {}
+      table.insert(dirs[TASKS], id .. ".output")
+      fs[TASKS .. "/" .. id .. ".output"] = { data = "", mtime = math.floor(birth), ino = 7, birth = birth }
+    end
+
+    before_each(function()
+      -- The directory comes from a path the session already states.
+      put(SESSION, {
+        vim.json.encode({
+          type = "user",
+          cwd = "/proj",
+          timestamp = iso(NOW - 500),
+          message = { role = "user", content = "go" },
+        }),
+      })
+      local stat = transcript._io.stat
+      transcript._io.stat = function(path)
+        local st = stat(path)
+        if st and fs[path] then
+          st.birth = fs[path].birth
+        end
+        return st
+      end
+    end)
+
+    local function with_known_dir(lines)
+      lines[#lines + 1] = vim.json.encode({
+        type = "queue-operation",
+        operation = "enqueue",
+        timestamp = iso(NOW - 400),
+        content = "<task-notification>\n<task-id>bold</task-id>\n<output-file>"
+          .. TASKS
+          .. "/bold.output</output-file>\n<status>completed</status>\n<summary>x (exit code 0)</summary>\n</task-notification>",
+      })
+      return lines
+    end
+
+    it("finds the one unclaimed file created after the one running call", function()
+      put(SESSION, with_known_dir({ call("toolu_a", (NOW - 10) * 1000, "make") }))
+      file("bold", NOW - 400)
+      file("bnew", NOW - 9)
+      fold_all()
+      expect(subagents.foreground_output(SESSION, "toolu_a")).to_be(TASKS .. "/bnew.output")
+    end)
+
+    it("pairs a subagent's call and its parent's with their files in the order both started", function()
+      agent("sub", { first = NOW - 60 })
+      local log = fs[DIR .. "/agent-sub.jsonl"]
+      log.data = log.data .. call("toolu_sub", (NOW - 20) * 1000 + 300, "npm test") .. "\n"
+      put(SESSION, with_known_dir({ call("toolu_main", (NOW - 20) * 1000 + 100, "cargo build") }))
+      file("bold", NOW - 400)
+      file("bfirst", NOW - 19 + 0.1)
+      file("bsecond", NOW - 19 + 0.4)
+      fold_all()
+      expect(subagents.foreground_output(SESSION, "toolu_main")).to_be(TASKS .. "/bfirst.output")
+      expect(subagents.foreground_output(SESSION, "toolu_sub")).to_be(TASKS .. "/bsecond.output")
+    end)
+
+    it("answers nothing when the files do not add up to the calls", function()
+      put(SESSION, with_known_dir({ call("toolu_a", (NOW - 20) * 1000, "a"), call("toolu_b", (NOW - 19) * 1000, "b") }))
+      file("bold", NOW - 400)
+      file("bonly", NOW - 18)
+      fold_all()
+      expect(subagents.foreground_output(SESSION, "toolu_a")).to_be(nil)
+    end)
+
+    it("will not take a file older than the call", function()
+      put(SESSION, with_known_dir({ call("toolu_a", (NOW - 20) * 1000, "a"), call("toolu_b", (NOW - 19) * 1000, "b") }))
+      file("bold", NOW - 400)
+      file("bstale", NOW - 100)
+      file("bnew", NOW - 18)
+      fold_all()
+      expect(subagents.foreground_output(SESSION, "toolu_a")).to_be(nil)
+    end)
+
+    it("uses the call time it is given when the transcript is not folded that far", function()
+      put(SESSION, with_known_dir({}))
+      file("bold", NOW - 400)
+      file("bnew", NOW - 4)
+      fold_all()
+      expect(subagents.foreground_output(SESSION, "toolu_unfolded", NOW - 5)).to_be(TASKS .. "/bnew.output")
+      expect(subagents.foreground_output(SESSION, "toolu_unfolded")).to_be(nil)
+    end)
+  end)
+
   describe("formatting", function()
     it("shortens token counts", function()
       expect(subagents.format_tokens(nil)).to_be("·")

@@ -154,7 +154,7 @@ local config = nil
 ---@field agent_calls table<string, ClaudeCodeAgentsEvent> `Agent`/`Task` tool events, by tool_use id.
 ---@field agent_results table<string, ClaudeCodeAgentsTaskResult> Foreground subagent results, by tool_use id.
 ---@field task_notes table<string, ClaudeCodeAgentsTaskResult> Background task completions, by task id (an agent id, or a shell's `b…` id).
----@field task_calls table<string, { tool: string, description: string|nil, command: string|nil, ts: number }> Shell, monitor and workflow calls with no result yet, by tool_use id.
+---@field task_calls table<string, { tool: string, description: string|nil, command: string|nil, ts: number, at: number }> Shell, monitor and workflow calls with no result yet, by tool_use id. `at` keeps the timestamp's fraction.
 ---@field tasks table<string, ClaudeCodeAgentsShell> Background tasks this transcript started — shells, monitors, workflow runs — by task id.
 ---@field task_stops table<string, number> Tasks a `TaskStop` call stopped: task id -> epoch seconds.
 ---@field task_events table<string, { count: integer, last_ts: number, expired_ts: number|nil }> Monitor events, by task id.
@@ -204,16 +204,19 @@ local config = nil
 --- filesystem. Production implementations use libuv directly.
 M._io = {
   ---@param path string
-  ---@return { size: integer, mtime: integer, ino: integer|nil }|nil
+  ---@return { size: integer, mtime: integer, ino: integer|nil, birth: number|nil }|nil
+  ---        `birth`: creation time with its fraction, where the filesystem records one.
   stat = function(path)
     local st = uv and uv.fs_stat(path)
     if not st then
       return nil
     end
+    local birth = type(st.birthtime) == "table" and st.birthtime.sec or nil
     return {
       size = st.size,
       mtime = type(st.mtime) == "table" and st.mtime.sec or st.mtime,
       ino = st.ino,
+      birth = birth and birth > 0 and (birth + (st.birthtime.nsec or 0) / 1e9) or nil,
     }
   end,
 
@@ -586,6 +589,27 @@ function M._iso_to_epoch(iso)
     return 0
   end
   y, mo, d, h, mi, s = tonumber(y), tonumber(mo), tonumber(d), tonumber(h), tonumber(mi), tonumber(s)
+  return M._civil_to_epoch(y, mo, d, h, mi, s)
+end
+
+---Epoch seconds of an ISO timestamp with its fraction kept (`…:24.614Z` →
+---`….614`). Only where the order of two events inside one second matters.
+---@param iso string|nil
+---@return number
+function M._iso_to_epoch_precise(iso)
+  local whole = M._iso_to_epoch(iso)
+  local fraction = whole > 0 and iso:match("^%d+%-%d+%-%d+T%d+:%d+:%d+(%.%d+)") or nil
+  return whole + (tonumber(fraction) or 0)
+end
+
+---@param y integer
+---@param mo integer
+---@param d integer
+---@param h integer
+---@param mi integer
+---@param s integer
+---@return integer
+function M._civil_to_epoch(y, mo, d, h, mi, s)
   -- Days from civil (Howard Hinnant's algorithm): era-based, no lookup tables.
   local yy = y - (mo <= 2 and 1 or 0)
   local era = math.floor(yy / 400)
@@ -729,6 +753,8 @@ local function fold_tool_use(sum, entry, want_events)
         description = type(input.description) == "string" and input.description or nil,
         command = command and command:sub(1, SHELL_COMMAND_LIMIT) or nil,
         ts = ts,
+        -- Sub-second, for ordering calls running at once (`subagents.foreground_output`).
+        at = M._iso_to_epoch_precise(entry.timestamp),
       }
     end
     if
@@ -2278,6 +2304,7 @@ end
 ---@field input table|nil What the call was given (a `Bash`'s command, say).
 ---@field result any The decoded `toolUseResult`, or nil when none has landed yet.
 ---@field ts number Epoch seconds of the call.
+---@field at number|nil The same, with its fraction.
 
 ---Everything the transcript holds about one tool call, read on demand.
 ---
@@ -2335,6 +2362,7 @@ function M.tool_call(transcript_path, tool_id, cb)
           call.tool = type(block.name) == "string" and block.name or nil
           call.input = type(block.input) == "table" and block.input or nil
           call.ts = M._iso_to_epoch(entry.timestamp)
+          call.at = M._iso_to_epoch_precise(entry.timestamp)
         elseif type(block) == "table" and block.tool_use_id == tool_id then
           -- The result entry. `toolUseResult` is the decoded, tool-shaped copy the
           -- CLI writes beside the raw block; the block's own `content` is the
