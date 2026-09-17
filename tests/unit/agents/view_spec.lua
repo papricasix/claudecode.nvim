@@ -885,6 +885,76 @@ describe("agents_view", function()
       expect(#launched).to_be(1)
     end)
 
+    describe("after deleting the selected session", function()
+      ---Delete rows the way `dd` does, from the sessions pane, answering yes.
+      local function delete_rows(first, last)
+        package.loaded["claudecode.agents.confirm"] = {
+          ask = function(_, cb)
+            cb(true)
+          end,
+        }
+        require("claudecode.agents.model").delete_sessions = function(ids)
+          local gone = {}
+          for _, id in ipairs(ids) do
+            gone[id] = true
+          end
+          local keep = {}
+          for _, row in ipairs(rows) do
+            if not gone[row.session_id] then
+              keep[#keep + 1] = row
+            end
+          end
+          rows = keep
+          return ids, {}
+        end
+        vim.api.nvim_set_current_win(agents_view._state().wins.sessions)
+        agents_view.delete_range(first, last)
+        package.loaded["claudecode.agents.confirm"] = nil
+      end
+
+      it("selects the session that took its place, rather than offering the deleted one", function()
+        -- The centre kept offering the deleted conversation, and `i` on that offer
+        -- claimed the deleted id for a brand new CLI.
+        open_view()
+        expect(selected).to_be("aaa")
+        delete_rows(1, 1)
+        expect(selected).to_be("bbb")
+        expect(agents_view._state().pending_start).to_be("bbb")
+        expect(center_lines():find("Second", 1, true) ~= nil).to_be_true()
+
+        agents_view.focus_terminal()
+        expect(table.concat(launched, ",")).to_be("bbb")
+      end)
+
+      it("shows a running agent that took its place, starting nothing", function()
+        rows[3] = { session_id = "ccc", title = "Third" }
+        open_view()
+        agents_view.cycle_session(1)
+        expect(selected).to_be("bbb")
+        live.ccc = true
+        delete_rows(2, 2)
+        expect(selected).to_be("ccc")
+        expect(shown[#shown]).to_be("ccc")
+        expect(agents_view._state().pending_start).to_be(nil)
+        expect(#launched).to_be(0)
+      end)
+
+      it("moves up when the last row was the one deleted", function()
+        open_view()
+        agents_view.cycle_session(1)
+        expect(selected).to_be("bbb")
+        delete_rows(2, 2)
+        expect(selected).to_be("aaa")
+      end)
+
+      it("leaves the selection alone when another row was deleted", function()
+        open_view()
+        delete_rows(2, 2)
+        expect(selected).to_be("aaa")
+        expect(agents_view._state().pending_start).to_be("aaa")
+      end)
+    end)
+
     it("goes back to that screen when the last conversation is deleted", function()
       open_view()
       expect(agents_view._state().pending_start).to_be("aaa")
@@ -1424,6 +1494,10 @@ describe("agents_view", function()
           return { session_id = id, title = "Session " .. id, added = 3, removed = 1 }
         end,
         foreign_state = function() end,
+        rows = function()
+          return {}
+        end,
+        selected = function() end,
         delete_sessions = function(ids)
           for _, id in ipairs(ids) do
             deleted[#deleted + 1] = id

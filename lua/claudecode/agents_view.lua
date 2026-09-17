@@ -2413,6 +2413,55 @@ local function delete_label(session_id)
   return label
 end
 
+---Move the selection off a conversation that was just deleted.
+---
+---The model drops a deleted selection, but the centre went on offering it, and
+---accepting that offer resumed nothing: `M.select` found no row and *claimed* the
+---deleted id with `--session-id`, starting a new conversation under the id just
+---removed. The row that takes the deleted one's place — the one the sessions
+---cursor lands on, or the one above when the last row went — is selected instead,
+---the way `<C-n>` selects: a running agent is shown, a stopped one offered.
+---@param order string[] Session ids in list order, read before the delete.
+---@param focus string|nil The session selected or offered before the delete.
+---@param deleted string[]
+local function follow_deletion(order, focus, deleted)
+  local gone = {}
+  for _, session_id in ipairs(deleted) do
+    gone[session_id] = true
+  end
+  if state.pending_start and gone[state.pending_start] then
+    clear_start_prompt()
+  end
+  if not focus or not gone[focus] then
+    return
+  end
+
+  local at = nil
+  for index, session_id in ipairs(order) do
+    if session_id == focus then
+      at = index
+      break
+    end
+  end
+  local function usable(session_id)
+    return not gone[session_id] and model.row(session_id) ~= nil
+  end
+  if at then
+    for index = at + 1, #order do
+      if usable(order[index]) then
+        return M.preview_session(order[index])
+      end
+    end
+    for index = at - 1, 1, -1 do
+      if usable(order[index]) then
+        return M.preview_session(order[index])
+      end
+    end
+  end
+  -- Nothing left to move to: the empty-project screen takes the centre.
+  sync_empty_notice()
+end
+
 ---Ask about a batch of conversations, then delete the ones the user agreed to.
 ---
 ---Running agents are set aside rather than refusing the whole gesture: with a
@@ -2476,7 +2525,15 @@ local function confirm_and_delete(session_ids)
     if not ok then
       return
     end
+    -- Read before the rows move, so the one that takes the selection's place can
+    -- be found once they have.
+    local order = {}
+    for index, row in ipairs(model.rows()) do
+      order[index] = row.session_id
+    end
+    local focus = model.selected() or state.pending_start
     local deleted, failed = model.delete_sessions(deletable)
+    follow_deletion(order, focus, deleted)
     if #failed > 0 then
       local first = failed[1]
       local detail = tostring(first.err)
