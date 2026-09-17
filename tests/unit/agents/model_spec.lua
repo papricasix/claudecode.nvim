@@ -86,6 +86,11 @@ describe("agents.model", function()
       session_path = function(_, id)
         return "/p/" .. id .. ".jsonl"
       end,
+      -- The real rule is the transcript spec's to pin down; this only has to
+      -- tell the model's two kinds of path apart.
+      is_scratchpad = function(path)
+        return path:find("/scratchpad/", 1, true) ~= nil
+      end,
     }
 
     package.loaded["claudecode.agents.registry"] = {
@@ -712,6 +717,20 @@ describe("agents.model", function()
         expect(#feed).to_be(2)
         expect(feed[1].path).to_be("/proj/b.lua")
       end)
+    end)
+
+    it("marks a file in the CLI's scratchpad, and only that one", function()
+      local pad = "/tmp/claude-501/-proj/0b3c2f4e-1a2b-4c3d-8e9f-0123456789ab/scratchpad/probe.lua"
+      summaries.aaa.files[pad] = { added = 5, removed = 0, kind = "add", last_ts = 2 }
+      table.insert(summaries.aaa.order, pad)
+      model.select("aaa")
+
+      local marked = {}
+      for _, e in ipairs(model.changes()) do
+        marked[e.path] = e.scratchpad
+      end
+      expect(marked[pad]).to_be_true()
+      expect(marked["/proj/a.lua"]).to_be_false()
     end)
 
     it("leaves reads out of the changed-files list", function()

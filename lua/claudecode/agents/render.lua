@@ -699,7 +699,7 @@ end
 
 ---Draw the files the selected agent touched.
 ---@param buf integer
----@param entries table[] `{ path, status, added, removed, deleted }`
+---@param entries table[] `{ path, status, added, removed, deleted, scratchpad }`
 ---@param opts { cwd: string?, width: integer? }|nil
 function M.changes(buf, entries, opts)
   opts = opts or {}
@@ -734,7 +734,14 @@ function M.changes(buf, entries, opts)
       -- so the one thing left standing out on the row is the `D`.
       marks[#marks + 1] = { row = lnum, col = #head, end_col = #line, hl = hl("deleted") }
     else
-      marks[#marks + 1] = { row = lnum, col = #head, end_col = #head + #name, hl = hl("path") }
+      -- A file in the CLI's scratchpad is work the session did for itself, not to
+      -- the project, so it wears what Activity draws a settled tool call's label
+      -- in rather than the path colour: quieter, and not grey — grey says a file
+      -- is gone. The same group by construction (an unknown age is the resting
+      -- step), so the two follow each other through `fade`, `highlights.title`
+      -- and colorscheme changes. Its counts are left as they are.
+      local path_group = entry.scratchpad and fade.dim_group(hl("title"), nil) or hl("path")
+      marks[#marks + 1] = { row = lnum, col = #head, end_col = #head + #name, hl = path_group }
       push_spans(marks, lnum, counts_at, spans)
     end
   end

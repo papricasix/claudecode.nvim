@@ -544,6 +544,53 @@ describe("agents.render", function()
       expect(groups[1].text:find("D", 1, true)).to_be_nil()
     end)
 
+    it("draws a scratchpad file's path like a settled tool call's label, keeping its counts", function()
+      ---Each marked span of a buffer's rows, keyed by row, with the text it covers.
+      local function spans(pane)
+        local lines = lines_of(pane)
+        local by_row = {}
+        for _, mark in ipairs(vim._extmarks or {}) do
+          if mark.bufnr == pane and mark.opts.end_col then
+            by_row[mark.row + 1] = by_row[mark.row + 1] or {}
+            local text = lines[mark.row + 1]:sub(mark.col + 1, mark.opts.end_col)
+            table.insert(by_row[mark.row + 1], { text = text, hl = mark.opts.hl_group })
+          end
+        end
+        return by_row
+      end
+      local function group_of(row_spans, needle)
+        for _, span in ipairs(row_spans or {}) do
+          if span.text:find(needle, 1, true) then
+            return span.hl
+          end
+        end
+      end
+
+      -- What Activity draws a Bash call's description in once the row has settled.
+      local feed = render.create_buf("feed")
+      render.feed(feed, {
+        { ts = 1785700000, kind = "tool", tool = "Bash", label = "run the tests", tool_id = "t1" },
+      }, { width = 60, cwd = "/proj" })
+      local tool_group = group_of(spans(feed)[1], "run the tests")
+      expect(tool_group ~= nil).to_be_true()
+
+      local changes = render.create_buf("changes")
+      render.changes(changes, {
+        { path = "/proj/a.lua", status = "M", added = 1, removed = 0 },
+        { path = "/tmp/pad/probe.lua", status = "A", added = 7, removed = 0, scratchpad = true },
+        { path = "/tmp/pad/gone.lua", status = "D", added = 2, removed = 0, scratchpad = true, deleted = true },
+      }, { width = 60, cwd = "/proj" })
+      local by_row = spans(changes)
+
+      expect(group_of(by_row[1], "a.lua")).to_be("ClaudeCodeAgentsPath")
+      expect(group_of(by_row[2], "probe.lua")).to_be(tool_group)
+      -- Its counts are still drawn as blocks: a span of their own beyond the path.
+      expect(#by_row[2] > 1).to_be_true()
+      -- Gone is gone, scratchpad or not: grey wins.
+      expect(#by_row[3]).to_be(1)
+      expect(by_row[3][1].hl).to_be("ClaudeCodeAgentsDeleted")
+    end)
+
     it("says so when the session changed nothing", function()
       local changes = render.create_buf("changes")
       render.changes(changes, {}, { width = 40 })

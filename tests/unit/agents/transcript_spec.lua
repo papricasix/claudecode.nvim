@@ -219,6 +219,36 @@ describe("agents.transcript", function()
     end)
   end)
 
+  describe("is_scratchpad", function()
+    local ID = "0b3c2f4e-1a2b-4c3d-8e9f-0123456789ab"
+
+    it("knows the scratchpad by its shape, whatever the temp root", function()
+      -- macOS resolves `/tmp` through its symlink; Linux does not; the variable
+      -- moves it anywhere; and Windows has neither a `/tmp` nor a numeric uid.
+      for _, path in ipairs({
+        "/private/tmp/claude-501/-Users-me-proj/" .. ID .. "/scratchpad/probe.lua",
+        "/tmp/claude-1000/-home-me-proj/" .. ID .. "/scratchpad/notes/run.txt",
+        "/var/folders/ct/claude-501/-Users-me-proj/" .. ID .. "/scratchpad/a.md",
+        "C:\\Users\\me\\AppData\\Local\\Temp\\claude-0\\D--Git-proj\\" .. ID .. "\\scratchpad\\a.py",
+        "C:/Users/me/AppData/Local/Temp/claude-/D--Git-proj/" .. ID .. "/scratchpad/a.py",
+      }) do
+        expect(transcript.is_scratchpad(path)).to_be_true()
+      end
+    end)
+
+    it("does not take a project folder that happens to be called scratchpad", function()
+      -- Measured in a real store: a project with its own `scratchpad/` directory,
+      -- written to 110 times. The session segment is what tells it apart.
+      expect(transcript.is_scratchpad("/Users/me/app/scratchpad/notes.md")).to_be_false()
+      expect(transcript.is_scratchpad("/tmp/claude-501/-proj/not-a-session/scratchpad/a.md")).to_be_false()
+      expect(transcript.is_scratchpad("/tmp/claude-501/-proj/" .. ID .. "/tasks/b4mk05121.output")).to_be_false()
+      -- The directory itself is not a file in it.
+      expect(transcript.is_scratchpad("/tmp/claude-501/-proj/" .. ID .. "/scratchpad")).to_be_false()
+      expect(transcript.is_scratchpad("/tmp/claude-501/-proj/" .. ID .. "/scratchpad/")).to_be_false()
+      expect(transcript.is_scratchpad(nil)).to_be_false()
+    end)
+  end)
+
   describe("deleting", function()
     it("removes the transcript, its sidecar directory and its cached fold", function()
       put("/p/a.jsonl", { edit_line("/proj/x.lua", 1, 0) })

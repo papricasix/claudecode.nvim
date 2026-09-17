@@ -443,6 +443,38 @@ function M._trim_separator(path)
   return trimmed
 end
 
+local UUID = table.concat({
+  string.rep("%x", 8),
+  string.rep("%x", 4),
+  string.rep("%x", 4),
+  string.rep("%x", 4),
+  string.rep("%x", 12),
+}, "%-")
+
+--- `claude-<uid>/<slug>/<session>/scratchpad/<something>`, whole segments, either
+--- separator. See `M.is_scratchpad`.
+local SCRATCHPAD_PATTERN = "[/\\]claude%-%d*[/\\][^/\\]+[/\\]" .. UUID .. "[/\\]scratchpad[/\\][^/\\]"
+
+---Whether a path lies inside a CLI session's scratchpad directory.
+---
+---The CLI builds it as `<temp root>/claude-<uid>/<slug of cwd>/<session>/scratchpad`
+---(2.1.274), but only the part from `claude-` on is the same everywhere: the root
+---is `/tmp` resolved through symlinks on macOS (`/private/tmp`), `/tmp` on Linux,
+---`$CLAUDE_CODE_TMPDIR` when set, and on Windows is not `/tmp` at all (the
+---platform branch is compiled out of each build, so it cannot be read from this
+---one) — nor is the uid a number there. So the shape is matched rather than the
+---directory derived.
+---
+---Not tied to the transcript's own id: a resumed or forked conversation writes
+---to the scratchpad it was given when it started (43 of 131 transcripts here
+---named another session's). The UUID segment is what keeps a project folder that
+---merely happens to be called `scratchpad` out.
+---@param path string|nil
+---@return boolean
+function M.is_scratchpad(path)
+  return type(path) == "string" and path:find(SCRATCHPAD_PATTERN) ~= nil
+end
+
 ---Locate the transcript directory for a project.
 ---
 ---Tries the slug first — for the path as given and, if that misses, for its

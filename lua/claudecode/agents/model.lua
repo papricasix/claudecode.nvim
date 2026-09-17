@@ -1325,6 +1325,7 @@ function M.changes()
         removed_age_ms = removed_age,
         kind = file.kind,
         deleted = deleted,
+        scratchpad = transcript.is_scratchpad(path),
         status = deleted and "D" or letter or (file.kind == "add" and "A" or "M"),
       }
     end
