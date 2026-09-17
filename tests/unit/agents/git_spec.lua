@@ -142,6 +142,78 @@ describe("agents.git", function()
     end)
   end)
 
+  describe("reading a file's committed content", function()
+    local spawned
+
+    ---Answer every command with `text` and `code`, recording what was run.
+    local function spawn_answers(kind, root, text, code)
+      git._working_copy = function()
+        return kind, root
+      end
+      git._spawn = function(argv, cwd, cb)
+        spawned[#spawned + 1] = { argv = argv, cwd = cwd }
+        cb(text, code)
+      end
+    end
+
+    local function read(path)
+      local answer
+      git._show_head(path, function(lines, info)
+        answer = { lines = lines, info = info }
+      end)
+      return answer
+    end
+
+    before_each(function()
+      spawned = {}
+    end)
+
+    it("asks git for HEAD, from the file's own directory", function()
+      spawn_answers("git", "/proj", "one\ntwo\n", 0)
+      local answer = read("/proj/lua/a.lua")
+
+      expect(table.concat(spawned[1].argv, " ")).to_be("git -C /proj/lua show HEAD:./a.lua")
+      -- The final newline is not a line of the file.
+      expect(table.concat(answer.lines, "|")).to_be("one|two")
+      expect(answer.info.rev).to_be("HEAD")
+    end)
+
+    it("asks svn for BASE in an svn working copy", function()
+      spawn_answers("svn", "/wc", "one\n", 0)
+      local answer = read("/wc/src/a@2x.lua")
+
+      -- The trailing @ keeps an @ in the name from reading as a peg revision.
+      expect(table.concat(spawned[1].argv, " ")).to_be("svn cat -r BASE /wc/src/a@2x.lua@")
+      expect(spawned[1].cwd).to_be("/wc")
+      expect(answer.lines[1]).to_be("one")
+      expect(answer.info.vcs).to_be("svn")
+      expect(answer.info.rev).to_be("BASE")
+    end)
+
+    it("reads a failure inside a working copy as not committed", function()
+      spawn_answers("svn", "/wc", "", 1)
+      local answer = read("/wc/new.lua")
+      expect(answer.lines).to_be_nil()
+      expect(answer.info.unversioned).to_be_nil()
+      expect(answer.info.failed).to_be_nil()
+    end)
+
+    it("still asks git outside any working copy, and calls a failure unversioned", function()
+      -- A repository named by GIT_DIR leaves no marker to find.
+      spawn_answers(nil, nil, "", 128)
+      local answer = read("/tmp/loose.lua")
+      expect(spawned[1].argv[1]).to_be("git")
+      expect(answer.info.unversioned).to_be_true()
+    end)
+
+    it("says when the command could not be started at all", function()
+      spawn_answers("svn", "/wc", nil, -1)
+      local answer = read("/wc/a.lua")
+      expect(answer.lines).to_be_nil()
+      expect(answer.info.failed).to_be_true()
+    end)
+  end)
+
   describe("single flight", function()
     it("coalesces a burst into one extra query", function()
       -- Deferred so several requests are genuinely in flight at once.

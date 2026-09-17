@@ -263,6 +263,9 @@ describe("agents.file_view", function()
 
     ---Answer for `git show HEAD:<file>`; nil means the file is not in HEAD.
     local head
+    ---What the reader says it read; nil answers the way a git repository does.
+    local info
+    local notified
 
     local function open_head(path)
       local win, called = nil, false
@@ -273,16 +276,23 @@ describe("agents.file_view", function()
       return win
     end
 
+    local notify
+
     before_each(function()
-      head = {}
+      head, info, notified = {}, nil, {}
       package.loaded["claudecode.agents.git"] = nil
       git = require("claudecode.agents.git")
       git._set_head_reader(function(path, cb)
-        cb(head[path])
+        cb(head[path], info)
       end)
+      notify = vim.notify
+      vim.notify = function(msg)
+        notified[#notified + 1] = msg
+      end
     end)
 
     after_each(function()
+      vim.notify = notify
       git._set_head_reader(nil)
       package.loaded["claudecode.agents.git"] = nil
     end)
@@ -300,6 +310,62 @@ describe("agents.file_view", function()
       expect(shown[1].old_text).to_be("one\ntwo\nthree\n")
       local _, title = float_buf()
       expect(title:find("vs HEAD", 1, true) ~= nil).to_be_true()
+    end)
+
+    describe("in an svn working copy", function()
+      before_each(function()
+        info = { vcs = "svn", rev = "BASE" }
+      end)
+
+      it("diffs against BASE, and says so", function()
+        install_unified()
+        disk["/proj/a.lua"] = { "one", "TWO" }
+        head["/proj/a.lua"] = { "one", "two" }
+
+        expect(open_head("/proj/a.lua")).not_to_be_nil()
+        expect(shown[1].old_text).to_be("one\ntwo\n")
+        local _, title = float_buf()
+        expect(title:find("vs BASE", 1, true) ~= nil).to_be_true()
+      end)
+
+      it("reads a file svn has no BASE for as all new", function()
+        install_unified()
+        disk["/proj/new.lua"] = { "a" }
+
+        open_head("/proj/new.lua")
+        local _, title = float_buf()
+        expect(title:find("new since BASE", 1, true) ~= nil).to_be_true()
+      end)
+
+      it("names BASE in the text diff's header", function()
+        disk["/proj/a.lua"] = { "one", "TWO" }
+        head["/proj/a.lua"] = { "one", "two" }
+
+        open_head("/proj/a.lua")
+        local lines = vim.api.nvim_buf_get_lines(float_buf(), 0, -1, false)
+        expect(lines[1]:find("(BASE)", 1, true) ~= nil).to_be_true()
+      end)
+    end)
+
+    it("says a file is not versioned rather than showing every line as new", function()
+      -- Previously any failure read as "not in HEAD", so a file outside every
+      -- repository opened as one long addition.
+      install_unified()
+      info = { vcs = "git", rev = "HEAD", unversioned = true }
+      disk["/proj/a.lua"] = { "one" }
+
+      expect(open_head("/proj/a.lua")).to_be_nil()
+      expect(#shown).to_be(0)
+      expect(notified[1]:find("not in a git or svn working copy", 1, true) ~= nil).to_be_true()
+    end)
+
+    it("says the command could not run rather than showing every line as new", function()
+      install_unified()
+      info = { vcs = "svn", rev = "BASE", failed = true }
+      disk["/proj/a.lua"] = { "one" }
+
+      expect(open_head("/proj/a.lua")).to_be_nil()
+      expect(notified[1]:find("could not run svn", 1, true) ~= nil).to_be_true()
     end)
 
     it("reads a file that is not in HEAD as all new", function()

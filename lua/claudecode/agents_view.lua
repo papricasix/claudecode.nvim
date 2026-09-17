@@ -727,7 +727,7 @@ local KEY_SPECS = {
     field = "git_diff",
     panes = { "feed", "changes" },
     group = "This file",
-    desc = "Diff it against git HEAD (everything uncommitted, not just this agent's work)",
+    desc = "Diff it against git HEAD / svn BASE (everything uncommitted, not just this agent's work)",
     run = function()
       M.diff_head_under_cursor()
     end,

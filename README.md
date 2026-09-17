@@ -334,8 +334,10 @@ there too.
 - `.` in the Activity or Changes pane diffs that file against **git HEAD** —
   everything uncommitted in it, whoever put it there — rather than against what
   the session started from. Useful once several agents have been over the same
-  tree. A file not in HEAD reads as all new; one that matches HEAD says so
-  instead of opening an empty diff.
+  tree. In an svn working copy it diffs against **svn BASE** instead. A file not
+  yet committed reads as all new; one that matches its baseline says so instead
+  of opening an empty diff, and one outside any git or svn working copy says
+  that.
 - `gf` in the Activity or Changes pane opens the **file itself, in a new tab** —
   what is on disk, to work in, rather than a view of what the agent did to it.
   The other two keys answer questions about the row; this one leaves the row
@@ -350,7 +352,7 @@ there too.
   through everything an agent changed without closing the float between files.
   The float itself stays put and its content is swapped, the pane's cursor
   follows, and the baseline stays whichever you opened with (the session's
-  changes for `<CR>`, git HEAD for `.`). Holding the key scrolls through the list
+  changes for `<CR>`, git HEAD or svn BASE for `.`). Holding the key scrolls through the list
   and opens the row you settle on.
 - `q` closes the view; the agents keep running unless you set
   `kill_on_close = true`.

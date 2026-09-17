@@ -15,10 +15,16 @@
 --- lines split on newlines, and NUL bytes arrive as `\n`, which destroys the exact
 --- framing `-z` exists to provide. Newline-delimited output with quoted paths is
 --- the format that survives the transport.
+---
+--- Reading a file's committed content (`file_at_head`, the `.` key) also speaks
+--- svn: in an svn working copy it is `BASE`, since nothing else here asks svn
+--- anything.
 ---@brief ]]
 ---@module 'claudecode.agents.git'
 
 local logger = require("claudecode.logger")
+
+local uv = vim.uv or vim.loop
 
 local M = {}
 
@@ -51,24 +57,27 @@ local function spawn(argv, cwd, cb)
   end
 
   local out = {}
-  local ok_job = pcall(function()
-    vim.fn.jobstart(argv, {
-      cwd = cwd,
-      stdout_buffered = true,
-      on_stdout = function(_, data)
-        for _, line in ipairs(data or {}) do
-          out[#out + 1] = line
-        end
-      end,
-      on_exit = function(_, code)
-        cb(table.concat(out, "\n"), code or 0)
-      end,
-    })
-  end)
-  if not ok_job then
+  local ok_job, job = pcall(vim.fn.jobstart, argv, {
+    cwd = cwd,
+    stdout_buffered = true,
+    on_stdout = function(_, data)
+      for _, line in ipairs(data or {}) do
+        out[#out + 1] = line
+      end
+    end,
+    on_exit = function(_, code)
+      cb(table.concat(out, "\n"), code or 0)
+    end,
+  })
+  -- A command that is not installed can also come back as a job id of -1 rather
+  -- than an error, and then `on_exit` never runs.
+  if not ok_job or type(job) ~= "number" or job <= 0 then
     cb(nil, -1)
   end
 end
+
+--- Overridable for tests: reading a file out of a repository must not start a process.
+M._spawn = spawn
 
 ---Run a git command, calling back with its non-empty stdout lines.
 ---@param argv string[]
@@ -96,28 +105,79 @@ function M._set_runner(fn)
   M._runner = fn or M.run
 end
 
----A file's content at `HEAD`.
+---@class ClaudeCodeAgentsHeadInfo What a committed-content read was asked of.
+---@field vcs "git"|"svn"
+---@field rev "HEAD"|"BASE" The revision read, as the float names it.
+---@field unversioned boolean|nil No working copy holds the file.
+---@field failed boolean|nil The command could not be started (not installed, say).
+
+---The working copy a file belongs to: the nearest directory above it holding a
+---`.git` (a directory, or the file a worktree or submodule has) or a `.svn`.
 ---
----Runs from the file's own directory and asks for `HEAD:./<name>`, so the repo
----root never has to be found: git resolves a `./` path against the working
----directory it was given. A non-zero exit means the file is not in `HEAD` — it
----is new, which is a diff against nothing rather than a failure.
+---Walked by hand with a stat per candidate, so a deleted file whose directory is
+---gone too is still found, and `.git` wins when one directory holds both.
+---@param path string Absolute path of the file.
+---@return "git"|"svn"|nil kind
+---@return string|nil root The directory holding the marker.
+function M._working_copy(path)
+  local dir = vim.fn.fnamemodify(path, ":h")
+  while uv and type(dir) == "string" and dir ~= "" do
+    for _, kind in ipairs({ "git", "svn" }) do
+      if uv.fs_stat(dir .. "/." .. kind) then
+        return kind, dir
+      end
+    end
+    local parent = vim.fn.fnamemodify(dir, ":h")
+    if parent == dir then
+      break
+    end
+    dir = parent
+  end
+  return nil, nil
+end
+
+---A file's committed content: `HEAD` in git, `BASE` in svn.
+---
+---Git runs against the file's own directory and asks for `HEAD:./<name>`, so the
+---repo root never has to be found: git resolves a `./` path against the working
+---directory it was given. svn's `BASE` is the revision the working copy last
+---updated the file to, which is what `svn diff` compares against; the trailing
+---`@` stops an `@` in the file's name being read as a peg revision.
+---
+---A non-zero exit inside a working copy means the file was never committed — it
+---is new, which is a diff against nothing rather than a failure. Outside one (no
+---marker found, and git, still asked in case `GIT_DIR` names a repository, says
+---no) the file is not versioned at all.
 ---
 ---Deliberately not routed through `M.run`: that one drops empty lines, which is
 ---right for status output and wrong for file content, where a blank line is a
 ---line.
 ---@param path string Absolute path of the file.
----@param cb fun(lines: string[]|nil) nil when the file is not in HEAD.
+---@param cb fun(lines: string[]|nil, info: ClaudeCodeAgentsHeadInfo) nil when not committed.
 function M._show_head(path, cb)
-  local dir = vim.fn.fnamemodify(path, ":h")
-  local name = vim.fn.fnamemodify(path, ":t")
-  local argv = { "git", "-C", dir, "show", "HEAD:./" .. name }
+  local kind, root = M._working_copy(path)
+  ---@type ClaudeCodeAgentsHeadInfo
+  local info = { vcs = kind or "git", rev = kind == "svn" and "BASE" or "HEAD" }
 
-  ---@param text string|nil
-  ---@param code integer
-  local function answer(text, code)
-    if code ~= 0 or type(text) ~= "string" then
-      cb(nil)
+  local argv
+  if kind == "svn" then
+    argv = { "svn", "cat", "-r", "BASE", path .. "@" }
+  else
+    local dir = vim.fn.fnamemodify(path, ":h")
+    argv = { "git", "-C", dir, "show", "HEAD:./" .. vim.fn.fnamemodify(path, ":t") }
+  end
+
+  -- From the working copy's root, which exists even when the file's directory
+  -- was deleted along with it.
+  M._spawn(argv, root, function(text, code)
+    if type(text) ~= "string" then
+      info.failed = true
+      cb(nil, info)
+      return
+    end
+    if code ~= 0 then
+      info.unversioned = kind == nil or nil
+      cb(nil, info)
       return
     end
     local lines = vim.split(text, "\n", { plain = true })
@@ -126,23 +186,21 @@ function M._show_head(path, cb)
     if lines[#lines] == "" then
       table.remove(lines)
     end
-    cb(lines)
-  end
-
-  spawn(argv, dir, answer)
+    cb(lines, info)
+  end)
 end
 
 --- Overridable for tests, like `_runner`: reading a file out of HEAD must not
 --- need a repository.
 M._head_reader = M._show_head
 
----@param fn fun(path: string, cb: fun(lines: string[]|nil))|nil
+---@param fn fun(path: string, cb: fun(lines: string[]|nil, info: ClaudeCodeAgentsHeadInfo|nil))|nil
 function M._set_head_reader(fn)
   M._head_reader = fn or M._show_head
 end
 
 ---@param path string Absolute path of the file.
----@param cb fun(lines: string[]|nil)
+---@param cb fun(lines: string[]|nil, info: ClaudeCodeAgentsHeadInfo|nil) See `_show_head`.
 function M.file_at_head(path, cb)
   return M._head_reader(path, cb)
 end

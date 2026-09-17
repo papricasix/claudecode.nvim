@@ -219,8 +219,9 @@ end
 ---@param after string[]
 ---@param title string
 ---@param reuse integer|nil Float to swap this into, rather than stacking a new one.
+---@param rev string What `before` is, for the header: `HEAD`, or svn's `BASE`.
 ---@return integer|nil win
-local function open_text_diff(session_id, path, before, after, title, reuse)
+local function open_text_diff(session_id, path, before, after, title, reuse, rev)
   -- `vim.diff` is a Neovim built-in, so the answer is still a diff on a machine
   -- with no unified.nvim — just not an inline one.
   -- An empty side is empty text, not one blank line: a deleted file would
@@ -237,7 +238,7 @@ local function open_text_diff(session_id, path, before, after, title, reuse)
   end
   local lines = vim.split(text, "\n", { plain = true })
   table.insert(lines, 1, "+++ " .. path .. " (working tree)")
-  table.insert(lines, 1, "--- " .. path .. " (HEAD)")
+  table.insert(lines, 1, "--- " .. path .. " (" .. rev .. ")")
   local buf = scratch(lines, "claudecode://head/" .. path)
   if not buf then
     return nil
@@ -272,13 +273,29 @@ function M._same_lines(a, b)
   return true
 end
 
+---Why a file's committed content could not be read at all, as a notification;
+---nil when the reader answered (even with "not committed").
+---@param name string
+---@param info table|nil The reader's second answer; see `git.file_at_head`.
+---@return string|nil
+local function unreadable_reason(name, info)
+  if info and info.failed then
+    return "could not run " .. (info.vcs or "git")
+  end
+  if info and info.unversioned then
+    return name .. " is not in a git or svn working copy"
+  end
+  return nil
+end
+
 ---Show a file against `HEAD`, rather than against what a session started from.
 ---
 ---The session diff answers "what did this agent do here", which is the question
 ---the panes ask — but the neighbouring one, "what is uncommitted in this file",
 ---is asked just as often once several agents have been over the same tree, and
 ---no session's history can answer it. Same float, same inline rendering, a
----different baseline.
+---different baseline. In an svn working copy the baseline is `BASE`, the
+---revision the file was last updated to, and the float says so.
 ---@param opts { session_id: string?, path: string, line: integer?, cwd: string?, reuse: integer? }
 ---@param done fun(win: integer|nil)|nil
 function M.open_against_head(opts, done)
@@ -299,25 +316,36 @@ function M.open_against_head(opts, done)
     -- Deleted: what HEAD holds is what was removed. The inline renderer needs
     -- the file's own buffer, and a buffer on a missing path is one `:w` from
     -- resurrecting it, so this is always shown as diff text.
-    require("claudecode.agents.git").file_at_head(path, function(head)
+    require("claudecode.agents.git").file_at_head(path, function(head, info)
+      local rev = info and info.rev or "HEAD"
       if not head then
-        vim.notify("ClaudeCode: " .. name .. " is not on disk", vim.log.levels.WARN)
+        local reason = unreadable_reason(name, info) or (name .. " is not on disk")
+        vim.notify("ClaudeCode: " .. reason, vim.log.levels.WARN)
         return finish(nil)
       end
-      local title = M.title(path, opts.cwd, "(deleted since HEAD)")
-      return finish(open_text_diff(opts.session_id, path, head, {}, title, opts.reuse))
+      local title = M.title(path, opts.cwd, "(deleted since " .. rev .. ")")
+      return finish(open_text_diff(opts.session_id, path, head, {}, title, opts.reuse, rev))
     end)
     return
   end
 
-  require("claudecode.agents.git").file_at_head(path, function(head)
-    -- Not in HEAD: untracked, or created since the last commit. Diffing against
-    -- nothing reads every line as an addition, which is what it is.
+  require("claudecode.agents.git").file_at_head(path, function(head, info)
+    local rev = info and info.rev or "HEAD"
+    -- Neither a repository nor a command that ran: diffing against nothing would
+    -- claim every line is new, which is not what anyone asked.
+    local reason = unreadable_reason(name, info)
+    if reason then
+      vim.notify("ClaudeCode: " .. reason, vim.log.levels.WARN)
+      return finish(nil)
+    end
+
+    -- Not committed: untracked, or added since. Diffing against nothing reads
+    -- every line as an addition, which is what it is.
     local before = head or {}
-    local title = M.title(path, opts.cwd, head and "(vs HEAD)" or "(new since HEAD)")
+    local title = M.title(path, opts.cwd, head and ("(vs " .. rev .. ")") or ("(new since " .. rev .. ")"))
 
     if head and M._same_lines(head, lines) then
-      vim.notify("ClaudeCode: " .. name .. " matches HEAD", vim.log.levels.INFO)
+      vim.notify("ClaudeCode: " .. name .. " matches " .. rev, vim.log.levels.INFO)
       return finish(nil)
     end
 
@@ -327,7 +355,7 @@ function M.open_against_head(opts, done)
         return finish(win)
       end
     end
-    return finish(open_text_diff(opts.session_id, path, before, lines, title, opts.reuse))
+    return finish(open_text_diff(opts.session_id, path, before, lines, title, opts.reuse, rev))
   end)
 end
 
