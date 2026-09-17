@@ -82,7 +82,26 @@ describe("agents.file_view", function()
     expect(win).not_to_be_nil()
     expect(#shown).to_be(1)
     -- The baseline is the file with the session's edit undone, not the file itself.
-    expect(shown[1].old_text).to_be("one\ntwo\nthree")
+    -- It ends in a newline, as unified.nvim reads the buffer's own text: without
+    -- one every diff marked the file's last line changed.
+    expect(shown[1].old_text).to_be("one\ntwo\nthree\n")
+  end)
+
+  it("shows every edit to a tab-indented file, not only those without a tab", function()
+    -- The CLI writes tabs in a patch as two spaces. Matched verbatim, the tabbed
+    -- hunk never located and the float showed only the other change.
+    install_unified()
+    disk["/proj/a.gd"] = { "func a():", "\tTWO", "ONE" }
+    histories["/proj/a.gd"] = {
+      hunks = { hunk(3, { "-one", "+ONE" }), hunk(1, { " func a():", "-  two", "+  TWO" }) },
+      created = false,
+      reads = {},
+    }
+
+    open({ session_id = "s", transcript = "/p/a.jsonl", path = "/proj/a.gd" })
+    expect(shown[1].old_text).to_be("func a():\n\ttwo\none\n")
+    local _, title = float_buf()
+    expect(title:find("still present", 1, true)).to_be_nil()
   end)
 
   it("diffs a file the session created against nothing, so it reads as all new", function()
@@ -278,7 +297,7 @@ describe("agents.file_view", function()
       local win = open_head("/proj/a.lua")
       expect(win).not_to_be_nil()
       expect(#shown).to_be(1)
-      expect(shown[1].old_text).to_be("one\ntwo\nthree")
+      expect(shown[1].old_text).to_be("one\ntwo\nthree\n")
       local _, title = float_buf()
       expect(title:find("vs HEAD", 1, true) ~= nil).to_be_true()
     end)

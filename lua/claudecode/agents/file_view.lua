@@ -191,7 +191,15 @@ local function open_inline_diff(session_id, path, lines, before, title, reuse)
     pcall(diff.ensure_unified_initialized)
   end
   local unified_diff = require("unified.diff")
-  if not pcall(unified_diff.show_against_text, buf, table.concat(before, "\n")) then
+  -- unified.nvim diffs against the buffer's text *with* its final newline whenever
+  -- 'endofline' is set, which a scratch buffer always has. A baseline without one
+  -- differed on its last line, so every diff marked the file's last line changed.
+  local base = table.concat(before, "\n")
+  local ok_eol, eol = pcall(vim.api.nvim_get_option_value, "endofline", { buf = buf })
+  if #before > 0 and (not ok_eol or eol ~= false) then
+    base = base .. "\n"
+  end
+  if not pcall(unified_diff.show_against_text, buf, base) then
     float.close(win)
     return nil
   end

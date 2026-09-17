@@ -764,6 +764,28 @@ describe("agents.transcript", function()
       expect(hist.created).to_be_false()
     end)
 
+    it("keeps the result's own text for removed lines the patch wrote tabs out of", function()
+      -- The patch has two spaces where oldString has the tab; the diff view puts
+      -- the removed line back from here.
+      put("/p/a.jsonl", {
+        vim.json.encode({
+          type = "user",
+          timestamp = "2026-08-02T20:19:59.000Z",
+          toolUseResult = {
+            filePath = "/proj/x.gd",
+            oldString = "\told()",
+            newString = "\tnew()",
+            structuredPatch = {
+              { oldStart = 1, oldLines = 1, newStart = 1, newLines = 1, lines = { "-  old()", "+  new()" } },
+            },
+          },
+        }),
+      })
+      local hist = history("/p/a.jsonl", "/proj/x.gd")
+      expect(#hist.hunks).to_be(1)
+      expect(hist.hunks[1].exact_old[1]).to_be("\told()")
+    end)
+
     it("marks a file the session created, which has no patch to diff", function()
       put("/p/a.jsonl", { write_create_line("/proj/new.lua", "a\nb\n") })
       local hist = history("/p/a.jsonl", "/proj/new.lua")

@@ -41,6 +41,7 @@
 ---@module 'claudecode.agents.transcript'
 
 local logger = require("claudecode.logger")
+local patch = require("claudecode.agents.patch")
 local tools = require("claudecode.agents.tools")
 
 local uv = vim.uv or vim.loop
@@ -122,7 +123,7 @@ local config = nil
 
 ---@class ClaudeCodeAgentsFileHistory What one session did to one file.
 ---@field path string The file.
----@field hunks table[] Every `structuredPatch` hunk for it, oldest edit first.
+---@field hunks table[] Every `structuredPatch` hunk for it, oldest edit first, annotated by `patch.annotate`.
 ---@field created boolean The session created the file (its first touch was a write with no patch).
 ---@field reads { start_line: integer, num_lines: integer, ts: number }[]
 ---@field content string|nil Content of the last `Write`, when the session wrote the whole file.
@@ -2172,6 +2173,9 @@ local function fold_history(hist, entry)
   if #hunks == 0 and type(result.content) == "string" and #hist.hunks == 0 then
     hist.created = true
   end
+  -- The patch writes tabs as spaces; the result's own strings do not, and they are
+  -- what lets the removed lines be put back as the file had them.
+  patch.annotate(hunks, result)
   for _, hunk in ipairs(hunks) do
     if type(hunk) == "table" and type(hunk.lines) == "table" then
       hist.hunks[#hist.hunks + 1] = hunk
