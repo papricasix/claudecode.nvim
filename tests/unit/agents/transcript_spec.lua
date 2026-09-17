@@ -540,6 +540,34 @@ describe("agents.transcript", function()
       expect(sum.events[1].num_lines).to_be(3)
     end)
 
+    it("names a file event by the call it answers", function()
+      -- The view holds the Activity pane's cursor on a row by this name while new
+      -- rows land above it. Two edits of one file in the same second are two rows,
+      -- and only the call id tells them apart.
+      local function answering(line, id)
+        local entry = vim.json.decode(line)
+        entry.message = { role = "user", content = { { type = "tool_result", tool_use_id = id, content = "ok" } } }
+        return vim.json.encode(entry)
+      end
+      put("/p/a.jsonl", {
+        answering(edit_line("/proj/x.lua", 1, 0), "toolu_e1"),
+        answering(edit_line("/proj/x.lua", 1, 0), "toolu_e2"),
+        answering(read_line("/proj/x.lua"), "toolu_r"),
+      })
+      local sum = fold("/p/a.jsonl")
+      expect(sum.events[1].tool_id).to_be("toolu_e1")
+      expect(sum.events[3].tool_id).to_be("toolu_r")
+      expect(transcript.event_key(sum.events[1])).to_be("toolu_e1")
+      expect(transcript.event_key(sum.events[1]) ~= transcript.event_key(sum.events[2])).to_be_true()
+    end)
+
+    it("names an event without a call id by what it did, where and when", function()
+      local edit = { ts = 5, kind = "edit", path = "/proj/x.lua" }
+      expect(transcript.event_key(edit)).to_be(transcript.event_key({ ts = 5, kind = "edit", path = "/proj/x.lua" }))
+      expect(transcript.event_key(edit) ~= transcript.event_key({ ts = 6, kind = "edit", path = "/proj/x.lua" })).to_be_true()
+      expect(transcript.event_key(edit) ~= transcript.event_key({ ts = 5, kind = "read", path = "/proj/x.lua" })).to_be_true()
+    end)
+
     it("records touched files in first-touch order", function()
       put("/p/a.jsonl", {
         edit_line("/proj/b.lua", 1, 0),

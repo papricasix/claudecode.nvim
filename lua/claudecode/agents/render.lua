@@ -9,12 +9,15 @@
 ---
 --- Alongside the lines, each render records what each row *is* (`payload_at`), so
 --- a keymap can act on the thing under the cursor without re-parsing the text it
---- just drew.
+--- just drew. Every payload carries a `key` naming its row within its pane — a
+--- session id, a tool call id, a path, a task id — which is how the view keeps a
+--- cursor on its row while repaints insert rows around it.
 ---@brief ]]
 ---@module 'claudecode.agents.render'
 
 local fade = require("claudecode.agents.fade")
 local tools = require("claudecode.agents.tools")
+local transcript = require("claudecode.agents.transcript")
 local utils = require("claudecode.utils")
 
 local M = {}
@@ -559,7 +562,7 @@ function M.sessions(buf, rows, opts)
 
     local lnum = index - 1
     lines[#lines + 1] = line
-    payload_map[index] = { session_id = row.session_id, kind = "session" }
+    payload_map[index] = { session_id = row.session_id, kind = "session", key = row.session_id }
 
     if row.selected then
       marks[#marks + 1] = { row = lnum, col = 0, end_col = #gutter, hl = hl("title") }
@@ -655,6 +658,7 @@ function M.feed(buf, events, opts)
         tool_id = event.tool_id,
         label = event.label,
         status = event.status,
+        key = transcript.event_key(event),
       }
     else
       -- The event's own kind and read window travel with the row: opening a read
@@ -665,6 +669,7 @@ function M.feed(buf, events, opts)
         event_kind = event.kind,
         start_line = event.start_line,
         num_lines = event.num_lines,
+        key = transcript.event_key(event),
       }
     end
 
@@ -726,7 +731,7 @@ function M.changes(buf, entries, opts)
 
     local lnum = index - 1
     lines[#lines + 1] = line
-    payload_map[index] = { kind = "file", path = entry.path, event_kind = entry.kind }
+    payload_map[index] = { kind = "file", path = entry.path, event_kind = entry.kind, key = entry.path }
 
     if entry.deleted then
       -- Dimmed whole, counts included: their coloured blocks and flashes are for
@@ -843,13 +848,25 @@ function M.subagents(buf, rows, opts)
         tool_id = row.tool_id,
         transcript = row.transcript,
         description = row.description,
+        key = "shell\0" .. tostring(row.id),
       }
     elseif is_workflow then
-      payload_map[index] = { kind = "workflow", task_id = row.id, description = row.description }
+      payload_map[index] = {
+        kind = "workflow",
+        task_id = row.id,
+        description = row.description,
+        key = "workflow\0" .. tostring(row.id),
+      }
     else
       -- `path` is set for a workflow's agent, whose transcript is not where a
       -- session's own subagents are.
-      payload_map[index] = { kind = "subagent", agent_id = row.id, path = row.path, description = row.description }
+      payload_map[index] = {
+        kind = "subagent",
+        agent_id = row.id,
+        path = row.path,
+        description = row.description,
+        key = "subagent\0" .. tostring(row.id),
+      }
     end
 
     local prefix_at = #GUTTER

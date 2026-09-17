@@ -429,6 +429,46 @@ describe("agents.render", function()
     end)
   end)
 
+  describe("row keys", function()
+    -- The view keeps each pane's cursor on its row by these. A repaint keeps the
+    -- cursor on its line, so a row landing above it slid another under it.
+    it("names an Activity row by its call, wherever it is drawn", function()
+      local feed = render.create_buf("feed")
+      local edit = { ts = 1, kind = "edit", path = "/proj/a.lua", tool_id = "toolu_e" }
+      local bash = { ts = 2, kind = "tool", tool = "Bash", label = "ls", tool_id = "toolu_b", status = "done" }
+      render.feed(feed, { bash, edit }, { width = 40 })
+      expect(render.payload_at(feed, 2).key).to_be("toolu_e")
+
+      render.feed(feed, { { ts = 3, kind = "read", path = "/proj/b.lua", tool_id = "toolu_r" }, bash, edit }, {
+        width = 40,
+      })
+      expect(render.payload_at(feed, 2).key).to_be("toolu_b")
+      expect(render.payload_at(feed, 3).key).to_be("toolu_e")
+    end)
+
+    it("names a session by its id and a changed file by its path", function()
+      local sessions = render.create_buf("sessions")
+      render.sessions(sessions, { { session_id = "aaaa1111", title = "First" } }, { width = 40 })
+      expect(render.payload_at(sessions, 1).key).to_be("aaaa1111")
+
+      local changes = render.create_buf("changes")
+      render.changes(changes, { { path = "/proj/a.lua", added = 1, removed = 0 } }, { width = 40 })
+      expect(render.payload_at(changes, 1).key).to_be("/proj/a.lua")
+    end)
+
+    it("names a task by its kind as well as its id", function()
+      local pane = render.create_buf("subagents")
+      render.subagents(pane, {
+        { id = "x1", kind = "subagent", agent_type = "Explore", prefix = "", state = "done" },
+        { id = "x1", kind = "shell", agent_type = "Bash", prefix = "", state = "done" },
+        { id = "x1", kind = "workflow", agent_type = "review", prefix = "", state = "done" },
+      }, { width = 40 })
+      local subagent, shell, workflow =
+        render.payload_at(pane, 1).key, render.payload_at(pane, 2).key, render.payload_at(pane, 3).key
+      expect(subagent ~= shell and shell ~= workflow and subagent ~= workflow).to_be_true()
+    end)
+  end)
+
   describe("the leading blank cell", function()
     -- A word-highlight plugin (mini.cursorword, vim-illuminate, ...) paints every
     -- other occurrence of the word under the cursor. Parked in column 1 of a list

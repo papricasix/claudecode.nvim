@@ -118,7 +118,7 @@ local config = nil
 ---@field num_lines integer|nil How many lines that read covered.
 ---@field tool string|nil `tool` events: the tool's own name, e.g. `Bash`.
 ---@field label string|nil `tool` events: one line naming what the call was for.
----@field tool_id string|nil `tool` events: the `toolu_…` id its result is joined by.
+---@field tool_id string|nil The `toolu_…` id of the call: what a `tool` event's result is joined by, and what names a file event's row (see `event_key`).
 ---@field status "running"|"done"|"error"|"interrupted"|"rejected"|nil `tool` events; see `resolve_tool`.
 
 ---@class ClaudeCodeAgentsFileHistory What one session did to one file.
@@ -965,6 +965,23 @@ local function note_task_stop(sum, line)
   end
 end
 
+---The `toolu_…` id of the call a result entry answers.
+---@param entry table Decoded transcript line.
+---@return string|nil
+local function result_tool_id(entry)
+  local message = entry.message
+  local content = type(message) == "table" and message.content or nil
+  if type(content) ~= "table" then
+    return nil
+  end
+  for _, block in ipairs(content) do
+    if type(block) == "table" and block.type == "tool_result" and type(block.tool_use_id) == "string" then
+      return block.tool_use_id
+    end
+  end
+  return nil
+end
+
 ---Fold one decoded `toolUseResult` entry into the summary.
 ---@param sum ClaudeCodeAgentsSummary
 ---@param entry table Decoded transcript line.
@@ -974,6 +991,7 @@ local function fold_result(sum, entry)
   if type(result) ~= "table" then
     return false
   end
+  local tool_id = result_tool_id(entry)
   local ts = M._iso_to_epoch(entry.timestamp)
   if ts > sum.last_ts then
     sum.last_ts = ts
@@ -992,6 +1010,7 @@ local function fold_result(sum, entry)
       removed = 0,
       start_line = tonumber(result.file.startLine),
       num_lines = tonumber(result.file.numLines),
+      tool_id = tool_id,
     })
     return true
   end
@@ -1014,7 +1033,7 @@ local function fold_result(sum, entry)
   touch_file(sum, result.filePath, kind, added, removed, ts)
   sum.added = sum.added + added
   sum.removed = sum.removed + removed
-  push_event(sum, { ts = ts, kind = kind, path = result.filePath, added = added, removed = removed })
+  push_event(sum, { ts = ts, kind = kind, path = result.filePath, added = added, removed = removed, tool_id = tool_id })
   return true
 end
 
@@ -1723,6 +1742,22 @@ end
 function M.events(path)
   local sum = cache[path]
   return sum and sum.events or {}
+end
+
+---A name for an Activity event that stays the same while rows move around it.
+---
+---The view holds its cursor on a row by this rather than by its line: the pane is
+---newest first, so every event that lands pushes the rest down one. The call's
+---`toolu_…` id is unique for both kinds of row. An event folded from a line that
+---carries none falls back to what it did, where and when, which can repeat — the
+---view settles a tie by taking the row nearest to where the cursor was.
+---@param event ClaudeCodeAgentsEvent
+---@return string
+function M.event_key(event)
+  if type(event.tool_id) == "string" then
+    return event.tool_id
+  end
+  return table.concat({ event.kind or "", event.path or "", tostring(event.ts or 0) }, "\0")
 end
 
 --------------------------------------------------------------------------------

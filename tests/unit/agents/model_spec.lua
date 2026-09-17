@@ -86,6 +86,9 @@ describe("agents.model", function()
       session_path = function(_, id)
         return "/p/" .. id .. ".jsonl"
       end,
+      event_key = function(event)
+        return event.tool_id or event.path
+      end,
       -- The real rule is the transcript spec's to pin down; this only has to
       -- tell the model's two kinds of path apart.
       is_scratchpad = function(path)
@@ -659,6 +662,29 @@ describe("agents.model", function()
       expect(#feed).to_be(2)
       expect(feed[1].path).to_be("/proj/third.lua") -- the oldest is what is dropped
       expect(feed[2].path).to_be("/proj/second.lua")
+    end)
+
+    it("draws a row someone holds however far new events have pushed it, and no further", function()
+      -- The view keeps the Activity cursor on its row as events land above it. Cut
+      -- to what the pane shows, the row fell out of the list after a screenful,
+      -- and the cursor with it.
+      local events = {}
+      for n = 1, 10 do
+        events[n] = { ts = n, kind = "tool", tool = "Bash", label = "call " .. n, tool_id = "t" .. n }
+      end
+      summaries.aaa.events = events
+      model.select("aaa")
+
+      expect(#model.feed(3)).to_be(3)
+      local feed = model.feed(3, { t4 = true })
+      expect(#feed).to_be(7)
+      expect(feed[7].tool_id).to_be("t4")
+      -- Held rows already on screen cost nothing extra.
+      expect(#model.feed(3, { t9 = true })).to_be(3)
+
+      -- A row that is not there at all is looked for as far as the store keeps.
+      model.setup({ agents = { enabled = true, feed_limit = 6 } })
+      expect(#model.feed(3, { gone = true })).to_be(6)
     end)
 
     describe("the activity filter", function()

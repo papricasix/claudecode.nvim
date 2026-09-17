@@ -1211,23 +1211,38 @@ end
 ---them the other way up, which is how they are read. What an agent is doing now
 ---is the question the pane answers, and appending puts that answer at the bottom
 ---edge — scrolled out of sight the moment the session has any history.
----`visible` is how many rows the pane can actually show. Everything past that is
----unreachable — the pane is drawn newest-first and a wholesale repaint resets any
----scroll — so building and stamping them is work thrown away on every frame. On
----real data that is ~240 rows down to ~40. `feed_limit` still bounds what the
----store keeps; this bounds what is drawn from it.
+---`visible` is how many rows the pane can actually show. Rows past that are only
+---reached by scrolling down, and the pane is read from the top, so building and
+---stamping them is work thrown away on every frame. On real data that is ~240
+---rows down to ~40. `feed_limit` still bounds what the store keeps; this bounds
+---what is drawn from it.
+---
+---**Except the rows someone is holding on to** (`keep`): the one under the pane's
+---cursor and the ones a float is showing. The view keeps its cursor on a row while
+---new ones land above it, and a row that fell out of the drawn list would take the
+---cursor's place in the list with it — and with it the row `<C-n>` steps from.
+---So the walk goes on past `visible` until each kept row is drawn, and never past
+---`feed_limit`.
 ---@param visible integer|nil Rows the pane can show. Unbounded when omitted.
+---@param keep table<string, true>|nil `transcript.event_key`s to draw however far down they are.
 ---@return table[] events The transcript's own tables, newest first.
 ---@return number[] ages Milliseconds each has been on screen, by position.
-function M.feed(visible)
+function M.feed(visible, keep)
   local row = state.selected and state.by_id[state.selected]
   if not row then
     return {}, {}
   end
   local events = transcript.events(row.path)
-  local limit = opts().feed_limit or 500
+  local ceiling = opts().feed_limit or 500
+  local limit = ceiling
   if type(visible) == "number" and visible > 0 and visible < limit then
     limit = visible
+  end
+  -- A copy, emptied as rows are found, so the walk knows when it may stop.
+  local missing, pending = 0, {}
+  for key in pairs(keep or {}) do
+    pending[key] = true
+    missing = missing + 1
   end
   local filter = state.feed_filter
   local out = {}
@@ -1239,9 +1254,16 @@ function M.feed(visible)
     local event = events[index]
     local is_tool = event.kind == "tool"
     if filter == "all" or (filter == "tools") == is_tool then
-      out[#out + 1] = event
-      if #out >= limit then
+      if #out >= limit and (missing == 0 or #out >= ceiling) then
         break
+      end
+      out[#out + 1] = event
+      if missing > 0 then
+        local key = transcript.event_key(event)
+        if pending[key] then
+          pending[key] = nil
+          missing = missing - 1
+        end
       end
     end
   end

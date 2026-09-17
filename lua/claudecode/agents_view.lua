@@ -80,9 +80,11 @@ local state = {
   --- stopped session, cleared the moment a terminal takes the centre back.
   pending_start = nil, ---@type string|nil
   --- What each open row-float is a view of, so its own `<C-n>`/`<C-p>` can step
-  --- through the pane it came from: [win] = { pane, action, lnum, aim, opening }.
-  --- `aim` is where the stepping has got to, and runs ahead of `lnum` — the row
-  --- actually on screen — while an open is in flight.
+  --- through the pane it came from: [win] = { pane, action, key, lnum, aim_key,
+  --- aim, opening }. `aim` is where the stepping has got to, and runs ahead of the
+  --- row actually on screen while an open is in flight. Rows are named by their
+  --- `key`; `lnum` and `aim` are only where those rows were last seen, since rows
+  --- landing above one move it down the pane.
   float_nav = {}, ---@type table<integer, table>
   --- Set from `open` until the first session list arrives and one is offered.
   await_initial = false,
@@ -91,6 +93,10 @@ local state = {
   --- only becomes reachable later — a new agent has no row until its first
   --- message — without fighting the user's own cursor while it has not changed.
   cursor_selection = nil, ---@type string|nil
+  --- The session the Activity, Changes and Tasks panes were last painted for. Their
+  --- cursors keep their rows only while it stays the same: after a selection
+  --- change the rows are another conversation's.
+  rows_session = nil, ---@type string|nil
 }
 
 --- A record from a restored Neovim session, waiting to be claimed when the view
@@ -110,8 +116,8 @@ local PANES = { "center", "sessions", "feed", "changes", "subagents" }
 local SIZE_SNAPSHOT_MS = 1000
 
 --- Rows drawn beyond what the Activity pane can show. Slack, not scrollback: the
---- pane repaints wholesale on every frame, so anything below the fold is
---- unreachable anyway.
+--- pane is read from the top, and a row further down is drawn only while
+--- something holds on to it (see `model.feed`).
 local FEED_OVERDRAW = 5
 
 ---@return table
@@ -1884,6 +1890,112 @@ local function anything_moving(rows, ages)
   return false
 end
 
+--------------------------------------------------------------------------------
+-- Keeping a cursor on its row
+--
+-- A repaint replaces a pane's lines wholesale, and Neovim keeps the cursor on the
+-- same *line* — so a row landing above it slides a different row under the cursor.
+-- In Activity that is every new event (the pane is newest first), in Changes a
+-- file first read and then edited, in Tasks a shell started inside a subagent. The
+-- cursor is the only selection these panes have, and `<CR>`, `.` and a float's
+-- stepping all act on it, so each pane's cursor is held by its row's `key`
+-- (`render` gives every payload one) and put back on that row after the paint.
+--------------------------------------------------------------------------------
+
+---The row a pane's cursor is on, before a repaint moves rows around it.
+---@param pane string
+---@return { key: string, lnum: integer }|nil
+local function cursor_row(pane)
+  local win, buf = pane_win(pane), state.bufs[pane]
+  if not win or not buf then
+    return nil
+  end
+  local ok, pos = pcall(vim.api.nvim_win_get_cursor, win)
+  local payload = ok and pos and render.payload_at(buf, pos[1]) or nil
+  if not payload or payload.key == nil then
+    return nil
+  end
+  return { key = payload.key, lnum = pos[1] }
+end
+
+---Which line of a pane a row is on now.
+---
+---A key can repeat — an Activity event folded without a call id is named by what
+---it did, where and when — so a tie goes to the line nearest `near`, where the
+---row was last seen.
+---@param pane string
+---@param key string|nil
+---@param near integer|nil
+---@return integer|nil lnum
+local function find_row(pane, key, near)
+  local buf = state.bufs[pane]
+  if key == nil or not buf or not vim.api.nvim_buf_is_valid(buf) then
+    return nil
+  end
+  near = near or 1
+  local best = nil
+  for lnum = 1, vim.api.nvim_buf_line_count(buf) do
+    local payload = render.payload_at(buf, lnum)
+    if payload and payload.key == key and (not best or math.abs(lnum - near) < math.abs(best - near)) then
+      best = lnum
+    end
+  end
+  return best
+end
+
+---Put a pane's cursor back on the row `cursor_row` found it on. A row the paint
+---no longer draws leaves the cursor on its line.
+---@param pane string
+---@param held { key: string, lnum: integer }|nil
+local function restore_cursor_row(pane, held)
+  if not held then
+    return
+  end
+  local win = pane_win(pane)
+  local lnum = win and find_row(pane, held.key, held.lnum)
+  if lnum and lnum ~= held.lnum then
+    pcall(vim.api.nvim_win_set_cursor, win, { lnum, 0 })
+  end
+end
+
+---The rows of a pane that an open float is showing or stepping towards.
+---@param pane string
+---@return table<string, true>
+local function float_rows(pane)
+  local keys = {}
+  for win, nav in pairs(state.float_nav) do
+    if nav.pane == pane and vim.api.nvim_win_is_valid(win) then
+      if nav.key ~= nil then
+        keys[nav.key] = true
+      end
+      if nav.aim_key ~= nil then
+        keys[nav.aim_key] = true
+      end
+    end
+  end
+  return keys
+end
+
+---Let go of a float's row once its pane no longer draws it.
+---
+---Its stepping then goes from the line the row was last seen on, as it did before
+---rows had names. Mostly this is the Activity filter hiding the row; the cost it
+---saves is `model.feed` walking the whole history on every frame for a row that
+---is not there.
+---@param pane string
+local function drop_lost_float_rows(pane)
+  for _, nav in pairs(state.float_nav) do
+    if nav.pane == pane then
+      if nav.key ~= nil and not find_row(pane, nav.key, nav.lnum) then
+        nav.key = nil
+      end
+      if nav.aim_key ~= nil and not find_row(pane, nav.aim_key, nav.aim) then
+        nav.aim_key = nil
+      end
+    end
+  end
+end
+
 function M.redraw()
   if not M.is_open() then
     return
@@ -1918,12 +2030,7 @@ function M.redraw()
     -- cosmetic — `<CR>`, `x` and `dd` act on the row under the cursor, and
     -- `cursorline` paints it exactly like the selection, so a session that had
     -- merely done something looked like the selected one.
-    local anchor = nil
-    local ok_cursor, pos = pcall(vim.api.nvim_win_get_cursor, sessions_win)
-    if ok_cursor and pos then
-      local payload = render.payload_at(state.bufs.sessions, pos[1])
-      anchor = payload and payload.session_id or nil
-    end
+    local held = cursor_row("sessions")
 
     rows = model.rows()
     render.sessions(state.bufs.sessions, rows, {
@@ -1948,18 +2055,39 @@ function M.redraw()
       end
     end
 
-    if anchor and not followed then
-      reveal_session(anchor)
+    if not followed then
+      restore_cursor_row("sessions", held)
     end
   end
 
+  -- The panes below show the selected session's rows, and a row is only the same
+  -- row within one conversation: after a selection change the cursor is left on
+  -- its line, as it always was.
+  local rows_session = model.selected()
+  local same_session = rows_session ~= nil and rows_session == state.rows_session
+  state.rows_session = rows_session
+
   local feed_win = pane_win("feed")
   if feed_win and state.bufs.feed then
+    local held = same_session and cursor_row("feed") or nil
+    local keep = same_session and float_rows("feed") or {}
+    -- The top row is the newest, and a cursor left there is watching whatever is
+    -- newest, so it stays on the top row as events land — the pane is glanced at
+    -- for what the agent is doing now, and holding the row would scroll that out
+    -- of sight a screenful later. Any other row is one the user went to, and a
+    -- top row a float is showing is the one that float's `<C-n>` steps from.
+    if held and held.lnum == 1 and not keep[held.key] then
+      held = nil
+    end
+    if held then
+      keep[held.key] = true
+    end
     -- Only what the pane can show, plus a little slack so a row is not missing
-    -- if the window grows between the measurement and the paint.
+    -- if the window grows between the measurement and the paint — and whatever is
+    -- held, however far down new events have pushed it.
     local visible = vim.api.nvim_win_get_height(feed_win) + FEED_OVERDRAW
     local events
-    events, ages = model.feed(visible)
+    events, ages = model.feed(visible, next(keep) ~= nil and keep or nil)
     -- A caller (or a spec) may hand back events without ages; the pane then just
     -- draws them at their resting colour.
     ages = ages or {}
@@ -1968,22 +2096,36 @@ function M.redraw()
       cwd = model.selected_cwd(),
       ages = ages,
     })
+    if same_session then
+      restore_cursor_row("feed", held)
+      drop_lost_float_rows("feed")
+    end
   end
 
   local changes_win = pane_win("changes")
   if changes_win and state.bufs.changes then
+    local held = same_session and cursor_row("changes") or nil
     render.changes(state.bufs.changes, model.changes(), {
       width = vim.api.nvim_win_get_width(changes_win),
       cwd = model.selected_cwd(),
     })
+    if same_session then
+      restore_cursor_row("changes", held)
+      drop_lost_float_rows("changes")
+    end
   end
 
   local subagents_win = pane_win("subagents")
   if subagents_win and state.bufs.subagents then
+    local held = same_session and cursor_row("subagents") or nil
     render.subagents(state.bufs.subagents, model.subagents(), {
       width = vim.api.nvim_win_get_width(subagents_win),
       label = subagent_label(),
     })
+    if same_session then
+      restore_cursor_row("subagents", held)
+      drop_lost_float_rows("subagents")
+    end
   end
 
   -- Hand the animation clock back when nothing on screen is going to change, and
@@ -2659,20 +2801,35 @@ end
 ---as fast as the key repeats and opens the row it settled on, instead of firing
 ---an asynchronous transcript read per keypress and letting them land in whatever
 ---order they finish.
+---
+---The aim is looked up by its row, not its line: an open takes a transcript read,
+---and a row that lands meanwhile moves the aimed one down.
 ---@param win integer
 local function open_aimed(win)
   local nav = state.float_nav[win]
-  if not nav or nav.opening or nav.aim == nil or nav.aim == nav.lnum then
+  if not nav or nav.opening or nav.aim == nil then
+    return
+  end
+  local at = find_row(nav.pane, nav.aim_key, nav.aim) or nav.aim
+  -- Rows compared by name while both have one; a name let go of (see
+  -- `drop_lost_float_rows`) falls back to comparing where they were last seen.
+  local on_screen
+  if nav.aim_key ~= nil and nav.key ~= nil then
+    on_screen = nav.aim_key == nav.key
+  else
+    on_screen = at == (find_row(nav.pane, nav.key, nav.lnum) or nav.lnum)
+  end
+  if on_screen then
     return
   end
   local buf = state.bufs[nav.pane]
-  local payload = buf and render.payload_at(buf, nav.aim)
+  local payload = buf and render.payload_at(buf, at)
   if not payload then
-    nav.aim = nav.lnum
+    nav.aim, nav.aim_key = nav.lnum, nav.key
     return
   end
 
-  local wanted = nav.aim
+  local wanted, wanted_key = at, payload.key
   nav.opening = true
   open_row(payload, nav.pane, wanted, nav.action, {
     reuse = win,
@@ -2681,10 +2838,10 @@ local function open_aimed(win)
       if not new_win then
         -- Nothing opened — a file that matches HEAD, say. Stay on what is on
         -- screen rather than chasing an aim that has no view behind it.
-        nav.aim = nav.lnum
+        nav.aim, nav.aim_key = nav.lnum, nav.key
         return
       end
-      nav.lnum = wanted
+      nav.lnum, nav.key = wanted, wanted_key
       if new_win ~= win then
         -- The float could not be reused (the user closed it), so a new one was
         -- built. Move the state across, or the next key would step a dead window.
@@ -2704,13 +2861,19 @@ local function step_float(win, delta)
   if not nav then
     return
   end
-  local target = next_open_row(nav.pane, nav.aim or nav.lnum, delta, nav.action)
+  -- From where the aimed row is *now*. Its old line holds whatever row has been
+  -- pushed there since, and stepping from that is how `<C-n>` came to skip past
+  -- the row the float was showing, or land back on it.
+  local from = find_row(nav.pane, nav.aim_key, nav.aim) or nav.aim or nav.lnum
+  local target = next_open_row(nav.pane, from, delta, nav.action)
   if not target then
     return
   end
   -- The aim moves on the keypress, the window follows when it can: that is what
   -- makes holding the key feel like scrolling a list rather than opening files.
-  nav.aim = target
+  local buf = state.bufs[nav.pane]
+  local payload = buf and render.payload_at(buf, target)
+  nav.aim, nav.aim_key = target, payload and payload.key or nil
   -- Move the pane's own cursor with it: the float is a view of a row, so that is
   -- the row the pane should be sitting on when the float closes.
   local pane_window = pane_win(nav.pane)
@@ -2734,7 +2897,8 @@ end
 ---@param pane string|nil
 ---@param lnum integer|nil
 ---@param action string
-local function bind_float_nav(win, pane, lnum, action)
+---@param key string|nil The row's `key`, which is what finds it again once rows have moved.
+local function bind_float_nav(win, pane, lnum, action, key)
   if not win or not pane or not lnum or not vim.api.nvim_win_is_valid(win) then
     return
   end
@@ -2749,12 +2913,16 @@ local function bind_float_nav(win, pane, lnum, action)
 
   local nav = state.float_nav[win]
   if nav then
-    nav.pane, nav.action, nav.lnum = pane, action, lnum
+    nav.pane, nav.action, nav.lnum, nav.key = pane, action, lnum, key
     -- Deliberately not `nav.aim = lnum`: the aim may have moved on while this
     -- open was in flight, and that later keypress is the one to honour.
     nav.aim = nav.aim or lnum
+    if nav.aim_key == nil and nav.aim == lnum then
+      nav.aim_key = key
+    end
   else
-    state.float_nav[win] = { pane = pane, action = action, lnum = lnum, aim = lnum, opening = false }
+    state.float_nav[win] =
+      { pane = pane, action = action, key = key, lnum = lnum, aim_key = key, aim = lnum, opening = false }
   end
 
   local keys = keymaps()
@@ -2806,11 +2974,12 @@ end
 ---@param nav_opts { reuse: integer?, done: fun(win: integer|nil)? }|nil
 function open_row(payload, pane, lnum, action, nav_opts)
   nav_opts = nav_opts or {}
+  local key = payload and payload.key or nil
   ---Every exit runs through here, so a caller waiting on the open (the stepping
   ---above) is told even when nothing opened, rather than waiting for ever.
   ---@param win integer|nil
   local function opened(win)
-    bind_float_nav(win, pane, lnum, action)
+    bind_float_nav(win, pane, lnum, action, key)
     if nav_opts.done then
       nav_opts.done(win)
     end
@@ -2841,7 +3010,7 @@ function open_row(payload, pane, lnum, action, nav_opts)
       -- A running foreground command's float swaps to the finished call in place;
       -- the stepping keys go with it.
       on_handoff = function(win)
-        bind_float_nav(win, pane, lnum, action)
+        bind_float_nav(win, pane, lnum, action, key)
       end,
     }, opened)
     return
@@ -2907,7 +3076,7 @@ function open_row(payload, pane, lnum, action, nav_opts)
       reuse = nav_opts.reuse,
       row_for = subagent_row_for(session_path),
       on_open = function(win)
-        bind_float_nav(win, pane, lnum, action)
+        bind_float_nav(win, pane, lnum, action, key)
       end,
     }, opened)
     return
@@ -3380,6 +3549,7 @@ function M.forget()
   -- The next `open` places the cursor from scratch; carrying this over would let
   -- an unchanged selection skip that.
   state.cursor_selection = nil
+  state.rows_session = nil
   -- The snapshot describes a layout that no longer exists; carrying it into the
   -- next `open` would restore the previous view's proportions over the fresh
   -- build.

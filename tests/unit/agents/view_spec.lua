@@ -1330,6 +1330,192 @@ describe("agents_view", function()
     end)
   end)
 
+  describe("keeping a pane's cursor on its row", function()
+    -- A repaint keeps the cursor on its *line*, so a row landing above it slid a
+    -- different row under the cursor — and `<C-n>` in a float stepped from there.
+    local render, events, changes, tasks, selected, kept, opened
+
+    local function tool(n)
+      return { ts = n, kind = "tool", tool = "Bash", label = "call " .. n, tool_id = "t" .. n, status = "done" }
+    end
+
+    local function file(path)
+      return { path = path, added = 1, removed = 0 }
+    end
+
+    local function task(id)
+      return { id = id, kind = "subagent", agent_type = "Explore", prefix = "", state = "done" }
+    end
+
+    local function cursor(pane)
+      return vim.api.nvim_win_get_cursor(agents_view._state().wins[pane])[1]
+    end
+
+    local function put_cursor(pane, lnum)
+      vim.api.nvim_win_set_cursor(agents_view._state().wins[pane], { lnum, 0 })
+    end
+
+    local function key_at(pane, lnum)
+      return render.payload_at(agents_view._state().bufs[pane], lnum).key
+    end
+
+    before_each(function()
+      events = { tool(1), tool(2), tool(3), tool(4) }
+      changes = { file("/proj/a.lua"), file("/proj/c.lua") }
+      tasks = { task("s1"), task("s3") }
+      selected, kept, opened = "aaa", nil, {}
+
+      package.loaded["claudecode.agents.model"] = {
+        setup = function() end,
+        on_change = function() end,
+        attach = function() end,
+        detach = function() end,
+        cwd = function()
+          return "/proj"
+        end,
+        selected_cwd = function()
+          return "/proj"
+        end,
+        selected = function()
+          return selected
+        end,
+        transcript_path = function()
+          return "/store/" .. selected .. ".jsonl"
+        end,
+        rows = function()
+          return {}
+        end,
+        -- Newest first, like the real one, and never cut: what the view asks to
+        -- keep is recorded instead.
+        feed = function(_, keep)
+          kept = keep
+          local out = {}
+          for index = #events, 1, -1 do
+            out[#out + 1] = events[index]
+          end
+          return out, {}
+        end,
+        changes = function()
+          return changes
+        end,
+        subagents = function()
+          return tasks
+        end,
+        hidden_count = function()
+          return 0
+        end,
+        window = function()
+          return { key = "2w", label = "Last 2 weeks" }
+        end,
+        refresh_list = function() end,
+        refresh_git = function() end,
+        set_armed = function() end,
+      }
+      package.loaded["claudecode.agents.tool_view"] = {
+        open = function(opts, done)
+          opened[#opened + 1] = opts.tool_id
+          local win = opts.reuse
+          if not (win and vim.api.nvim_win_is_valid(win)) then
+            local buf = vim.api.nvim_create_buf(false, true)
+            vim.api.nvim_buf_set_option(buf, "buftype", "nofile")
+            win = vim.api.nvim_open_win(buf, false, { relative = "editor", width = 10, height = 5, row = 1, col = 1 })
+          end
+          done(win)
+        end,
+      }
+
+      package.loaded["claudecode.agents_view"] = nil
+      agents_view = require("claudecode.agents_view")
+      agents_view.setup(base_config({
+        enabled = true,
+        keymaps = { next_session = "<C-n>", prev_session = "<C-p>" },
+      }))
+      expect(agents_view.open()).to_be_true()
+      render = require("claudecode.agents.render")
+      -- The first paint for a session places nothing; rows are held from then on.
+      agents_view.redraw()
+    end)
+
+    after_each(function()
+      agents_view.close()
+      for _, name in ipairs({ "model", "tool_view" }) do
+        package.loaded["claudecode.agents." .. name] = nil
+      end
+      package.loaded["claudecode.agents_view"] = nil
+    end)
+
+    it("keeps an Activity row under the cursor as newer events land above it", function()
+      put_cursor("feed", 3)
+      expect(key_at("feed", 3)).to_be("t2")
+      events[#events + 1] = tool(5)
+      agents_view.redraw()
+      expect(cursor("feed")).to_be(4)
+      expect(key_at("feed", 4)).to_be("t2")
+      -- However far down new events push it, the feed is asked to still draw it.
+      expect(kept.t2).to_be_true()
+    end)
+
+    it("leaves a cursor on the top Activity row watching the newest", function()
+      put_cursor("feed", 1)
+      events[#events + 1] = tool(5)
+      agents_view.redraw()
+      expect(cursor("feed")).to_be(1)
+      expect(key_at("feed", 1)).to_be("t5")
+      expect(kept).to_be_nil()
+    end)
+
+    it("keeps a Changes row when a file is listed above it, top row included", function()
+      put_cursor("changes", 2)
+      table.insert(changes, 2, file("/proj/b.lua"))
+      agents_view.redraw()
+      expect(cursor("changes")).to_be(3)
+      expect(key_at("changes", 3)).to_be("/proj/c.lua")
+
+      put_cursor("changes", 1)
+      table.insert(changes, 1, file("/proj/0.lua"))
+      agents_view.redraw()
+      expect(cursor("changes")).to_be(2)
+    end)
+
+    it("keeps a Tasks row when a run is started above it", function()
+      put_cursor("subagents", 2)
+      table.insert(tasks, 2, task("s2"))
+      agents_view.redraw()
+      expect(cursor("subagents")).to_be(3)
+    end)
+
+    it("leaves the cursor on its line when another session is selected", function()
+      -- Its rows are another conversation's, even where a path is the same.
+      put_cursor("changes", 2)
+      selected = "bbb"
+      changes = { file("/proj/b.lua"), file("/proj/x.lua"), file("/proj/c.lua") }
+      agents_view.redraw()
+      expect(cursor("changes")).to_be(2)
+    end)
+
+    it("steps a float from the row it shows, after rows landed above that row", function()
+      local wins = agents_view._state().wins
+      vim.api.nvim_set_current_win(wins.feed)
+      put_cursor("feed", 1)
+      agents_view.open_under_cursor()
+      expect(opened[1]).to_be("t4")
+
+      events[#events + 1] = tool(5)
+      agents_view.redraw()
+      -- The top row is watching the newest, unless a float is showing it.
+      expect(cursor("feed")).to_be(2)
+
+      vim._keymaps.n["<C-n>"].rhs()
+      expect(opened[2]).to_be("t3") -- not t4 again, which is where line 2 now is
+      expect(cursor("feed")).to_be(3)
+
+      events[#events + 1] = tool(6)
+      agents_view.redraw()
+      vim._keymaps.n["<C-p>"].rhs()
+      expect(opened[3]).to_be("t4") -- not t5, which is where line 2 now is
+    end)
+  end)
+
   describe("`gf` on a Changes or Activity row", function()
     local render, payload, tmp
 
