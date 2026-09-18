@@ -218,6 +218,20 @@ describe("agents.transcript", function()
     end)
   end)
 
+  describe("staleness", function()
+    it("says a transcript has moved on when its size or mtime has, by stat alone", function()
+      put("/p/a.jsonl", { edit_line("/proj/x.lua", 1, 0) })
+      expect(transcript.stale("/p/a.jsonl")).to_be_true() -- never folded
+      fold("/p/a.jsonl")
+      local read_count = #reads
+      expect(transcript.stale("/p/a.jsonl")).to_be(false)
+      append("/p/a.jsonl", { edit_line("/proj/y.lua", 1, 0) })
+      expect(transcript.stale("/p/a.jsonl")).to_be_true()
+      expect(#reads).to_be(read_count) -- nothing was read to answer
+      expect(transcript.stale("/p/missing.jsonl")).to_be(false)
+    end)
+  end)
+
   describe("prefiltering", function()
     it("never decodes a Bash result", function()
       put("/p/a.jsonl", { bash_line(), bash_line(), bash_line() })

@@ -11,6 +11,7 @@ describe("agents.model", function()
   local git_result -- what the stubbed `git status` answers
   local scheduled -- pending scheduler callbacks
   local deleted -- transcripts the stubbed store was asked to remove
+  local stale -- transcripts the stubbed store says have grown since their fold
 
   local function summary_for(id, fields)
     return vim.tbl_extend("force", {
@@ -28,7 +29,7 @@ describe("agents.model", function()
   end
 
   local function stub_modules()
-    summaries, scans, live, git_calls, scheduled, deleted = {}, {}, {}, 0, {}, {}
+    summaries, scans, live, git_calls, scheduled, deleted, stale = {}, {}, {}, 0, {}, {}, {}
     git_result = {}
 
     package.loaded["claudecode.agents.transcript"] = {
@@ -66,6 +67,9 @@ describe("agents.model", function()
           end
         end
         return nil
+      end,
+      stale = function(path)
+        return stale[path] == true
       end,
       delete = function(path)
         deleted[#deleted + 1] = path
@@ -1316,6 +1320,27 @@ describe("agents.model", function()
       tick()
 
       expect(#model.rows()).to_be(2)
+    end)
+
+    it("re-reads the selected transcript when the file has grown, even in hooks mode", function()
+      -- A hook says a tool returned; the CLI may write its line a beat later, or
+      -- the hook may never arrive. The panes are drawn from the file, so the
+      -- file is what the tick has to ask about — a stat, not a read.
+      summaries.aaa = summary_for("aaa")
+      model.attach(1, "/proj")
+      model.select("aaa")
+      model.request_refresh()
+      tick() -- drain the read that selecting legitimately asks for
+      scans = {}
+
+      model.poll({ list_only = true })
+      tick()
+      expect(#scans).to_be(0)
+
+      stale["/p/aaa.jsonl"] = true
+      model.poll({ list_only = true })
+      tick()
+      expect(scans[1]).to_be("/p/aaa.jsonl")
     end)
 
     it("enumerates even when it is told not to read transcripts", function()

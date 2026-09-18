@@ -217,6 +217,7 @@ Rules:
 
 - `source = "auto"` rides the hooks `status` already pays for, else polls transcript mtimes. Hook cost is two headless `nvim` per tool call _per running agent_, so polling is the default.
 - Two hooks are registered even under polling: `PostToolUse(ExitPlanMode)` and `SessionStart`.
+- **Hooks mode still stats the selected transcript every tick** (`transcript.stale`, one `fs_stat`, no read): a `PostToolUse` hook says the tool returned, but the CLI does not write the tool's transcript line in lockstep with it, and a hook can fail to arrive at all. Re-reading only on hook events left Changes and Activity behind until the next event — after a long command, the end of the turn (reported as "30s until I see any diff"). The status bullet was never affected, since it comes from the event itself.
 - Live state is per **conversation**, not per tab (`status.classify` is extracted so the rules stay shared). `done` takes the same three conditions as the tab rule: the conversation is the selected one, the view's tab is current, and Neovim has focus (`status.is_focused`, exported so the rules cannot drift).
 - Clearing `done` needs its own wiring: `model.mark_read` (`done` → `idle`; `waiting` untouched) is called by `model.select` (covers `<CR>` and `<C-n>`/`<C-p>`) and by `agents_view.mark_selected_read` on `TabEnter`/`FocusGained`. `status`'s own autocmds cannot help — its entries are keyed by tab and several conversations share this one.
 

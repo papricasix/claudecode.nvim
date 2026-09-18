@@ -1633,6 +1633,23 @@ function M.summary(path, cb)
   fold_chunks(sum, st, job, finish)
 end
 
+---Whether a transcript has moved on since it was last folded: one stat, no read.
+---
+---What the hooks-mode poll asks about the selected session. A hook says a tool
+---returned; the file is what the panes are drawn from, and the CLI may append the
+---tool's line a moment after the hook fires — or a hook may never arrive at all.
+---Without this the panes waited for the *next* event to catch up.
+---@param path string
+---@return boolean
+function M.stale(path)
+  local st = M._io.stat(path)
+  if not st then
+    return false
+  end
+  local sum = cache[path]
+  return sum == nil or sum.partial == true or sum.size ~= st.size or sum.mtime ~= st.mtime
+end
+
 ---Enumerate a project's transcripts, newest first.
 ---
 ---Stat-only and therefore synchronous: no file is opened, so this is a handful of

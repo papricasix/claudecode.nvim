@@ -1895,6 +1895,16 @@ function M.poll(tick_opts)
   end
   if not (tick_opts and tick_opts.list_only) then
     state.dirty.transcript = true
+  else
+    -- Hooks mode still stats the selected transcript: a hook reports the tool,
+    -- the file is what the panes are drawn from, and the two are not written in
+    -- lockstep. A record that lands after the hook's re-read — or a hook that
+    -- never arrives — otherwise left Changes and Activity behind until the next
+    -- event, which after a long command is the end of the turn.
+    local row = state.selected and state.by_id[state.selected]
+    if row and row.path and transcript.stale(row.path) then
+      state.dirty.transcript = true
+    end
   end
   if state.subagents_running then
     state.dirty.subagents = true
