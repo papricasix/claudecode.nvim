@@ -191,15 +191,34 @@ local function apply_user_options(win)
   end
 end
 
+---Dress a float the way `create` does: its border colour, then the user's own
+---display settings.
+---@param win integer
+---@param border_hl string|nil
+local function apply_window_options(win, border_hl)
+  utils.set_win_option(win, "winhighlight", "FloatBorder:" .. (border_hl or "FloatBorder"))
+  apply_user_options(win)
+end
+
+---Swap a float's content in place.
+---
+---**Every window option is set again after the swap.** Putting a buffer in a
+---`style = "minimal"` float re-applies minimal style (measured, Neovim 0.12.2):
+---`number` goes back off and `winhighlight` back to minimal's own, so stepping
+---through a pane's rows took the line numbers and the border colour away on the
+---first step, for as long as the float stayed open.
 ---@param win integer
 ---@param entry table Registry row for this float.
 ---@param buf integer
 ---@param title string|nil
 ---@param owned_buf boolean
+---@param border_hl string|nil
 ---@return integer win
 ---@return integer buf
-local function reuse_window(win, entry, buf, title, owned_buf)
+local function reuse_window(win, entry, buf, title, owned_buf, border_hl)
   pcall(vim.api.nvim_win_set_buf, win, buf)
+  entry.border_hl = border_hl or entry.border_hl
+  apply_window_options(win, entry.border_hl)
   if vim.fn.has("nvim-0.9") == 1 then
     -- `nvim_win_set_config` needs the whole config back, so start from the one
     -- the window already has and change only the title.
@@ -326,7 +345,7 @@ function M.create(opts)
   if opts.reuse and vim.api.nvim_win_is_valid(opts.reuse) then
     for _, entry in ipairs(floats) do
       if entry.win == opts.reuse then
-        return reuse_window(opts.reuse, entry, buf, opts.title, owned_buf)
+        return reuse_window(opts.reuse, entry, buf, opts.title, owned_buf, opts.border_hl)
       end
     end
   end
@@ -351,8 +370,7 @@ function M.create(opts)
       vim.w[win][name] = value
     end
   end)
-  utils.set_win_option(win, "winhighlight", "FloatBorder:" .. (opts.border_hl or "FloatBorder"))
-  apply_user_options(win)
+  apply_window_options(win, opts.border_hl)
 
   floats[#floats + 1] = {
     win = win,
@@ -360,6 +378,7 @@ function M.create(opts)
     session_id = opts.session_id,
     title = opts.title,
     owned_buf = owned_buf,
+    border_hl = opts.border_hl,
     -- What this float is for. `close_all` filters on it so that dismissing the
     -- file a plan was shown in never takes a *pending diff* down with it: a diff
     -- float is a question waiting for an answer, and closing it is not answering.

@@ -54,6 +54,30 @@ describe("agents.float", function()
       expect(vim.wo[win].number).to_be_false()
     end)
 
+    it("keeps the user's settings and its border when stepping swaps its content", function()
+      -- Putting a buffer in a minimal float re-applies minimal style (measured on
+      -- Neovim 0.12.2), which the mock does not: `number` goes back off and
+      -- `winhighlight` back to minimal's own. The first `<C-n>` took the line
+      -- numbers away for as long as the float stayed open.
+      vim.go.number = true
+      local win = float.create("aaa", { title = "a.lua" })
+      local border = vim.wo[win].winhighlight
+      expect(border:find("FloatBorder:", 1, true) ~= nil).to_be_true()
+
+      local set_buf = vim.api.nvim_win_set_buf
+      vim.api.nvim_win_set_buf = function(target, buf)
+        set_buf(target, buf)
+        vim.wo[target].number = false
+        vim.wo[target].winhighlight = "EndOfBuffer:"
+      end
+      local again = float.create("aaa", { title = "b.lua", reuse = win })
+      vim.api.nvim_win_set_buf = set_buf
+
+      expect(again).to_be(win)
+      expect(vim.wo[win].number).to_be_true()
+      expect(vim.wo[win].winhighlight).to_be(border)
+    end)
+
     it("remembers which conversation each float belongs to", function()
       float.create("aaa", { title = "a" })
       float.create("bbb", { title = "b" })
