@@ -194,6 +194,9 @@ M.defaults = {
       -- the same; `gC` (the command with `!`) drops the newest one.
       checkpoint = "gc",
       checkpoint_drop = "gC",
+      -- On a checkpoint rule in Activity / Changes / Tasks: give it a name (`i`
+      -- there does the same). An empty name clears it.
+      checkpoint_name = "a",
       help = "?", -- show the keys that reach the pane you are in
       next_pane = "<Tab>",
       focus_term = "i",
@@ -710,6 +713,7 @@ function M.validate(config)
         "subagent_label",
         "checkpoint",
         "checkpoint_drop",
+        "checkpoint_name",
         "help",
         "next_pane",
         "focus_term",

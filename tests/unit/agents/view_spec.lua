@@ -1600,7 +1600,8 @@ describe("agents_view", function()
       setup_with({ enabled = true })
       local changes = keys_for("changes")
       expect(changes["dd"]).to_be(nil)
-      expect(changes["a"]).to_be(nil)
+      expect(changes["x"]).to_be(nil)
+      expect(changes["a"] ~= "Start a new agent").to_be_true() -- names a checkpoint rule there
       expect(changes["<CR>"]).to_be_string() -- open the file, not select a session
       expect(changes["<Tab>"]).to_be_string()
     end)
@@ -1647,6 +1648,10 @@ describe("agents_view", function()
         expect(keys_for(pane)["gC"]).to_be_string()
       end
       expect(keys_for("center")["gc"]).to_be(nil) -- `gc` belongs to Claude there
+      -- Naming is offered where a rule can be under the cursor; `a` in the
+      -- sessions pane still starts an agent.
+      expect(keys_for("changes")["a"]:find("name it", 1, true) ~= nil).to_be_true()
+      expect(keys_for("sessions")["a"]).to_be("Start a new agent")
     end)
 
     it("groups them under headings, this pane's first", function()

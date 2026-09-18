@@ -92,9 +92,55 @@ describe("agents.checkpoints", function()
     end)
 
     it("drops what is not a moment when reading", function()
-      store = { vim.json.encode({ version = 1, sessions = { s = { 5, "x", 0, 3 }, t = "no" } }) }
+      store = { vim.json.encode({ version = 2, sessions = { s = { marks = { 5, "x", 0, 3 } }, t = "no" } }) }
       assert.same({ 3, 5 }, checkpoints.list("s"))
       expect(#checkpoints.list("t")).to_be(0)
+    end)
+
+    it("still reads a version 1 store, which held the bare list", function()
+      store = { vim.json.encode({ version = 1, sessions = { s = { 5, 3 } } }) }
+      assert.same({ 3, 5 }, checkpoints.list("s"))
+      assert.same({}, checkpoints.names("s"))
+    end)
+  end)
+
+  describe("names", function()
+    it("names a checkpoint, and only one that exists", function()
+      checkpoints.add("s", 100)
+      expect(checkpoints.set_name("s", 100, "before the refactor")).to_be_true()
+      expect(checkpoints.set_name("s", 999, "nope")).to_be(false)
+      assert.same({ [100] = "before the refactor" }, checkpoints.names("s"))
+    end)
+
+    it("tidies the name and clears it with an empty one", function()
+      checkpoints.add("s", 100)
+      checkpoints.set_name("s", 100, "  reviewed\nup to here  ")
+      expect(checkpoints.names("s")[100]).to_be("reviewed up to here")
+      expect(checkpoints.set_name("s", 100, "   ")).to_be_true()
+      assert.same({}, checkpoints.names("s"))
+    end)
+
+    it("reads names back across a reload, and forgets one dropped or deleted", function()
+      checkpoints.add("s", 100)
+      checkpoints.add("s", 200)
+      checkpoints.set_name("s", 100, "first")
+      checkpoints.set_name("s", 200, "second")
+      checkpoints.reset()
+      assert.same({ [100] = "first", [200] = "second" }, checkpoints.names("s"))
+
+      checkpoints.drop("s")
+      checkpoints.reset()
+      assert.same({ [100] = "first" }, checkpoints.names("s"))
+
+      checkpoints.forget("s")
+      checkpoints.reset()
+      assert.same({}, checkpoints.names("s"))
+    end)
+
+    it("keeps no name for a moment that is not a checkpoint", function()
+      store =
+        { vim.json.encode({ version = 2, sessions = { s = { marks = { 5 }, names = { ["5"] = "a", ["9"] = "b" } } } }) }
+      assert.same({ [5] = "a" }, checkpoints.names("s"))
     end)
   end)
 

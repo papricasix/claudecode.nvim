@@ -1226,6 +1226,7 @@ local function divider_for(session_id, marks, index)
     state.dividers[key] = row
   end
   row.count = #marks
+  row.name = checkpoints.names(session_id)[marks[index]]
   return row
 end
 
@@ -1485,6 +1486,7 @@ function M.changes()
   end
 
   local now = M._now_s()
+  local named = checkpoints.names(row.session_id)
   for index = #marks + 1, 1, -1 do
     local era = eras[index]
     if era then
@@ -1497,7 +1499,13 @@ function M.changes()
     end
     -- The rule below an era is the checkpoint that opened it.
     if index > 1 then
-      entries[#entries + 1] = { kind = "checkpoint", ts = marks[index - 1], index = index - 1, count = #marks }
+      entries[#entries + 1] = {
+        kind = "checkpoint",
+        ts = marks[index - 1],
+        index = index - 1,
+        count = #marks,
+        name = named[marks[index - 1]],
+      }
     end
   end
   return entries
@@ -1521,10 +1529,13 @@ function M.subagents()
     checkpoints = checkpoints.list(row.session_id),
   })
   local running = false
+  local named = nil
   for _, entry in ipairs(rows) do
     if entry.state == "running" then
       running = true
-      break
+    elseif entry.kind == "checkpoint" then
+      named = named or checkpoints.names(row.session_id)
+      entry.name = named[entry.ts]
     end
   end
   state.subagents_running = running

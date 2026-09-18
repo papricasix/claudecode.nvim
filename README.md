@@ -363,7 +363,9 @@ there too.
   Sessions pane stays the whole conversation's total. Checkpoints belong to the
   conversation, not the view — they survive closing it and restarting Neovim —
   and go with the conversation when it is deleted. `gC` (or the command with `!`)
-  drops the newest one, merging its era into the next.
+  drops the newest one, merging its era into the next. `a` or `i` on a rule
+  **names it** in a small prompt — `── checkpoint 14:32 · before the refactor ──`
+  — so several on one conversation stay apart; an empty name clears it.
 - Inside such a float, `<C-n>` and `<C-p>` step to the **next and previous row of
   the pane it came from** rather than to the next session — so you can read
   through everything an agent changed without closing the float between files.
@@ -532,6 +534,7 @@ opts = {
       subagent_label = "g.",      -- Tasks: description / agent type or command
       checkpoint = "gc",          -- split the selected session's history here
       checkpoint_drop = "gC",     -- drop its newest checkpoint
+      checkpoint_name = "a",      -- on a checkpoint rule: name it (`i` does too)
       next_pane = "<Tab>", focus_term = "i",
       -- Cycle the selected session from any pane, and from inside the agent's
       -- terminal (bound there in terminal mode too). Inside a file float the same

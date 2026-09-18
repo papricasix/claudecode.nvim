@@ -713,6 +713,17 @@ local KEY_SPECS = {
     end,
   },
   {
+    field = "checkpoint_name",
+    -- The panes a rule is drawn in. `i` on a rule does the same (see
+    -- `focus_terminal`): both keys say "type here" everywhere else in Neovim.
+    panes = { "feed", "changes", "subagents" },
+    group = "Sessions",
+    desc = "On a checkpoint rule: name it (an empty name clears it)",
+    run = function()
+      M.name_checkpoint_under_cursor()
+    end,
+  },
+  {
     field = "open",
     panes = { "feed", "changes" },
     group = "This file",
@@ -3232,6 +3243,49 @@ function M.checkpoint()
   return ts
 end
 
+---Whether the cursor is on a checkpoint rule in one of the panes.
+---@return table|nil payload The rule's payload (`ts`, `name`), or nil.
+local function checkpoint_under_cursor()
+  local payload = payload_under_cursor()
+  if payload and payload.kind == "checkpoint" and payload.ts then
+    return payload
+  end
+  return nil
+end
+
+---Name the checkpoint under the cursor, through a small prompt.
+---
+---A rule says when; a name says what for — "before the refactor", "reviewed" —
+---and once a conversation has three of them the clock alone stops telling them
+---apart. The prompt opens on the current name, and answering with nothing takes
+---the name away.
+---@return boolean asked false when the cursor is not on a rule.
+function M.name_checkpoint_under_cursor()
+  local payload = checkpoint_under_cursor()
+  if not payload then
+    vim.notify("ClaudeCode: put the cursor on a checkpoint rule to name it", vim.log.levels.INFO)
+    return false
+  end
+  local session_id = model.selected()
+  if not session_id then
+    return false
+  end
+  local checkpoints = require("claudecode.agents.checkpoints")
+  local ts = payload.ts
+  require("claudecode.agents.input").ask({
+    title = "Name checkpoint " .. checkpoints.label(ts),
+    default = checkpoints.names(session_id)[ts] or "",
+  }, function(text)
+    if text == nil then
+      return
+    end
+    if checkpoints.set_name(session_id, ts, text) then
+      M.redraw()
+    end
+  end)
+  return true
+end
+
 ---Drop the selected session's newest checkpoint, merging its era into the next.
 ---@return number|nil ts The checkpoint dropped, nil when there was none.
 function M.drop_checkpoint()
@@ -3314,6 +3368,11 @@ end
 ---session" is the same intent whether the CLI is already running or not, so it
 ---starts it first and lands in it.
 function M.focus_terminal()
+  -- On a checkpoint rule, "type here" means the rule's name, not the terminal.
+  if checkpoint_under_cursor() then
+    M.name_checkpoint_under_cursor()
+    return
+  end
   local pending = state.pending_start
   if not pending and not center_has_terminal() then
     -- Nothing to focus and nothing offered: the list arrived late, or the user

@@ -387,6 +387,21 @@ describe("agents.render", function()
       expect(render.payload_at(feed, 3).path).to_be("/proj/a.lua")
     end)
 
+    it("draws a checkpoint's name after the clock, cut so a stub of rule is left", function()
+      local ts = os.time({ year = 2026, month = 9, day = 17, hour = 14, min = 32, sec = 0 })
+      local feed = render.create_buf("feed")
+      render.feed(feed, {
+        { kind = "checkpoint", ts = ts, index = 1, count = 1, name = "before the refactor" },
+        { kind = "checkpoint", ts = ts - 60, index = 2, count = 2, name = string.rep("long ", 20) },
+      }, { width = 46, cwd = "/proj", now = ts + 60 })
+      local lines = lines_of(feed)
+      expect(lines[1]).to_be(" ── checkpoint 14:32 · before the refactor ───")
+      expect(vim.fn.strdisplaywidth(lines[2])).to_be(46)
+      expect(lines[2]:find("…", 1, true) ~= nil).to_be_true()
+      expect(lines[2]:sub(-#" ──")).to_be(" ──")
+      expect(render.payload_at(feed, 1).name).to_be("before the refactor")
+    end)
+
     it("draws a tool call as the tool and what the call was for", function()
       local feed = render.create_buf("feed")
       render.feed(feed, {

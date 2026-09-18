@@ -25,12 +25,17 @@
 
 local M = {}
 
---- Bumped when a persisted field changes meaning.
-local STORE_VERSION = 1
+--- Bumped when a persisted field changes meaning. Version 1 held a bare list of
+--- moments per conversation; version 2 keeps the names beside them. A version 1
+--- store is still read.
+local STORE_VERSION = 2
 
 --- `[session_id] = { ts, ts, … }`, ascending. Empty until the store is read.
 ---@type table<string, number[]>
 local marks = {}
+--- `[session_id] = { [ts] = name }`, only for checkpoints that were given one.
+---@type table<string, table<number, string>>
+local names = {}
 local loaded = false
 
 --- The filesystem, as a seam for specs.
@@ -65,7 +70,7 @@ local function load()
     return
   end
   loaded = true
-  marks = {}
+  marks, names = {}, {}
   local lines = M._io.read(M.path())
   if not lines then
     return
@@ -73,11 +78,16 @@ local function load()
   local ok, decoded = pcall(function()
     return vim.json.decode(table.concat(lines, "\n"))
   end)
-  if not ok or type(decoded) ~= "table" or decoded.version ~= STORE_VERSION or type(decoded.sessions) ~= "table" then
+  if not ok or type(decoded) ~= "table" or type(decoded.sessions) ~= "table" then
     return
   end
-  for id, list in pairs(decoded.sessions) do
-    if type(id) == "string" and type(list) == "table" then
+  if decoded.version ~= STORE_VERSION and decoded.version ~= 1 then
+    return
+  end
+  for id, record in pairs(decoded.sessions) do
+    if type(id) == "string" and type(record) == "table" then
+      -- Version 1 wrote the list itself where version 2 writes `{ marks, names }`.
+      local list = type(record.marks) == "table" and record.marks or record
       local kept = {}
       for _, ts in ipairs(list) do
         if type(ts) == "number" and ts > 0 then
@@ -87,6 +97,20 @@ local function load()
       table.sort(kept)
       if #kept > 0 then
         marks[id] = kept
+        -- JSON keys are strings; a name is kept only for a moment that exists.
+        if type(record.names) == "table" then
+          for key, name in pairs(record.names) do
+            local ts = tonumber(key)
+            if ts and type(name) == "string" and name ~= "" then
+              for _, mark in ipairs(kept) do
+                if mark == ts then
+                  names[id] = names[id] or {}
+                  names[id][ts] = name
+                end
+              end
+            end
+          end
+        end
       end
     end
   end
@@ -96,7 +120,15 @@ local function save()
   local sessions = {}
   for id, list in pairs(marks) do
     if #list > 0 then
-      sessions[id] = list
+      local record = { marks = list }
+      local named = names[id]
+      if named and next(named) then
+        record.names = {}
+        for ts, name in pairs(named) do
+          record.names[tostring(ts)] = name
+        end
+      end
+      sessions[id] = record
     end
   end
   local ok, encoded = pcall(vim.json.encode, { version = STORE_VERSION, sessions = sessions })
@@ -156,6 +188,9 @@ function M.drop(session_id)
   if #list == 0 then
     marks[session_id] = nil
   end
+  if names[session_id] then
+    names[session_id][ts] = nil
+  end
   save()
   return ts, #list
 end
@@ -164,10 +199,57 @@ end
 ---@param session_id string
 function M.forget(session_id)
   load()
-  if marks[session_id] then
+  if marks[session_id] or names[session_id] then
     marks[session_id] = nil
+    names[session_id] = nil
     save()
   end
+end
+
+---The names a conversation's checkpoints were given, by moment. A copy.
+---@param session_id string|nil
+---@return table<number, string>
+function M.names(session_id)
+  load()
+  local out = {}
+  for ts, name in pairs((session_id and names[session_id]) or {}) do
+    out[ts] = name
+  end
+  return out
+end
+
+---Name a checkpoint, or take its name away with an empty one.
+---
+---A name says what the line was drawn for — "before the refactor", "reviewed" —
+---which the clock alone cannot, and a conversation may carry several. Whitespace
+---around it is dropped and line breaks inside it are folded into spaces, since
+---the name is drawn on a one-line rule.
+---@param session_id string
+---@param ts number The checkpoint's moment, as `list` reports it.
+---@param name string|nil
+---@return boolean set false when no such checkpoint exists.
+function M.set_name(session_id, ts, name)
+  load()
+  local found = false
+  for _, mark in ipairs(marks[session_id] or {}) do
+    if mark == ts then
+      found = true
+    end
+  end
+  if not found then
+    return false
+  end
+  name = type(name) == "string" and name:gsub("%s+", " "):gsub("^ ", ""):gsub(" $", "") or ""
+  if name == "" then
+    if names[session_id] then
+      names[session_id][ts] = nil
+    end
+  else
+    names[session_id] = names[session_id] or {}
+    names[session_id][ts] = name
+  end
+  save()
+  return true
 end
 
 ---Which era a moment falls in: 1 for anything at or before the first checkpoint,
@@ -228,7 +310,7 @@ end
 
 ---Test/reload helper: forget what was read, so the next call re-reads the store.
 function M.reset()
-  marks = {}
+  marks, names = {}, {}
   loaded = false
 end
 

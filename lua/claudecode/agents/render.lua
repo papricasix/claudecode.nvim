@@ -610,18 +610,37 @@ end
 ---
 ---A rule across the whole width with the moment in it — `── checkpoint 14:32 ──`
 ---— so it reads as a boundary between rows rather than as a row. Every pane
----draws it the same way, whichever direction that pane's rows run in.
----@param entry { ts: number, index: integer }
+---draws it the same way, whichever direction that pane's rows run in. A name the
+---user gave it follows the clock: `── checkpoint 14:32 · before the refactor ──`,
+---cut with `…` so at least a stub of rule survives at the right edge.
+---@param entry { ts: number, index: integer, name: string? }
 ---@param width integer
 ---@param now number|nil
 ---@return string line
 ---@return table payload
 function M.checkpoint_line(entry, width, now)
   local label = "checkpoint " .. require("claudecode.agents.checkpoints").label(entry.ts, now)
-  local head = GUTTER .. "── " .. label .. " "
+  local head = GUTTER .. "── " .. label
+  if type(entry.name) == "string" and entry.name ~= "" then
+    local room = width
+      - vim.fn.strdisplaywidth(head)
+      - vim.fn.strdisplaywidth(" · ")
+      - vim.fn.strdisplaywidth(" ──")
+    if room >= 2 then
+      head = head .. " · " .. M.truncate(entry.name, room)
+    end
+  end
+  head = head .. " "
   local rest = width - vim.fn.strdisplaywidth(head)
   local line = head .. string.rep("─", math.max(2, rest))
-  return line, { kind = "checkpoint", ts = entry.ts, index = entry.index, key = "checkpoint\0" .. tostring(entry.ts) }
+  return line,
+    {
+      kind = "checkpoint",
+      ts = entry.ts,
+      index = entry.index,
+      name = entry.name,
+      key = "checkpoint\0" .. tostring(entry.ts),
+    }
 end
 
 ---Add a checkpoint's rule to a pane being drawn: the line, its payload, and one

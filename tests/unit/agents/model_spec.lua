@@ -1509,6 +1509,17 @@ describe("agents.model", function()
       expect(#checkpoints.list("aaa")).to_be(0)
     end)
 
+    it("carries a checkpoint's name on its rule in every pane", function()
+      checkpoints.add("aaa", 20)
+      checkpoints.set_name("aaa", 20, "reviewed")
+      expect(model.changes()[3].name).to_be("reviewed")
+      -- Newest first: the add at 25 is above the rule, so the rule is row 3.
+      expect(model.feed()[3].name).to_be("reviewed")
+      -- Renamed later: the kept Activity row follows the store.
+      checkpoints.set_name("aaa", 20, "again")
+      expect(model.feed()[3].name).to_be("again")
+    end)
+
     it("asks git and the disk about each file once, and never about a rule", function()
       -- The rule row has no path, and `fs_stat(nil)` threw from the poll timer.
       local stats, git_paths = {}, nil
