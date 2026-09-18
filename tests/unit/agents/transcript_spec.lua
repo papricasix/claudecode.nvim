@@ -200,6 +200,22 @@ describe("agents.transcript", function()
       put("/p/a.jsonl", { edit_line("/proj/x.lua", 1, 0), read_line("/proj/x.lua") })
       expect(fold("/p/a.jsonl").files["/proj/x.lua"].kind).to_be("edit")
     end)
+
+    it("keeps each edit on its own, dated, so a checkpoint can split the counts", function()
+      put("/p/a.jsonl", {
+        edit_line("/proj/x.lua", 2, 1, "2026-08-02T20:19:59.000Z"),
+        read_line("/proj/x.lua", "2026-08-02T20:20:30.000Z"),
+        edit_line("/proj/x.lua", 3, 0, "2026-08-02T20:21:00.000Z"),
+      })
+      local file = fold("/p/a.jsonl").files["/proj/x.lua"]
+      expect(#file.edits).to_be(2) -- the read is not one
+      expect(file.edits[1].added).to_be(2)
+      expect(file.edits[1].removed).to_be(1)
+      expect(file.edits[1].ts).to_be(transcript._iso_to_epoch("2026-08-02T20:19:59.000Z"))
+      expect(file.edits[2].added).to_be(3)
+      expect(file.edits[2].kind).to_be("edit")
+      expect(file.added).to_be(5)
+    end)
   end)
 
   describe("prefiltering", function()

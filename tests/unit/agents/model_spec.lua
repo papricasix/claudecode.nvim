@@ -3,6 +3,7 @@ require("tests.busted_setup")
 
 describe("agents.model", function()
   local model
+  local checkpoints
   local summaries -- [path] = summary handed back by the stubbed transcript
   local scans -- paths passed to transcript.summary, in order
   local live -- conversations the stubbed registry reports as running
@@ -134,6 +135,17 @@ describe("agents.model", function()
     model.setup({ agents = { enabled = true, refresh_ms = 10, fold_batch = 10 } })
     model.reset()
     model.setup({ agents = { enabled = true, refresh_ms = 10, fold_batch = 10 } })
+
+    -- Checkpoints live in memory here: the store would otherwise be a real file
+    -- under the mock's cache directory, shared between tests.
+    checkpoints = require("claudecode.agents.checkpoints")
+    checkpoints.reset()
+    checkpoints._io = {
+      read = function()
+        return nil
+      end,
+      write = function() end,
+    }
 
     -- The vim mock runs defer_fn immediately, which would defeat every assertion
     -- about coalescing. Queue instead, and let each test decide when time passes.
@@ -1325,6 +1337,151 @@ describe("agents.model", function()
         end
       end
       expect(reread_selected).to_be(false)
+    end)
+  end)
+
+  describe("checkpoints", function()
+    before_each(function()
+      summaries.aaa = summary_for("aaa", {
+        added = 30,
+        removed = 6,
+        files = {
+          ["/proj/a.lua"] = {
+            added = 30,
+            removed = 6,
+            kind = "edit",
+            last_ts = 30,
+            edits = {
+              { ts = 10, added = 10, removed = 2, kind = "edit" },
+              { ts = 20, added = 5, removed = 1, kind = "edit" },
+              { ts = 30, added = 15, removed = 3, kind = "edit" },
+            },
+          },
+          ["/proj/new.lua"] = {
+            added = 4,
+            removed = 0,
+            kind = "add",
+            last_ts = 25,
+            edits = { { ts = 25, added = 4, removed = 0, kind = "add" } },
+          },
+          ["/proj/read.lua"] = { added = 0, removed = 0, kind = "read", last_ts = 12, edits = {} },
+        },
+        order = { "/proj/a.lua", "/proj/new.lua", "/proj/read.lua" },
+        events = {
+          { ts = 10, kind = "edit", path = "/proj/a.lua" },
+          { ts = 20, kind = "edit", path = "/proj/a.lua" },
+          { ts = 25, kind = "add", path = "/proj/new.lua" },
+          { ts = 30, kind = "edit", path = "/proj/a.lua" },
+        },
+      })
+      model.attach(1, "/proj")
+      model.select("aaa")
+    end)
+
+    it("lists a file once per era it was edited in, with that era's own counts", function()
+      checkpoints.add("aaa", 20)
+      local rows = model.changes()
+      local drawn = {}
+      for _, row in ipairs(rows) do
+        if row.kind == "checkpoint" then
+          drawn[#drawn + 1] = "── " .. row.ts
+        else
+          drawn[#drawn + 1] =
+            string.format("%s +%d -%d (%d/%d)", row.path, row.added, row.removed, row.era.index, row.era.count)
+        end
+      end
+      -- Oldest era first, the rule between, the file edited on both sides twice.
+      assert.same({
+        "/proj/a.lua +15 -3 (1/1)",
+        "── 20",
+        "/proj/a.lua +15 -3 (2/1)",
+        "/proj/new.lua +4 -0 (2/1)",
+      }, drawn)
+      expect(rows[1].era.to).to_be(20)
+      expect(rows[3].era.from).to_be(20)
+      expect(rows[3].era.to).to_be(nil)
+    end)
+
+    it("stacks: each checkpoint splits again", function()
+      checkpoints.add("aaa", 10)
+      checkpoints.add("aaa", 22)
+      local drawn = {}
+      for _, row in ipairs(model.changes()) do
+        drawn[#drawn + 1] = row.kind == "checkpoint" and "──" or (row.path .. " +" .. row.added)
+      end
+      assert.same(
+        { "/proj/a.lua +10", "──", "/proj/a.lua +5", "──", "/proj/a.lua +15", "/proj/new.lua +4" },
+        drawn
+      )
+    end)
+
+    it("draws a rule even when nothing has happened since it", function()
+      checkpoints.add("aaa", 100)
+      local rows = model.changes()
+      expect(rows[#rows].kind).to_be("checkpoint")
+      expect(#rows).to_be(3)
+    end)
+
+    it("keeps the whole conversation's counts on the session row", function()
+      checkpoints.add("aaa", 20)
+      expect(model.rows()[1].added).to_be(30)
+      expect(model.rows()[1].removed).to_be(6)
+    end)
+
+    it("dates a file's totals by its last touch when there is no per-edit record", function()
+      summaries.aaa.files["/proj/a.lua"].edits = nil
+      checkpoints.add("aaa", 20)
+      local drawn = {}
+      for _, row in ipairs(model.changes()) do
+        drawn[#drawn + 1] = row.kind == "checkpoint" and "──" or (row.path .. " +" .. row.added)
+      end
+      assert.same({ "──", "/proj/a.lua +30", "/proj/new.lua +4" }, drawn)
+    end)
+
+    it("lists every file once with no checkpoint, as before", function()
+      local rows = model.changes()
+      expect(#rows).to_be(2)
+      expect(rows[1].era).to_be(nil)
+    end)
+
+    it("slots a rule into the activity feed where the checkpoint falls", function()
+      checkpoints.add("aaa", 25)
+      local kinds = {}
+      for _, event in ipairs(model.feed()) do
+        kinds[#kinds + 1] = event.kind == "checkpoint" and ("──" .. event.ts) or (event.kind .. event.ts)
+      end
+      -- Newest first: the add at 25 is at or before the checkpoint, so below it.
+      assert.same({ "edit30", "──25", "add25", "edit20", "edit10" }, kinds)
+    end)
+
+    it("puts a checkpoint newer than everything at the top of the feed", function()
+      checkpoints.add("aaa", 100)
+      local feed = model.feed()
+      expect(feed[1].kind).to_be("checkpoint")
+      expect(#feed).to_be(5)
+    end)
+
+    it("leaves a rule older than the rows drawn out of a feed cut to the pane", function()
+      checkpoints.add("aaa", 5)
+      local cut = model.feed(2)
+      expect(#cut).to_be(2)
+      expect(cut[2].kind).to_be("add")
+      -- Drawn whole, the rule sits at the bottom where it belongs.
+      local whole = model.feed()
+      expect(whole[#whole].kind).to_be("checkpoint")
+    end)
+
+    it("hands the feed the same rule table each time, so it settles like any row", function()
+      checkpoints.add("aaa", 25)
+      local first = model.feed()[2]
+      expect(first.kind).to_be("checkpoint")
+      expect(model.feed()[2]).to_be(first)
+    end)
+
+    it("forgets a deleted conversation's checkpoints", function()
+      checkpoints.add("aaa", 20)
+      expect(model.delete_session("aaa")).to_be_true()
+      expect(#checkpoints.list("aaa")).to_be(0)
     end)
   end)
 

@@ -79,6 +79,7 @@ local DEFAULT_HIGHLIGHTS = {
   match = "ClaudeCodeAgentsMatch",
   foldable = "ClaudeCodeAgentsFoldable",
   prompt = "ClaudeCodeAgentsPrompt",
+  checkpoint = "ClaudeCodeAgentsCheckpoint",
 }
 
 local HIGHLIGHT_LINKS = {
@@ -117,6 +118,9 @@ local HIGHLIGHT_LINKS = {
   -- A message to a subagent — its prompt, or one sent to it later — on a raised
   -- background, the way Claude Code sets what you typed apart from its replies.
   ClaudeCodeAgentsPrompt = "CursorLine",
+  -- The rule a checkpoint draws through a pane. Metadata, like the clock column,
+  -- so it follows the same quiet group; the shape is what sets it apart.
+  ClaudeCodeAgentsCheckpoint = "Comment",
 }
 
 ---Where the panes take their background from.
@@ -602,10 +606,43 @@ function M.sessions(buf, rows, opts)
   paint(buf, lines, marks, payload_map)
 end
 
+---The line a checkpoint draws through a pane, and the payload its row carries.
+---
+---A rule across the whole width with the moment in it — `── checkpoint 14:32 ──`
+---— so it reads as a boundary between rows rather than as a row. Every pane
+---draws it the same way, whichever direction that pane's rows run in.
+---@param entry { ts: number, index: integer }
+---@param width integer
+---@param now number|nil
+---@return string line
+---@return table payload
+function M.checkpoint_line(entry, width, now)
+  local label = "checkpoint " .. require("claudecode.agents.checkpoints").label(entry.ts, now)
+  local head = GUTTER .. "── " .. label .. " "
+  local rest = width - vim.fn.strdisplaywidth(head)
+  local line = head .. string.rep("─", math.max(2, rest))
+  return line, { kind = "checkpoint", ts = entry.ts, index = entry.index, key = "checkpoint\0" .. tostring(entry.ts) }
+end
+
+---Add a checkpoint's rule to a pane being drawn: the line, its payload, and one
+---mark across it.
+---@param out { lines: string[], marks: table[], payloads: table<integer, table> }
+---@param index integer 1-based row.
+---@param entry { ts: number, index: integer }
+---@param width integer
+---@param now number|nil
+---@param group string The highlight group the whole line wears.
+local function push_checkpoint(out, index, entry, width, now, group)
+  local line, payload = M.checkpoint_line(entry, width, now)
+  out.lines[#out.lines + 1] = line
+  out.payloads[index] = payload
+  out.marks[#out.marks + 1] = { row = index - 1, col = 0, end_col = #line, hl = group }
+end
+
 ---Draw the activity feed, oldest first.
 ---@param buf integer
 ---@param events table[] `{ ts, kind, path, added, removed }`
----@param opts { cwd: string?, width: integer? }|nil
+---@param opts { cwd: string?, width: integer?, now: number? }|nil
 function M.feed(buf, events, opts)
   opts = opts or {}
   local width = opts.width or 32
@@ -620,7 +657,12 @@ function M.feed(buf, events, opts)
     return
   end
 
-  for index, event in ipairs(events) do
+  local out = { lines = lines, marks = marks, payloads = payload_map }
+
+  ---One event's row.
+  ---@param index integer
+  ---@param event table
+  local function draw(index, event)
     local is_tool = event.kind == "tool"
     -- A tool call's column is the tool's own name — `bash`, `grep`, `agent` —
     -- which is what a glance at the pane is asking; the label beside it says what
@@ -701,13 +743,27 @@ function M.feed(buf, events, opts)
     end
   end
 
+  for index, event in ipairs(events) do
+    if event.kind == "checkpoint" then
+      -- Lit on arrival and settling like any row: a checkpoint just taken is
+      -- news, and the one from yesterday is not.
+      push_checkpoint(out, index, event, width, opts.now, fade.dim_group(hl("checkpoint"), ages[index]))
+    else
+      draw(index, event)
+    end
+  end
+
   paint(buf, lines, marks, payload_map)
 end
 
 ---Draw the files the selected agent touched.
+---
+---With checkpoints on the session, a file is listed once per era it was edited
+---in (`entry.era`, carried on the row so `<CR>` opens that era's diff), and a
+---`kind = "checkpoint"` entry is the rule between two eras.
 ---@param buf integer
----@param entries table[] `{ path, status, added, removed, deleted, scratchpad }`
----@param opts { cwd: string?, width: integer? }|nil
+---@param entries table[] `{ path, status, added, removed, deleted, scratchpad, era }` or `{ kind = "checkpoint", ts, index }`
+---@param opts { cwd: string?, width: integer?, now: number? }|nil
 function M.changes(buf, entries, opts)
   opts = opts or {}
   local width = opts.width or 28
@@ -718,7 +774,12 @@ function M.changes(buf, entries, opts)
     return
   end
 
-  for index, entry in ipairs(entries) do
+  local out = { lines = lines, marks = marks, payloads = payload_map }
+
+  ---One file's row.
+  ---@param index integer
+  ---@param entry table
+  local function draw(index, entry)
     local status = entry.status or " "
     -- The head already opens with a blank cell, so this pane needs no gutter of
     -- its own; see GUTTER.
@@ -733,7 +794,16 @@ function M.changes(buf, entries, opts)
 
     local lnum = index - 1
     lines[#lines + 1] = line
-    payload_map[index] = { kind = "file", path = entry.path, event_kind = entry.kind, key = entry.path }
+    -- An era row is a different row from the same file in another era: its key
+    -- says which, so the cursor holds on the one it was on.
+    local era = entry.era
+    payload_map[index] = {
+      kind = "file",
+      path = entry.path,
+      event_kind = entry.kind,
+      era = era,
+      key = era and (entry.path .. "\0" .. tostring(era.index)) or entry.path,
+    }
 
     if entry.deleted then
       -- Dimmed whole, counts included: their coloured blocks and flashes are for
@@ -750,6 +820,14 @@ function M.changes(buf, entries, opts)
       local path_group = entry.scratchpad and fade.dim_group(hl("title"), nil) or hl("path")
       marks[#marks + 1] = { row = lnum, col = #head, end_col = #head + #name, hl = path_group }
       push_spans(marks, lnum, counts_at, spans)
+    end
+  end
+
+  for index, entry in ipairs(entries) do
+    if entry.kind == "checkpoint" then
+      push_checkpoint(out, index, entry, width, opts.now, hl("checkpoint"))
+    else
+      draw(index, entry)
     end
   end
 
@@ -790,7 +868,7 @@ local WORKFLOW_MARK = "» "
 ---has no figure where a subagent's tokens go; a monitor shows its event count.
 ---@param buf integer
 ---@param rows ClaudeCodeSubagentRow[]
----@param opts { width: integer?, label: "type"|"description"|nil }|nil
+---@param opts { width: integer?, label: "type"|"description"|nil, now: number? }|nil
 function M.subagents(buf, rows, opts)
   opts = opts or {}
   local width = opts.width or 28
@@ -808,7 +886,12 @@ function M.subagents(buf, rows, opts)
     busy_group = group
   end)
 
-  for index, row in ipairs(rows) do
+  local out = { lines = lines, marks = marks, payloads = payload_map }
+
+  ---One run's row.
+  ---@param index integer
+  ---@param row ClaudeCodeSubagentRow
+  local function draw(index, row)
     local mark = SUBAGENT_MARK[row.state] or SUBAGENT_MARK.stopped
     local ended = row.state ~= "running"
     local is_workflow = row.kind == "workflow"
@@ -891,6 +974,14 @@ function M.subagents(buf, rows, opts)
       hl = ended and hl("stopped") or hl("title"),
     }
     marks[#marks + 1] = { row = lnum, col = right_at, end_col = #line, hl = hl("time") }
+  end
+
+  for index, row in ipairs(rows) do
+    if row.kind == "checkpoint" then
+      push_checkpoint(out, index, row, width, opts.now, hl("checkpoint"))
+    else
+      draw(index, row)
+    end
   end
 
   paint(buf, lines, marks, payload_map)

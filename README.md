@@ -202,6 +202,7 @@ Configure the plugin with the detected path:
 - `:ClaudeCodeLiveCursor [preview|open|off]` - Toggle the live Claude cursor (see [Live Claude Cursor](#live-claude-cursor))
 - `:ClaudeCodePlanView [on|off]` - Toggle showing Claude's plan-mode plan in an editor split (see [Plan View](#plan-view))
 - `:ClaudeCodeAgents [on|off]` - Toggle the agents view: several Claudes on one project, side by side (see [Agents Mode](#agents-mode))
+- `:ClaudeCodeAgentsCheckpoint[!]` - Draw a line through the selected agent session's history, so what it does from now on is listed apart from what it did before; with `!`, drop its newest checkpoint
 - `:ClaudeCodeAgentNew` - Start a new agent in the agents view
 - `:checkhealth claudecode` - Report the prerequisites (Neovim version, Claude CLI, terminal provider) and every running instance's port, lock file and connection
 
@@ -348,6 +349,20 @@ there too.
   everything the session changed; in the Activity pane just that one call — the
   edit it made, or the lines it read, highlighted. See
   [what the file view shows](#what-the-file-view-shows).
+- `gc` (or `:ClaudeCodeAgentsCheckpoint`) **draws a line through the selected
+  session's history**: everything it does from now on is listed apart from what
+  it did before. Each pane shows a `── checkpoint 14:32 ──` rule where the line
+  falls — Activity above it is new, below it is old; Changes and Tasks the other
+  way up, since those list oldest first — and a file the agent edits again after
+  the checkpoint gets a **second row** with only the new edits' counts. `<CR>` on
+  the old row shows the file as it stood at the checkpoint against what the
+  session started from; `<CR>` on the new row shows what changed since. Take
+  another to split again: an era is what lies between two neighbouring lines, and
+  a file touched in three of them has three rows. The session's own +N/-N in the
+  Sessions pane stays the whole conversation's total. Checkpoints belong to the
+  conversation, not the view — they survive closing it and restarting Neovim —
+  and go with the conversation when it is deleted. `gC` (or the command with `!`)
+  drops the newest one, merging its era into the next.
 - Inside such a float, `<C-n>` and `<C-p>` step to the **next and previous row of
   the pane it came from** rather than to the next session — so you can read
   through everything an agent changed without closing the float between files.
@@ -514,6 +529,8 @@ opts = {
       close = "q", open = "<CR>", git_diff = ".", goto_file = "gf", help = "?",
       filter = "f",               -- Activity: everything / files / commands
       subagent_label = "g.",      -- Tasks: description / agent type or command
+      checkpoint = "gc",          -- split the selected session's history here
+      checkpoint_drop = "gC",     -- drop its newest checkpoint
       next_pane = "<Tab>", focus_term = "i",
       -- Cycle the selected session from any pane, and from inside the agent's
       -- terminal (bound there in terminal mode too). Inside a file float the same
@@ -546,6 +563,8 @@ opts = {
     -- which is frequently a different colour from the diff text the same theme
     -- ships. Give the group a coloured foreground of your own to pick the hue.
     --     selected = "ClaudeCodeAgentsSelected", -- CursorLine
+    --     checkpoint = "ClaudeCodeAgentsCheckpoint", -- Comment (the rule a checkpoint
+    --                                            -- draws through a pane)
     --     header = "ClaudeCodeAgentsHelpHeader", -- Title
     --     key = "ClaudeCodeAgentsKey",           -- Special
     --   }

@@ -693,6 +693,26 @@ local KEY_SPECS = {
     end,
   },
   {
+    field = "checkpoint",
+    -- Every pane that lists the session's records, since each of them is where
+    -- the line shows up. Not the terminal: `gc` belongs to Claude there.
+    panes = { "sessions", "feed", "changes", "subagents" },
+    group = "Sessions",
+    desc = "Checkpoint the selected session: what it does from now on is listed apart from what it did before",
+    run = function()
+      M.checkpoint()
+    end,
+  },
+  {
+    field = "checkpoint_drop",
+    panes = { "sessions", "feed", "changes", "subagents" },
+    group = "Sessions",
+    desc = "Drop the selected session's newest checkpoint",
+    run = function()
+      M.drop_checkpoint()
+    end,
+  },
+  {
     field = "open",
     panes = { "feed", "changes" },
     group = "This file",
@@ -2095,6 +2115,7 @@ function M.redraw()
       width = vim.api.nvim_win_get_width(feed_win),
       cwd = model.selected_cwd(),
       ages = ages,
+      now = os.time(),
     })
     if same_session then
       restore_cursor_row("feed", held)
@@ -2108,6 +2129,7 @@ function M.redraw()
     render.changes(state.bufs.changes, model.changes(), {
       width = vim.api.nvim_win_get_width(changes_win),
       cwd = model.selected_cwd(),
+      now = os.time(),
     })
     if same_session then
       restore_cursor_row("changes", held)
@@ -2121,6 +2143,7 @@ function M.redraw()
     render.subagents(state.bufs.subagents, model.subagents(), {
       width = vim.api.nvim_win_get_width(subagents_win),
       label = subagent_label(),
+      now = os.time(),
     })
     if same_session then
       restore_cursor_row("subagents", held)
@@ -3126,6 +3149,8 @@ function open_row(payload, pane, lnum, action, nav_opts)
     read = read,
     prefer = prefer,
     tool_id = prefer == "step" and payload.tool_id or nil,
+    -- A Changes row between checkpoints opens as that era's diff.
+    era = payload.era,
     cwd = model.selected_cwd(),
     reuse = nav_opts.reuse,
   }, opened)
@@ -3178,6 +3203,55 @@ function M.cycle_feed_filter()
   local filter = model.cycle_feed_filter()
   M.redraw()
   vim.notify("ClaudeCode: activity — " .. filter.desc, vim.log.levels.INFO)
+end
+
+---Checkpoint the selected session: draw a line through its history, so what it
+---does from now on is listed apart from what it did before (see
+---`agents/checkpoints.lua`).
+---
+---The selected session rather than the row under the cursor: every pane follows
+---the selection, and the panes are where the line is read.
+---@return number|nil ts The checkpoint taken, nil when none was.
+function M.checkpoint()
+  local session_id = model.selected()
+  if not session_id then
+    vim.notify("ClaudeCode: no session selected to checkpoint", vim.log.levels.WARN)
+    return nil
+  end
+  local checkpoints = require("claudecode.agents.checkpoints")
+  local ts, count = checkpoints.add(session_id)
+  if not ts then
+    vim.notify("ClaudeCode: a checkpoint was taken this second already", vim.log.levels.INFO)
+    return nil
+  end
+  M.redraw()
+  vim.notify(
+    string.format("ClaudeCode: checkpoint at %s (%d on this session)", checkpoints.label(ts), count),
+    vim.log.levels.INFO
+  )
+  return ts
+end
+
+---Drop the selected session's newest checkpoint, merging its era into the next.
+---@return number|nil ts The checkpoint dropped, nil when there was none.
+function M.drop_checkpoint()
+  local session_id = model.selected()
+  if not session_id then
+    vim.notify("ClaudeCode: no session selected", vim.log.levels.WARN)
+    return nil
+  end
+  local checkpoints = require("claudecode.agents.checkpoints")
+  local ts, left = checkpoints.drop(session_id)
+  if not ts then
+    vim.notify("ClaudeCode: this session has no checkpoint to drop", vim.log.levels.INFO)
+    return nil
+  end
+  M.redraw()
+  vim.notify(
+    string.format("ClaudeCode: dropped the checkpoint at %s (%d left)", checkpoints.label(ts), left),
+    vim.log.levels.INFO
+  )
+  return ts
 end
 
 ---Switch the Subagents pane between agent types and descriptions. The winbar says

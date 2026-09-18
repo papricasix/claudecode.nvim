@@ -103,6 +103,13 @@ describe("agents_view", function()
       expect((pcall(config.validate, base_config({ keymaps = { new = 42 } })))).to_be(false)
     end)
 
+    it("takes keymaps and a highlight for checkpoints", function()
+      expect((pcall(config.validate, base_config({ keymaps = { checkpoint = "C", checkpoint_drop = false } })))).to_be_true()
+      expect((pcall(config.validate, base_config({ keymaps = { checkpoint = 42 } })))).to_be(false)
+      expect((pcall(config.validate, base_config({ highlights = { checkpoint = "NonText" } })))).to_be_true()
+      expect((pcall(config.validate, base_config({ highlights = { checkpoint = 1 } })))).to_be(false)
+    end)
+
     it("rejects a non-table block", function()
       expect((pcall(config.validate, base_config("yes please")))).to_be(false)
     end)
@@ -1631,6 +1638,15 @@ describe("agents_view", function()
       expect(keys_for("feed")["gs"]).to_be_string()
       expect(keys_for("changes")["gs"]).to_be_string()
       expect(keys_for("center")["gs"]).to_be(nil) -- `gs` belongs to Claude there
+    end)
+
+    it("offers the checkpoint keys from every pane that lists the session's records", function()
+      setup_with({ enabled = true })
+      for _, pane in ipairs({ "sessions", "feed", "changes", "subagents" }) do
+        expect(keys_for(pane)["gc"]).to_be_string()
+        expect(keys_for(pane)["gC"]).to_be_string()
+      end
+      expect(keys_for("center")["gc"]).to_be(nil) -- `gc` belongs to Claude there
     end)
 
     it("groups them under headings, this pane's first", function()

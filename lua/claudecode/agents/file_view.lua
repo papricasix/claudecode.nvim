@@ -268,38 +268,61 @@ local function reconstruction(history)
   return history.reconstruction
 end
 
----Show one call's edit: the file as that call left it, against what it found.
+---Show a run of consecutive calls as one edit: the file as the last call left
+---it, against what the first one found.
 ---
----An Activity row is one tool call, so its diff is that call's, not the session's.
+---One call (an Activity row: `first == last`) or an era's worth of them (a
+---Changes row between checkpoints) — the same question either way, "what did
+---this span of the session do here", and the same two ways to answer it.
+---
 ---Both sides come from the record when it holds enough to rebuild them
 ---(`patch.reconstruct`: an `originalFile`, a whole read or a `Write`'s content
 ---somewhere in the session, and the hunks between), and the title says so —
 ---`reconstructed` is the file as it stood then, not as it is now.
 ---
 ---Without an anchor the moment is rebuilt from today's file instead: every later
----step undone first (`patch.reverse_apply`, newest first), then this one for the
----other side, titled `on disk`. A hunk that no longer locates means something
----outside the session has touched those lines since; then the call's own patch
----is shown as diff text, which is the record itself, and the title says why.
+---step undone first (`patch.reverse_apply`, newest first), then the span's own for
+---the other side, titled `on disk`. A hunk that no longer locates means something
+---outside the session has touched those lines since; then the span's own patches
+---are shown as diff text, which is the record itself, and the title says why.
 ---@param opts table `M.open`'s opts.
 ---@param history ClaudeCodeAgentsFileHistory
----@param index integer Position of the step in `history.steps`.
+---@param first integer Position of the first step in `history.steps`.
+---@param last integer Position of the last.
+---@param what string How the title names the span: `edit 3 of 7`, `since 14:32`.
 ---@param title_for fun(note: string|nil): string
+---@param whole boolean The span is an era rather than one call: a span that left the file as it found it says so instead of opening an empty diff.
 ---@return integer|nil win
-local function open_step(opts, history, index, title_for)
+local function open_range(opts, history, first, last, what, title_for, whole)
   local steps = history.steps
-  local step = steps[index]
   local path = opts.path
-  local what = string.format("%s %d of %d", step.kind, index, #steps)
+  local own = {}
+  for i = first, last do
+    for _, hunk in ipairs(steps[i].hunks or {}) do
+      own[#own + 1] = hunk
+    end
+  end
 
   ---@param reason string|nil
   ---@return integer|nil
   local function patches(reason)
     local note = reason and (what .. ", " .. reason) or what
     if reason then
-      logger.debug("agents", "file_view: step", index, "of", path, "-", reason, "- showing its patch")
+      logger.debug("agents", "file_view:", what, "of", path, "-", reason, "- showing its patch")
     end
-    return open_patch_text(opts.session_id, path, step.hunks, title_for("(" .. note .. ")"), opts.reuse)
+    return open_patch_text(opts.session_id, path, own, title_for("(" .. note .. ")"), opts.reuse)
+  end
+
+  ---@param before string[]
+  ---@param after string[]
+  ---@return boolean unchanged The span left the file as it found it, and said so.
+  local function unchanged(before, after)
+    if whole and M._same_lines(before, after) then
+      local name = vim.fn.fnamemodify(path, ":t")
+      vim.notify("ClaudeCode: " .. name .. " was left as it was found (" .. what .. ")", vim.log.levels.INFO)
+      return true
+    end
+    return false
   end
 
   if not unified_available() then
@@ -307,8 +330,11 @@ local function open_step(opts, history, index, title_for)
   end
 
   local states = reconstruction(history)
-  local before, after = states[index - 1], states[index]
+  local before, after = states[first - 1], states[last]
   if before and after then
+    if unchanged(before, after) then
+      return nil
+    end
     local title = title_for("(" .. what .. ", reconstructed)")
     local win = open_inline_diff(opts.session_id, path, after, before, title, opts.reuse)
     if win then
@@ -321,8 +347,8 @@ local function open_step(opts, history, index, title_for)
     return patches("deleted")
   end
   local later = {}
-  for i = index + 1, #steps do
-    for _, hunk in ipairs(steps[i].hunks) do
+  for i = last + 1, #steps do
+    for _, hunk in ipairs(steps[i].hunks or {}) do
       later[#later + 1] = hunk
     end
   end
@@ -333,16 +359,51 @@ local function open_step(opts, history, index, title_for)
   after = rebuilt
 
   before = {}
-  if not step.created then
+  if not steps[first].created then
     local applied
-    before, applied, skipped = patch.reverse_apply(after, step.hunks)
+    before, applied, skipped = patch.reverse_apply(after, own)
     if skipped > 0 or applied == 0 then
       return patches("file moved on")
     end
   end
+  if unchanged(before, after) then
+    return nil
+  end
 
   local win = open_inline_diff(opts.session_id, path, after, before, title_for("(" .. what .. ", on disk)"), opts.reuse)
   return win or patches(nil)
+end
+
+---Show one call's edit: the file as that call left it, against what it found.
+---
+---An Activity row is one tool call, so its diff is that call's, not the session's;
+---the title says which of the session's edits to the file it is.
+---@param opts table `M.open`'s opts.
+---@param history ClaudeCodeAgentsFileHistory
+---@param index integer Position of the step in `history.steps`.
+---@param title_for fun(note: string|nil): string
+---@return integer|nil win
+local function open_step(opts, history, index, title_for)
+  local steps = history.steps
+  local what = string.format("%s %d of %d", steps[index].kind, index, #steps)
+  return open_range(opts, history, index, index, what, title_for, false)
+end
+
+---The steps an era covers: those after `from` and up to `to`, either bound open.
+---@param steps ClaudeCodeAgentsFileStep[]
+---@param era { from: number?, to: number? }
+---@return integer|nil first
+---@return integer|nil last
+local function era_steps(steps, era)
+  local first, last = nil, nil
+  for index, step in ipairs(steps) do
+    local ts = tonumber(step.ts) or 0
+    if (not era.from or ts > era.from) and (not era.to or ts <= era.to) then
+      first = first or index
+      last = index
+    end
+  end
+  return first, last
 end
 
 ---Whether two files are line-for-line identical.
@@ -456,9 +517,13 @@ end
 ---
 ---`prefer = "step"` with a `tool_id` shows that one call's edit (see `open_step`);
 ---a call the history holds no step for falls back to the session's whole diff.
+---`era` (a Changes row between checkpoints) shows the edits inside that span as
+---one diff (`open_range`), titled by the era's `note`; an era the history holds
+---no step for falls back the same way.
 ---@param opts { session_id: string?, transcript: string?, path: string, line: integer?,
 ---             read: { start_line: integer, num_lines: integer }?, prefer: "diff"|"read"|"step"?,
----             tool_id: string?, cwd: string?, reuse: integer? }
+---             tool_id: string?, era: { from: number?, to: number?, note: string }?,
+---             cwd: string?, reuse: integer? }
 ---@param done fun(win: integer|nil)|nil Called once the float is up (the history read is async).
 function M.open(opts, done)
   local path = opts and opts.path
@@ -578,6 +643,16 @@ function M.open(opts, done)
         if step.tool_id == opts.tool_id then
           return finish(open_step(opts, history, index, title_for))
         end
+      end
+    end
+    if type(opts.era) == "table" and history then
+      local first, last = era_steps(history.steps or {}, opts.era)
+      if first and last then
+        local what = opts.era.note
+        if not what or what == "" then
+          what = string.format("edits %d-%d", first, last)
+        end
+        return finish(open_range(opts, history, first, last, what, title_for, true))
       end
     end
     return show_history(history)

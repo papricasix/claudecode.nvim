@@ -908,10 +908,14 @@ end
 ---The session's subagents and background tasks as a flattened tree, children
 ---under their parent in the order they started.
 ---@param transcript_path string
----@param opts { live: boolean?, now: number? }|nil `live`: the session is running.
+---@param opts { live: boolean?, now: number?, checkpoints: number[]? }|nil `live`: the session is running; `checkpoints`: ascending, drawn as rules between the top-level runs.
 ---@return ClaudeCodeSubagentRow[]
 function M.rows(transcript_path, opts)
-  opts = { live = opts and opts.live, now = (opts and opts.now) or os.time() }
+  opts = {
+    live = opts and opts.live,
+    now = (opts and opts.now) or os.time(),
+    checkpoints = opts and opts.checkpoints or nil,
+  }
   local agents, sources, runs, run_agents = collect_sources(transcript_path)
   local index = { notes = {}, results = {}, calls = {}, stops = {}, events = {} }
 
@@ -1002,6 +1006,20 @@ function M.rows(transcript_path, opts)
   end
 
   local out, visited = {}, {}
+  -- Checkpoints (`agents/checkpoints.lua`) are rules between the top-level runs:
+  -- a run started at or before one sits above it, one started after sits below.
+  -- The tree wins over the clock — a child started after the checkpoint stays
+  -- under its parent, since where it hangs is what the pane is for.
+  local marks = (opts and opts.checkpoints) or {}
+  local next_mark = 1
+  ---@param before number Emit every rule older than this start.
+  local function rules_before(before)
+    while next_mark <= #marks and marks[next_mark] < before do
+      out[#out + 1] =
+        { kind = "checkpoint", ts = marks[next_mark], index = next_mark, count = #marks, depth = 0, prefix = "" }
+      next_mark = next_mark + 1
+    end
+  end
   ---@param list table[] Subagents, and shell nodes (`kind = "shell"`).
   ---@param depth integer
   ---@param stem string Connectors inherited from the ancestors.
@@ -1010,6 +1028,9 @@ function M.rows(transcript_path, opts)
     for position, agent in ipairs(list) do
       if not visited[agent.id] then
         visited[agent.id] = true
+        if depth == 0 then
+          rules_before(agent.started or 0)
+        end
         local last = position == #list
         local prefix = depth == 0 and "" or (stem .. (last and "└─" or "├─"))
         if agent.kind == "workflow" then
@@ -1108,6 +1129,9 @@ function M.rows(transcript_path, opts)
     end
   end
   walk(roots, 0, "")
+  -- The rules nothing has started since sit at the bottom: "nothing new" is
+  -- what a checkpoint is taken to find out.
+  rules_before(math.huge)
   return out
 end
 

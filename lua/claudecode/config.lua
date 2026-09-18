@@ -188,6 +188,12 @@ M.defaults = {
       goto_file = "gf", -- open the file itself, on disk, in a new tab
       filter = "f", -- Activity pane: everything / only files / only commands
       subagent_label = "g.", -- Tasks pane: name each run by its description (default) / by its agent type or command
+      -- Draw a line through the selected session's history: what it does from
+      -- now on is listed apart from what it did before, in every pane, and a
+      -- Changes row opens as that era's diff. `:ClaudeCodeAgentsCheckpoint` is
+      -- the same; `gC` (the command with `!`) drops the newest one.
+      checkpoint = "gc",
+      checkpoint_drop = "gC",
       help = "?", -- show the keys that reach the pane you are in
       next_pane = "<Tab>",
       focus_term = "i",
@@ -216,6 +222,8 @@ M.defaults = {
       foldable = "ClaudeCodeAgentsFoldable",
       -- A message to a subagent, behind its `›`; defaults to a link to CursorLine.
       prompt = "ClaudeCodeAgentsPrompt",
+      -- The rule a checkpoint draws through a pane; defaults to a link to Comment.
+      checkpoint = "ClaudeCodeAgentsCheckpoint",
       -- Terminal pane background: follows SnacksNormal when snacks is loaded,
       -- else NormalFloat. The sidebars keep the editor's own Normal.
       normal = "ClaudeCodeAgentsNormal",
@@ -700,6 +708,8 @@ function M.validate(config)
         "goto_file",
         "filter",
         "subagent_label",
+        "checkpoint",
+        "checkpoint_drop",
         "help",
         "next_pane",
         "focus_term",
@@ -732,6 +742,7 @@ function M.validate(config)
         "match",
         "foldable",
         "prompt",
+        "checkpoint",
       }
       for _, field in ipairs(highlight_fields) do
         checker(ag.highlights, "agents.highlights")(field, function(v)

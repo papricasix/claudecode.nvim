@@ -19,6 +19,7 @@
 ---@brief ]]
 ---@module 'claudecode.agents.model'
 
+local checkpoints = require("claudecode.agents.checkpoints")
 local transcript = require("claudecode.agents.transcript")
 
 local M = {}
@@ -100,6 +101,11 @@ local function new_state()
     -- What a run was sent to do by default: several `general-purpose` rows are
     -- told apart only by it.
     subagent_label = "description",
+    -- The rule the Activity pane draws where a checkpoint falls, one table per
+    -- `(session, checkpoint)` and reused across paints: `stamp_feed` ages rows by
+    -- table identity, so a fresh table every frame would light the rule up on
+    -- every redraw, while a kept one arrives lit once and settles like any row.
+    dividers = {}, ---@type table<string, table>
   }
 end
 
@@ -1169,6 +1175,7 @@ function M.delete_sessions(session_ids)
       failed[#failed + 1] = { session_id = session_id, err = err }
     else
       deleted[#deleted + 1] = session_id
+      checkpoints.forget(session_id)
       if state.selected == session_id then
         state.selected = nil
         state.dirty.transcript = true
@@ -1205,6 +1212,73 @@ function M.transcript_path(session_id)
   return row and row.path or nil
 end
 
+---The rule for one checkpoint, as an Activity row: the same table every time it
+---is asked for, so the pane's fade treats it like any other row (see `dividers`).
+---@param session_id string
+---@param marks number[] The conversation's checkpoints, ascending.
+---@param index integer Which one.
+---@return table
+local function divider_for(session_id, marks, index)
+  local key = session_id .. "\0" .. tostring(marks[index])
+  local row = state.dividers[key]
+  if not row then
+    row = { kind = "checkpoint", ts = marks[index], index = index }
+    state.dividers[key] = row
+  end
+  row.count = #marks
+  return row
+end
+
+---How many of a session's events the filter lets through — what `feed` would
+---list with no limit, so it can tell "the walk showed everything" from "it
+---stopped at the pane's height".
+---@param events table[]
+---@param filter string
+---@return integer
+local function count_shown(events, filter)
+  if filter == "all" then
+    return #events
+  end
+  local n = 0
+  for _, event in ipairs(events) do
+    if (filter == "tools") == (event.kind == "tool") then
+      n = n + 1
+    end
+  end
+  return n
+end
+
+---Slot a rule into the newest-first feed wherever a checkpoint falls between two
+---events: above every event at or before it, below every event after it. A
+---checkpoint newer than the newest event sits at the top — "nothing since" is
+---worth a row. One older than everything drawn is left out unless the walk drew
+---the whole history: below a pane cut to its height it would sit under events
+---that are not its neighbours.
+---@param out table[] Newest first.
+---@param marks number[] Ascending.
+---@param session_id string
+---@param complete boolean The walk drew every event the filter allows.
+---@return table[]
+local function with_dividers(out, marks, session_id, complete)
+  local rows = {}
+  local next_mark = #marks
+  for _, event in ipairs(out) do
+    local ts = tonumber(event.ts) or 0
+    while next_mark >= 1 and marks[next_mark] >= ts do
+      rows[#rows + 1] = divider_for(session_id, marks, next_mark)
+      next_mark = next_mark - 1
+    end
+    rows[#rows + 1] = event
+  end
+  if complete then
+    while next_mark >= 1 do
+      rows[#rows + 1] = divider_for(session_id, marks, next_mark)
+      next_mark = next_mark - 1
+    end
+  end
+  return rows
+end
+
 ---Activity events of the selected session, **newest first**.
 ---
 ---The store keeps them oldest-first, which is how they happened; the pane shows
@@ -1223,6 +1297,9 @@ end
 ---cursor's place in the list with it — and with it the row `<C-n>` steps from.
 ---So the walk goes on past `visible` until each kept row is drawn, and never past
 ---`feed_limit`.
+---
+---With checkpoints on the conversation, a `{ kind = "checkpoint", ts, index,
+---count }` row is slotted in wherever one falls (`with_dividers`).
 ---@param visible integer|nil Rows the pane can show. Unbounded when omitted.
 ---@param keep table<string, true>|nil `transcript.event_key`s to draw however far down they are.
 ---@return table[] events The transcript's own tables, newest first.
@@ -1266,6 +1343,10 @@ function M.feed(visible, keep)
         end
       end
     end
+  end
+  local marks = checkpoints.list(row.session_id)
+  if #marks > 0 then
+    out = with_dividers(out, marks, row.session_id, #out == count_shown(events, filter))
   end
   return out, stamp_feed(out)
 end
@@ -1324,32 +1405,97 @@ function M.changes()
 
   local utils = require("claudecode.utils")
   local entries = {}
+
+  ---One row: a file, with the counts of whichever span of the session is asked
+  ---about — the whole of it, or one era between checkpoints.
+  ---@param path string
+  ---@param counts { added: integer, removed: integer, kind: string }
+  ---@param era { index: integer, count: integer, from: number?, to: number?, note: string }|nil
+  local function push(path, counts, era)
+    -- Keyed the way `git.parse_status` keys it: git answers with `/`
+    -- separators whatever the platform, and this path is the CLI's own.
+    local key = utils.path_key(path)
+    local letter = state.git[key]
+    -- Gone from disk is decided by us as well as by git: a file the session
+    -- created and then removed was never tracked, so git says nothing about it
+    -- and the transcript alone would still call it an add.
+    local deleted = letter == "D" or state.gone[key] == true
+    -- Keyed by session as well as path: the same file under a different
+    -- conversation is a different set of counts, and comparing across the two
+    -- would flash the whole pane on every selection change. An era row is its
+    -- own set of counts too.
+    local counts_key = "file\0" .. row.session_id .. "\0" .. path .. (era and ("\0" .. era.index) or "")
+    local added_age, removed_age = stamp_counts(counts_key, counts.added, counts.removed)
+    entries[#entries + 1] = {
+      path = path,
+      added = counts.added,
+      removed = counts.removed,
+      added_age_ms = added_age,
+      removed_age_ms = removed_age,
+      kind = counts.kind,
+      deleted = deleted,
+      scratchpad = transcript.is_scratchpad(path),
+      status = deleted and "D" or letter or (counts.kind == "add" and "A" or "M"),
+      era = era,
+    }
+  end
+
+  local marks = checkpoints.list(row.session_id)
+  if #marks == 0 then
+    for _, path in ipairs(summary.order or {}) do
+      local file = summary.files[path]
+      if file and file.kind ~= "read" then
+        push(path, file, nil)
+      end
+    end
+    return entries
+  end
+
+  -- With checkpoints, a file is listed once per era it was edited in, with that
+  -- era's own counts, and a rule between the eras. Each era keeps the pane's
+  -- first-touch order within itself, and the eras run oldest to newest — where
+  -- new files have always appeared in this pane.
+  local eras = {}
   for _, path in ipairs(summary.order or {}) do
     local file = summary.files[path]
-    if file and file.kind ~= "read" then
-      -- Keyed the way `git.parse_status` keys it: git answers with `/`
-      -- separators whatever the platform, and this path is the CLI's own.
-      local key = utils.path_key(path)
-      local letter = state.git[key]
-      -- Gone from disk is decided by us as well as by git: a file the session
-      -- created and then removed was never tracked, so git says nothing about it
-      -- and the transcript alone would still call it an add.
-      local deleted = letter == "D" or state.gone[key] == true
-      -- Keyed by session as well as path: the same file under a different
-      -- conversation is a different set of counts, and comparing across the two
-      -- would flash the whole pane on every selection change.
-      local added_age, removed_age = stamp_counts("file\0" .. row.session_id .. "\0" .. path, file.added, file.removed)
-      entries[#entries + 1] = {
-        path = path,
-        added = file.added,
-        removed = file.removed,
-        added_age_ms = added_age,
-        removed_age_ms = removed_age,
-        kind = file.kind,
-        deleted = deleted,
-        scratchpad = transcript.is_scratchpad(path),
-        status = deleted and "D" or letter or (file.kind == "add" and "A" or "M"),
-      }
+    local edits = file and file.edits
+    -- A summary with no per-edit record (an old cache, a stub) still has its
+    -- totals; they are dated by the file's last touch rather than dropped.
+    if file and file.kind ~= "read" and (type(edits) ~= "table" or #edits == 0) then
+      edits = { { ts = file.last_ts, added = file.added, removed = file.removed, kind = file.kind } }
+    end
+    for _, edit in ipairs(edits or {}) do
+      local index = checkpoints.era(marks, edit.ts)
+      local era = eras[index]
+      if not era then
+        era = { order = {}, by_path = {} }
+        eras[index] = era
+      end
+      local counts = era.by_path[path]
+      if not counts then
+        counts = { added = 0, removed = 0, kind = edit.kind }
+        era.by_path[path] = counts
+        era.order[#era.order + 1] = path
+      end
+      counts.added = counts.added + (tonumber(edit.added) or 0)
+      counts.removed = counts.removed + (tonumber(edit.removed) or 0)
+      counts.kind = edit.kind or counts.kind
+    end
+  end
+
+  local now = M._now_s()
+  for index = 1, #marks + 1 do
+    local era = eras[index]
+    if era then
+      local from, to = checkpoints.bounds(marks, index)
+      local span =
+        { index = index, count = #marks, from = from, to = to, note = checkpoints.era_note(marks, index, now) }
+      for _, path in ipairs(era.order) do
+        push(path, era.by_path[path], span)
+      end
+    end
+    if index <= #marks then
+      entries[#entries + 1] = { kind = "checkpoint", ts = marks[index], index = index, count = #marks }
     end
   end
   return entries
@@ -1370,6 +1516,7 @@ function M.subagents()
   local rows = require("claudecode.agents.subagents").rows(row.path, {
     live = is_live(row),
     now = M._now_s(),
+    checkpoints = checkpoints.list(row.session_id),
   })
   local running = false
   for _, entry in ipairs(rows) do

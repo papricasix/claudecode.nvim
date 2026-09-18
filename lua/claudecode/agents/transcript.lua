@@ -145,6 +145,7 @@ local config = nil
 ---@field added integer
 ---@field removed integer
 ---@field kind "read"|"add"|"edit" Last thing that happened to it.
+---@field edits { ts: number, added: integer, removed: integer, kind: "add"|"edit" }[] Each edit on its own, oldest first (reads left out).
 ---@field last_ts number
 
 ---@class ClaudeCodeAgentsSummary
@@ -725,7 +726,7 @@ end
 local function touch_file(sum, path, kind, added, removed, ts)
   local entry = sum.files[path]
   if not entry then
-    entry = { added = 0, removed = 0, kind = kind, last_ts = ts }
+    entry = { added = 0, removed = 0, kind = kind, last_ts = ts, edits = {} }
     sum.files[path] = entry
     sum.order[#sum.order + 1] = path
   end
@@ -736,6 +737,13 @@ local function touch_file(sum, path, kind, added, removed, ts)
   -- about what the session did to it, and an edit is the stronger claim.
   if kind ~= "read" or entry.kind == "read" then
     entry.kind = kind
+  end
+  -- Each edit on its own, dated, so the counts can be split at a checkpoint
+  -- (`agents/checkpoints.lua`) without re-reading the transcript. Reads are left
+  -- out: they count for nothing and are most of a session's touches.
+  if kind ~= "read" then
+    entry.edits = entry.edits or {}
+    entry.edits[#entry.edits + 1] = { ts = ts, added = added, removed = removed, kind = kind }
   end
 end
 
@@ -2604,8 +2612,9 @@ end
 --- older version is not wrong-looking, only wrong: version 1's `last_ts` came
 --- from tool events alone, so a cache from it would sort the list by something
 --- other than what the list now claims to sort by, until every row re-folded.
---- An entry from another version is dropped, costing one cold fold.
-local CACHE_VERSION = 2
+--- An entry from another version is dropped, costing one cold fold. Version 3
+--- added each file's dated `edits`, which a checkpoint splits the counts by.
+local CACHE_VERSION = 3
 
 ---@return string path
 function M.cache_path()

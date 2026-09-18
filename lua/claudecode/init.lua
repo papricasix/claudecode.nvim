@@ -975,6 +975,18 @@ function M._create_commands()
     desc = "Toggle the Claude agents view: several agents on this project, side by side (optionally: on | off)",
   })
 
+  vim.api.nvim_create_user_command("ClaudeCodeAgentsCheckpoint", function(opts)
+    local agents = require("claudecode.agents_view")
+    if opts.bang then
+      agents.drop_checkpoint()
+    else
+      agents.checkpoint()
+    end
+  end, {
+    bang = true,
+    desc = "Draw a line through the selected agent session's history: what it does from now on is listed apart from what it did before (with !: drop its newest checkpoint)",
+  })
+
   vim.api.nvim_create_user_command("ClaudeCodeAgentNew", function()
     local agents = require("claudecode.agents_view")
     if not agents.is_open() then

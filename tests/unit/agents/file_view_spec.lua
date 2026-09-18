@@ -352,6 +352,116 @@ describe("agents.file_view", function()
     end)
   end)
 
+  describe("an era between checkpoints", function()
+    local function step(tool_id, ts, hunks, extra)
+      local s = { tool_id = tool_id, ts = ts, kind = "edit", hunks = hunks, created = false }
+      for k, v in pairs(extra or {}) do
+        s[k] = v
+      end
+      return s
+    end
+
+    local function history_of(steps)
+      local hunks = {}
+      for _, s in ipairs(steps) do
+        for _, h in ipairs(s.hunks) do
+          hunks[#hunks + 1] = h
+        end
+      end
+      return { hunks = hunks, steps = steps, created = false, reads = {} }
+    end
+
+    local function open_era(era)
+      return open({
+        session_id = "s",
+        transcript = "/p/a.jsonl",
+        path = "/proj/a.lua",
+        era = era,
+      })
+    end
+
+    before_each(function()
+      install_unified()
+      -- Three edits; a checkpoint between the second and the third.
+      disk["/proj/a.lua"] = { "ONE", "TWO", "THREE" }
+      histories["/proj/a.lua"] = history_of({
+        step("toolu_1", 10, { hunk(1, { "-one", "+ONE" }) }),
+        step("toolu_2", 20, { hunk(2, { "-two", "+TWO" }) }),
+        step("toolu_3", 30, { hunk(3, { "-three", "+THREE" }) }),
+      })
+    end)
+
+    it("shows the edits before the checkpoint as one diff, the later one undone", function()
+      local win = open_era({ to = 25, note = "until 14:32" })
+      expect(win).not_to_be_nil()
+      expect(shown[1].old_text).to_be("one\ntwo\nthree\n")
+      local buf, title = float_buf()
+      assert.same({ "ONE", "TWO", "three" }, vim.api.nvim_buf_get_lines(buf, 0, -1, false))
+      expect(title:find("(until 14:32, on disk)", 1, true) ~= nil).to_be_true()
+    end)
+
+    it("shows what changed since the checkpoint against the file as it stood then", function()
+      open_era({ from = 25, note = "since 14:32" })
+      expect(shown[1].old_text).to_be("ONE\nTWO\nthree\n")
+      local buf, title = float_buf()
+      assert.same({ "ONE", "TWO", "THREE" }, vim.api.nvim_buf_get_lines(buf, 0, -1, false))
+      expect(title:find("(since 14:32, on disk)", 1, true) ~= nil).to_be_true()
+    end)
+
+    it("takes an era between two checkpoints", function()
+      open_era({ from = 15, to = 25, note = "14:00 – 14:32" })
+      expect(shown[1].old_text).to_be("ONE\ntwo\nthree\n")
+      local buf = float_buf()
+      assert.same({ "ONE", "TWO", "three" }, vim.api.nvim_buf_get_lines(buf, 0, -1, false))
+    end)
+
+    it("takes both sides from the record when an anchor reaches them", function()
+      histories["/proj/a.lua"].steps[1].before = "one\ntwo\nthree\n"
+      disk["/proj/a.lua"] = { "utterly", "different" }
+      open_era({ to = 25, note = "until 14:32" })
+      expect(shown[1].old_text).to_be("one\ntwo\nthree\n")
+      local buf, title = float_buf()
+      assert.same({ "ONE", "TWO", "three" }, vim.api.nvim_buf_get_lines(buf, 0, -1, false))
+      expect(title:find("(until 14:32, reconstructed)", 1, true) ~= nil).to_be_true()
+    end)
+
+    it("shows the era's own patches when the file has moved on", function()
+      disk["/proj/a.lua"] = { "utterly", "different", "file" }
+      open_era({ to = 25, note = "until 14:32" })
+      expect(#shown).to_be(0)
+      local buf, title = float_buf()
+      expect(vim.api.nvim_buf_get_option(buf, "filetype")).to_be("diff")
+      expect(title:find("file moved on", 1, true) ~= nil).to_be_true()
+      -- Only the era's two hunks, not the third.
+      local text = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+      expect(text:find("+TWO", 1, true) ~= nil).to_be_true()
+      expect(text:find("+THREE", 1, true)).to_be_nil()
+    end)
+
+    it("says so when the era left the file as it found it", function()
+      local notified = {}
+      local notify = vim.notify
+      vim.notify = function(msg)
+        notified[#notified + 1] = msg
+      end
+      histories["/proj/a.lua"] = history_of({
+        step("toolu_1", 10, { hunk(1, { "-one", "+ONE" }) }),
+        step("toolu_2", 20, { hunk(1, { "-ONE", "+one" }) }),
+      })
+      disk["/proj/a.lua"] = { "one", "two", "three" }
+      local win = open_era({ to = 25, note = "until 14:32" })
+      vim.notify = notify
+      expect(win).to_be(nil)
+      expect(#shown).to_be(0)
+      expect(notified[1]:find("left as it was found", 1, true) ~= nil).to_be_true()
+    end)
+
+    it("falls back to the session's whole diff for an era with no edit in it", function()
+      open_era({ from = 100, note = "since 15:00" })
+      expect(shown[1].old_text).to_be("one\ntwo\nthree\n")
+    end)
+  end)
+
   describe("the session's changes, from the record", function()
     local function step(tool_id, hunks, extra)
       local s = { tool_id = tool_id, kind = "edit", hunks = hunks, created = false }

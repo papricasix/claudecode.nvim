@@ -372,6 +372,21 @@ describe("agents.render", function()
       expect(render.payload_at(feed, 1).path).to_be("/proj/b.lua")
     end)
 
+    it("draws a checkpoint as a rule between the events, dated from the next day on", function()
+      local ts = os.time({ year = 2026, month = 9, day = 17, hour = 14, min = 32, sec = 0 })
+      local feed = render.create_buf("feed")
+      render.feed(feed, {
+        { ts = ts + 60, kind = "edit", path = "/proj/b.lua" },
+        { kind = "checkpoint", ts = ts, index = 1, count = 1 },
+        { ts = ts - 60, kind = "read", path = "/proj/a.lua" },
+      }, { width = 40, cwd = "/proj", now = ts + 86400 })
+      local lines = lines_of(feed)
+      expect(#lines).to_be(3)
+      expect(lines[2]:find("── checkpoint Sep 17 14:32 ─", 1, true) ~= nil).to_be_true()
+      expect(render.payload_at(feed, 2).kind).to_be("checkpoint")
+      expect(render.payload_at(feed, 3).path).to_be("/proj/a.lua")
+    end)
+
     it("draws a tool call as the tool and what the call was for", function()
       local feed = render.create_buf("feed")
       render.feed(feed, {
@@ -636,6 +651,35 @@ describe("agents.render", function()
       render.changes(changes, {}, { width = 40 })
       expect(lines_of(changes)[1]:find("no files", 1, true) ~= nil).to_be_true()
     end)
+
+    it("draws a checkpoint as a rule across the pane, and tells the same file's eras apart", function()
+      local ts = os.time({ year = 2026, month = 9, day = 17, hour = 14, min = 32, sec = 0 })
+      local changes = render.create_buf("changes")
+      render.changes(changes, {
+        { path = "/proj/a.lua", status = "M", added = 1, removed = 0, era = { index = 1, count = 1, to = ts } },
+        { kind = "checkpoint", ts = ts, index = 1, count = 1 },
+        { path = "/proj/a.lua", status = "M", added = 2, removed = 0, era = { index = 2, count = 1, from = ts } },
+      }, { width = 40, cwd = "/proj", now = ts + 60 })
+
+      local lines = lines_of(changes)
+      expect(#lines).to_be(3)
+      expect(lines[2]:find("── checkpoint 14:32 ─", 1, true) ~= nil).to_be_true()
+      expect(vim.fn.strdisplaywidth(lines[2])).to_be(40)
+      -- The rule is one span in its own group, and is not a file.
+      local rule = render.payload_at(changes, 2)
+      expect(rule.kind).to_be("checkpoint")
+      expect(rule.path).to_be(nil)
+      local group
+      for _, mark in ipairs(vim._extmarks or {}) do
+        if mark.bufnr == changes and mark.row == 1 then
+          group = mark.opts.hl_group
+        end
+      end
+      expect(group).to_be("ClaudeCodeAgentsCheckpoint")
+      -- Two rows of one file, each its own row to the cursor and to `<CR>`.
+      expect(render.payload_at(changes, 1).key ~= render.payload_at(changes, 3).key).to_be_true()
+      expect(render.payload_at(changes, 3).era.from).to_be(ts)
+    end)
   end)
 
   describe("subagents", function()
@@ -665,6 +709,21 @@ describe("agents.render", function()
         expect(vim.fn.strdisplaywidth(line)).to_be(40)
       end
       expect(render.payload_at(pane, 2).agent_id).to_be("b")
+    end)
+
+    it("draws a checkpoint as a rule across the tree", function()
+      local ts = os.time({ year = 2026, month = 9, day = 17, hour = 14, min = 32, sec = 0 })
+      render.subagents(pane, {
+        { id = "a", agent_type = "Explore", prefix = "", state = "done", tokens = 100, runtime_s = 5 },
+        { kind = "checkpoint", ts = ts, index = 1, count = 1, prefix = "", depth = 0 },
+        { id = "b", agent_type = "Plan", prefix = "", state = "running", tokens = 100, runtime_s = 5 },
+      }, { width = 40, now = ts + 60 })
+      local lines = lines_of(pane)
+      expect(#lines).to_be(3)
+      expect(lines[2]:find("── checkpoint 14:32 ─", 1, true) ~= nil).to_be_true()
+      expect(vim.fn.strdisplaywidth(lines[2])).to_be(40)
+      expect(render.payload_at(pane, 2).kind).to_be("checkpoint")
+      expect(render.payload_at(pane, 3).agent_id).to_be("b")
     end)
 
     it("names a run by its description, cut with an ellipsis to fit, or by its type on request", function()

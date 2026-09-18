@@ -157,6 +157,30 @@ describe("agents.subagents", function()
       expect(#out).to_be(1)
       expect(out[1].prefix).to_be("")
     end)
+
+    it("draws a checkpoint as a rule between the top-level runs it falls between", function()
+      agent("root", { first = NOW - 300 })
+      agent("child", { parent = "root", first = NOW - 150 }) -- after the checkpoint, still under its parent
+      agent("late", { first = NOW - 100 })
+
+      local out = rows({ live = true, checkpoints = { NOW - 200, NOW - 10 } })
+      local drawn = {}
+      for _, row in ipairs(out) do
+        drawn[#drawn + 1] = row.kind == "checkpoint" and ("──" .. row.index) or (row.prefix .. row.id)
+      end
+      -- One rule where nothing has started since: "nothing new" is what it was
+      -- taken to find out.
+      assert.same({ "root", "└─child", "──1", "late", "──2" }, drawn)
+      expect(out[3].ts).to_be(NOW - 200)
+      expect(out[3].depth).to_be(0)
+    end)
+
+    it("draws a checkpoint older than every run at the top", function()
+      agent("root", { first = NOW - 300 })
+      local out = rows({ live = true, checkpoints = { NOW - 400 } })
+      expect(out[1].kind).to_be("checkpoint")
+      expect(out[2].id).to_be("root")
+    end)
   end)
 
   describe("where a run stands", function()
