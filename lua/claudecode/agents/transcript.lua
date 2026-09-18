@@ -110,16 +110,24 @@ local config = nil
 
 ---@class ClaudeCodeAgentsEvent
 ---@field ts number Epoch seconds (0 when the entry carried no timestamp).
----@field kind "read"|"add"|"edit"|"tool" What the agent did. `tool` is a call that touched no file.
+---@field kind "read"|"add"|"edit"|"tool"|"rewind" What the agent did. `tool` is a call that touched no file; `rewind` is the user taking the conversation back (see `ClaudeCodeAgentsRewind`).
 ---@field path string|nil Absolute path as the CLI recorded it; nil on a `tool` event.
 ---@field added integer
 ---@field removed integer
 ---@field start_line integer|nil First line of a read (the CLI records the window it read).
 ---@field num_lines integer|nil How many lines that read covered.
 ---@field tool string|nil `tool` events: the tool's own name, e.g. `Bash`.
----@field label string|nil `tool` events: one line naming what the call was for.
+---@field label string|nil `tool` events: one line naming what the call was for. `rewind` events: the prompt the conversation was taken back to before.
 ---@field tool_id string|nil The `toolu_…` id of the call: what a `tool` event's result is joined by, and what names a file event's row (see `event_key`).
 ---@field status "running"|"done"|"error"|"interrupted"|"rejected"|nil `tool` events; see `resolve_tool`.
+---@field dropped integer|nil `rewind` events: how many tool calls the rewind took back.
+
+---@class ClaudeCodeAgentsRewind A stretch of the transcript the user rewound away (`/rewind`, Esc Esc).
+---@field from integer First line of it (1-based): the prompt the conversation was taken back to before.
+---@field to integer Last line of it: the one before the prompt that continued from there.
+---@field ts number Epoch seconds of the prompt that continued — when the rewind was acted on.
+---@field prompt string|false|nil The retracted prompt's text, for the Activity rule; `false` once read and found to be none.
+---@field dropped integer Tool calls inside the stretch.
 
 ---@class ClaudeCodeAgentsFileHistory What one session did to one file.
 ---@field path string The file.
@@ -173,6 +181,11 @@ local config = nil
 ---@field task_stops table<string, number> Tasks a `TaskStop` call stopped: task id -> epoch seconds.
 ---@field task_events table<string, { count: integer, last_ts: number, expired_ts: number|nil }> Monitor events, by task id.
 ---@field interrupted_ts number|nil Set when the CLI recorded a user interrupt; see INTERRUPT_MARKER.
+---@field lines integer Lines handed to `_fold_line` so far — the line number of the one being folded.
+---@field prompts { line: integer, parent: string }[] Every user message still standing, with the entry it followed; what a rewind is recognised against.
+---@field rewinds ClaudeCodeAgentsRewind[] Stretches the user rewound away, oldest first; skipped by every fold of the file.
+---@field rewound_tools table<string, true> `toolu_…` ids of the calls inside those stretches (a subagent launched by one is not this conversation's).
+---@field refold boolean|nil Set by `_fold_line` when it finds a rewind: the fold so far counted lines that are no longer part of the conversation, and `fold_chunks` starts over.
 ---@field size integer Bytes of the file when last folded.
 ---@field mtime integer
 ---@field ino integer|nil
@@ -747,6 +760,59 @@ local function touch_file(sum, path, kind, added, removed, ts)
   end
 end
 
+---The rewind a line falls inside, if any.
+---@param sum ClaudeCodeAgentsSummary
+---@param lnum integer
+---@return ClaudeCodeAgentsRewind|nil
+local function rewound(sum, lnum)
+  for _, rewind in ipairs(sum.rewinds) do
+    if lnum >= rewind.from and lnum <= rewind.to then
+      return rewind
+    end
+  end
+  return nil
+end
+
+---A user message's text, for a title or a rewind's rule; nil for a harness entry.
+---@param entry table
+---@return string|nil
+local function prompt_text(entry)
+  local content = entry.message and entry.message.content
+  local text
+  if type(content) == "string" then
+    text = content
+  elseif type(content) == "table" and type(content[1]) == "table" then
+    text = content[1].text
+  end
+  if type(text) == "string" and text ~= "" and not text:find("^<") then
+    return (text:gsub("%s+", " "):sub(1, 200))
+  end
+  return nil
+end
+
+---Fold a line the user rewound away: nothing it records is the conversation's
+---any more, but two things about it are worth knowing. The calls inside it, so a
+---subagent one of them started is not listed under the session (`subagents.scan`),
+---and how many there were, which is what the rule in Activity says was taken
+---back. The retracted prompt's text names the rule; it is decoded once, since the
+---stretch starts with it by construction.
+---@param sum ClaudeCodeAgentsSummary
+---@param rewind ClaudeCodeAgentsRewind
+---@param lnum integer
+---@param line string
+local function fold_rewound(sum, rewind, lnum, line)
+  if lnum == rewind.from and rewind.prompt == nil then
+    local ok, entry = pcall(vim.json.decode, line)
+    rewind.prompt = ok and type(entry) == "table" and prompt_text(entry) or false
+  end
+  if line:find('"type":"tool_use"', 1, true) then
+    rewind.dropped = rewind.dropped + 1
+    for id in line:gmatch('"id":"(toolu_[^"]+)"') do
+      sum.rewound_tools[id] = true
+    end
+  end
+end
+
 ---Whether the Activity pane wants rows for tool calls at all.
 ---
 ---Read per line rather than captured once: `setup` can replace the config while a
@@ -1224,11 +1290,78 @@ function M._task_notification(line)
   }
 end
 
+---Note a user message and what it followed; recognise a rewind.
+---
+---A message whose parent an earlier, still-standing message already has is the
+---conversation continuing from before that earlier one: everything from it to
+---the line before this one was rewound away. The stretch is recorded and the
+---fold asked to start over (`refold`), since what it has counted so far includes
+---those lines. Rewinds nested inside the new stretch are absorbed by it, so each
+---line is inside one stretch and the calls it took back are counted once.
+---
+---The message that continues from a rewind also gets the Activity rule saying so,
+---placed where the retracted calls would have been. It is emitted on the pass
+---that skips them, which is when the count is complete.
+---@param sum ClaudeCodeAgentsSummary
+---@param lnum integer
+---@param parent string
+---@param ts number
+---@return boolean rewound This message is a rewind; the fold restarts.
+local function note_prompt(sum, lnum, parent, ts)
+  for _, rewind in ipairs(sum.rewinds) do
+    if rewind.to == lnum - 1 then
+      push_event(sum, {
+        ts = ts,
+        kind = "rewind",
+        label = rewind.prompt or nil,
+        dropped = rewind.dropped,
+        added = 0,
+        removed = 0,
+      })
+    end
+  end
+  for _, prompt in ipairs(sum.prompts) do
+    if prompt.parent == parent then
+      local kept = {}
+      local fresh = { from = prompt.line, to = lnum - 1, ts = ts, dropped = 0 }
+      for _, rewind in ipairs(sum.rewinds) do
+        -- A stretch starting before the retracted prompt lies wholly before it:
+        -- the prompt would not be standing had it been inside one. One ending
+        -- right before it is a rewind to the same point — the prompt that
+        -- continued from that one is being retracted now — and the two read as
+        -- one: the rule names the first prompt taken back and counts both tries.
+        if rewind.to == prompt.line - 1 then
+          fresh.from = rewind.from
+          fresh.prompt = rewind.prompt
+        elseif rewind.from < prompt.line then
+          kept[#kept + 1] = rewind
+        end
+      end
+      kept[#kept + 1] = fresh
+      sum.rewinds = kept
+      sum.refold = true
+      return true
+    end
+  end
+  sum.prompts[#sum.prompts + 1] = { line = lnum, parent = parent }
+  return false
+end
+
 ---Fold one raw line. Prefilters on substrings so most lines are never decoded.
 ---@param sum ClaudeCodeAgentsSummary
 ---@param line string
 function M._fold_line(sum, line)
+  -- Counted before anything can return: a rewind is a stretch of *lines*, and the
+  -- number has to mean the same thing on every fold of the file.
+  sum.lines = sum.lines + 1
+  local lnum = sum.lines
   if #line == 0 then
+    return
+  end
+
+  local rewind = rewound(sum, lnum)
+  if rewind then
+    fold_rewound(sum, rewind, lnum, line)
     return
   end
 
@@ -1241,14 +1374,33 @@ function M._fold_line(sum, line)
   -- transcript here, 30 hours on another). Matched, not decoded: this is a scan
   -- over bytes already in hand, and stays clear of the JSON decoder the
   -- prefilter exists to avoid.
+  local ts = 0
   local at = line:find('"timestamp":"', 1, true)
   if at then
-    local ts = M._iso_to_epoch(line:sub(at + 13, at + 40))
+    ts = M._iso_to_epoch(line:sub(at + 13, at + 40))
     if ts > sum.last_ts then
       sum.last_ts = ts
     end
     if sum.first_ts == 0 and ts > 0 then
       sum.first_ts = ts
+    end
+  end
+
+  -- What the user typed, and what it followed. A rewind (`/rewind`, Esc Esc) is
+  -- recorded nowhere: measured against CLI 2.1.276 by driving one through a pty,
+  -- the transcript did not grow by a byte when the conversation and the file were
+  -- taken back — the retracted lines stay, and the only trace is that the next
+  -- prompt names as its `parentUuid` the entry the retracted prompt had named.
+  -- So every user message is noted with its parent, and a message whose parent
+  -- an earlier message already has is a rewind to before that earlier one
+  -- (across this store, 15 such pairs, every one a rewind; the nearest were 3
+  -- lines and 8 seconds apart). Tool results are user entries too and are left
+  -- out — they carry `toolUseResult`. Matched raw: the CLI writes the field first,
+  -- and a message quoting it has its quotes escaped.
+  if line:find('"type":"user"', 1, true) and not line:find('"toolUseResult"', 1, true) then
+    local parent = line:match('"parentUuid":"([^"]+)"')
+    if parent and note_prompt(sum, lnum, parent, ts) then
+      return
     end
   end
 
@@ -1421,16 +1573,7 @@ function M._fold_line(sum, line)
       sum.git_branch = type(entry.gitBranch) == "string" and entry.gitBranch or nil
     end
     if not sum.first_prompt then
-      local content = entry.message and entry.message.content
-      local text
-      if type(content) == "string" then
-        text = content
-      elseif type(content) == "table" and type(content[1]) == "table" then
-        text = content[1].text
-      end
-      if type(text) == "string" and text ~= "" and not text:find("^<") then
-        sum.first_prompt = text:gsub("%s+", " "):sub(1, 200)
-      end
+      sum.first_prompt = prompt_text(entry)
     end
   end
 end
@@ -1462,11 +1605,34 @@ local function new_summary(path)
     task_events = {},
     last_ts = 0,
     first_ts = 0,
+    lines = 0,
+    prompts = {},
+    rewinds = {},
+    rewound_tools = {},
     size = 0,
     mtime = 0,
     offset = 0,
     skipped = 0,
   }
+end
+
+---Start a summary over, keeping only what a rewind taught it.
+---
+---In place: `cache[path]` and `M.events(path)` hand the same table out, so the
+---consumers holding it see the refold rather than a summary that stopped moving.
+---@param sum ClaudeCodeAgentsSummary
+local function restart_summary(sum)
+  local fresh = new_summary(sum.path)
+  fresh.rewinds = sum.rewinds
+  for _, rewind in ipairs(fresh.rewinds) do
+    rewind.dropped = 0
+  end
+  for key in pairs(sum) do
+    sum[key] = nil
+  end
+  for key, value in pairs(fresh) do
+    sum[key] = value
+  end
 end
 
 ---Whether `sum` is still a valid basis for an incremental read of `st`.
@@ -1531,6 +1697,19 @@ local function fold_chunks(sum, st, job, done)
         end
         consumed = nl
         start = nl + 1
+        if sum.refold then
+          break
+        end
+      end
+
+      -- A rewind came to light: lines already folded are no longer the
+      -- conversation's. Start over from the top with the stretch known, so they
+      -- are skipped this time. Rare (one per rewind, ever) and bounded by the
+      -- file's size, like the restart a compaction causes.
+      if sum.refold then
+        restart_summary(sum)
+        step()
+        return
       end
 
       if consumed == 0 then
@@ -1556,6 +1735,14 @@ local function fold_chunks(sum, st, job, done)
             pcall(M._fold_line, sum, all:sub(from, nl - 1))
             last = nl
             from = nl + 1
+            if sum.refold then
+              break
+            end
+          end
+          if sum.refold then
+            restart_summary(sum)
+            step()
+            return
           end
           sum.offset = sum.offset + last
           done()
@@ -2377,65 +2564,83 @@ function M.file_history(transcript_path, file_path, cb)
   -- sidesteps JSON's escaping of a Windows separator.
   local needle = file_path:match("([^/\\]+)$") or file_path
 
-  local offset = 0
-  local function step()
-    if offset >= st.size then
-      history_cache[key] = { size = st.size, mtime = st.mtime, history = hist }
-      answer(hist)
-      return
+  ---@param sum ClaudeCodeAgentsSummary The session's summary, for the stretches a rewind took back.
+  local function scan(sum)
+    local offset, lnum = 0, 0
+    ---@param line string
+    local function fold(line)
+      lnum = lnum + 1
+      -- An edit the user rewound away is not part of what the session did to
+      -- the file — and the CLI put the file back, so applying its hunks to
+      -- anything would be applying them to a file they never touched.
+      if rewound(sum, lnum) then
+        return
+      end
+      if line:find('"toolUseResult"', 1, true) and line:find(needle, 1, true) then
+        local ok, entry = pcall(vim.json.decode, line)
+        if ok and type(entry) == "table" then
+          pcall(fold_history, hist, entry)
+        end
+      end
     end
-    local want = math.min(M._chunk_size, st.size - offset)
-    M._io.read(transcript_path, offset, want, function(data)
-      if not data or data == "" then
+    local function step()
+      if offset >= st.size then
+        history_cache[key] = { size = st.size, mtime = st.mtime, history = hist }
         answer(hist)
         return
       end
-      local consumed, start = 0, 1
-      while true do
-        local nl = data:find("\n", start, true)
-        if not nl then
-          break
-        end
-        local line = data:sub(start, nl - 1)
-        if line:find('"toolUseResult"', 1, true) and line:find(needle, 1, true) then
-          local ok, entry = pcall(vim.json.decode, line)
-          if ok and type(entry) == "table" then
-            pcall(fold_history, hist, entry)
-          end
-        end
-        consumed, start = nl, nl + 1
-      end
-      if consumed == 0 then
-        -- A line longer than a chunk: pull the remainder in one read rather than
-        -- spinning on the same bytes (the same case `fold_chunks` handles).
-        M._io.read(transcript_path, offset, st.size - offset, function(all)
-          if all then
-            local from = 1
-            while true do
-              local nl = all:find("\n", from, true)
-              if not nl then
-                break
-              end
-              local line = all:sub(from, nl - 1)
-              if line:find('"toolUseResult"', 1, true) and line:find(needle, 1, true) then
-                local ok, entry = pcall(vim.json.decode, line)
-                if ok and type(entry) == "table" then
-                  pcall(fold_history, hist, entry)
-                end
-              end
-              from = nl + 1
-            end
-          end
-          history_cache[key] = { size = st.size, mtime = st.mtime, history = hist }
+      local want = math.min(M._chunk_size, st.size - offset)
+      M._io.read(transcript_path, offset, want, function(data)
+        if not data or data == "" then
           answer(hist)
-        end)
-        return
-      end
-      offset = offset + consumed
-      step()
-    end)
+          return
+        end
+        local consumed, start = 0, 1
+        while true do
+          local nl = data:find("\n", start, true)
+          if not nl then
+            break
+          end
+          fold(data:sub(start, nl - 1))
+          consumed, start = nl, nl + 1
+        end
+        if consumed == 0 then
+          -- A line longer than a chunk: pull the remainder in one read rather than
+          -- spinning on the same bytes (the same case `fold_chunks` handles).
+          M._io.read(transcript_path, offset, st.size - offset, function(all)
+            if all then
+              local from = 1
+              while true do
+                local nl = all:find("\n", from, true)
+                if not nl then
+                  break
+                end
+                fold(all:sub(from, nl - 1))
+                from = nl + 1
+              end
+            end
+            history_cache[key] = { size = st.size, mtime = st.mtime, history = hist }
+            answer(hist)
+          end)
+          return
+        end
+        offset = offset + consumed
+        step()
+      end)
+    end
+    step()
   end
-  step()
+
+  -- The summary first: it is what knows which stretches of the file the user
+  -- rewound away, and this read has to skip the same ones. Up to date in the same
+  -- tick when nothing changed; otherwise the fold is the cost of being right.
+  M.summary(transcript_path, function(sum)
+    if not sum then
+      answer(nil)
+      return
+    end
+    scan(sum)
+  end)
 end
 
 --------------------------------------------------------------------------------

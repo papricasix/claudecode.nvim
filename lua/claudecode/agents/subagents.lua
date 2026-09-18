@@ -109,6 +109,12 @@ function M.scan(transcript_path)
   if not names then
     return out
   end
+  -- A run the user rewound away (`/rewind`) is still on disk — the CLI deletes
+  -- nothing — but the call that started it is no longer part of the conversation,
+  -- so neither is the run, nor anything it started in turn.
+  local session = transcript.get(transcript_path)
+  local rewound_tools = session and session.rewound_tools or {}
+  local rewound_agents = {}
   for _, name in ipairs(names) do
     local id = name:match("^agent%-(.+)%.meta%.json$")
     if id then
@@ -129,10 +135,34 @@ function M.scan(transcript_path)
           started = st.mtime or 0,
           mtime = log and log.mtime or 0,
         }
+        if meta.toolUseId ~= nil and rewound_tools[meta.toolUseId] then
+          rewound_agents[id] = true
+        end
       end
     end
   end
-  return out
+  if next(rewound_agents) == nil then
+    return out
+  end
+  -- Children of a rewound run go with it. Descriptors come in directory order, so
+  -- the tree is walked until nothing more falls.
+  local grew = true
+  while grew do
+    grew = false
+    for _, agent in ipairs(out) do
+      if not rewound_agents[agent.id] and agent.parent_id and rewound_agents[agent.parent_id] then
+        rewound_agents[agent.id] = true
+        grew = true
+      end
+    end
+  end
+  local kept = {}
+  for _, agent in ipairs(out) do
+    if not rewound_agents[agent.id] then
+      kept[#kept + 1] = agent
+    end
+  end
+  return kept
 end
 
 ---Fold the session's transcript and every subagent's up to date.

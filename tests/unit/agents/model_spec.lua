@@ -734,6 +734,18 @@ describe("agents.model", function()
         expect(#model.feed()).to_be(4)
       end)
 
+      it("keeps a rewind's rule under every filter", function()
+        summaries.aaa.events[#summaries.aaa.events + 1] = { ts = 5, kind = "rewind", dropped = 3 }
+        expect(model.cycle_feed_filter().key).to_be("files")
+        local feed = model.feed()
+        expect(#feed).to_be(3)
+        expect(feed[1].kind).to_be("rewind")
+        expect(model.cycle_feed_filter().key).to_be("tools")
+        feed = model.feed()
+        expect(#feed).to_be(3)
+        expect(feed[1].kind).to_be("rewind")
+      end)
+
       it("names subagents by what they were sent to do until switched, and forgets the switch with the view", function()
         expect(model.subagent_label()).to_be("description")
         expect(model.toggle_subagent_label()).to_be("type")

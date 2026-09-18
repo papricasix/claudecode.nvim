@@ -218,6 +218,192 @@ describe("agents.transcript", function()
     end)
   end)
 
+  describe("rewinds", function()
+    -- What a rewind (`/rewind`, Esc Esc) leaves behind, measured against CLI
+    -- 2.1.276 through a pty: nothing at the moment of the rewind, and the next
+    -- prompt naming as `parentUuid` the entry the retracted prompt had named.
+    local function turn(text, uuid, parent, ts)
+      return vim.json.encode({
+        type = "user",
+        uuid = uuid,
+        parentUuid = parent,
+        cwd = "/proj",
+        timestamp = ts,
+        message = { role = "user", content = text },
+      })
+    end
+
+    local function call_line(id, name, ts)
+      return vim.json.encode({
+        type = "assistant",
+        timestamp = ts,
+        message = {
+          role = "assistant",
+          content = { { type = "tool_use", id = id, name = name, input = { command = "ls", description = "list" } } },
+        },
+      })
+    end
+
+    local function history(path, file)
+      local result, called = nil, false
+      transcript.file_history(path, file, function(hist)
+        result = hist
+        called = true
+      end)
+      if vim._mock and vim._mock.flush then
+        vim._mock.flush()
+      end
+      assert.is_true(called, "file_history() did not answer")
+      return result
+    end
+
+    local T = {}
+    for i = 0, 9 do
+      T[i] = string.format("2026-08-02T20:0%d:00.000Z", i)
+    end
+
+    local function kinds(sum)
+      local out = {}
+      for _, event in ipairs(sum.events) do
+        out[#out + 1] = event.kind
+      end
+      return table.concat(out, ",")
+    end
+
+    it("leaves what the user rewound away out of the counts, the files and the feed", function()
+      put("/p/a.jsonl", {
+        turn("first", "u1", "root", T[0]),
+        turn("bad idea", "u2", "u1", T[1]), -- the retracted prompt
+        call_line("toolu_bad", "Bash", T[2]),
+        edit_line("/proj/x.lua", 5, 0, T[3]),
+        turn("better idea", "u3", "u1", T[4]), -- continues from before it: same parent
+        edit_line("/proj/y.lua", 2, 0, T[5]),
+      })
+      local sum = fold("/p/a.jsonl")
+      expect(sum.added).to_be(2)
+      expect(sum.files["/proj/x.lua"]).to_be_nil()
+      expect(sum.files["/proj/y.lua"].added).to_be(2)
+      expect(#sum.rewinds).to_be(1)
+      expect(sum.rewinds[1].from).to_be(2)
+      expect(sum.rewinds[1].to).to_be(4)
+      expect(sum.rewinds[1].prompt).to_be("bad idea")
+      expect(sum.rewound_tools["toolu_bad"]).to_be_true()
+      -- The rule stands where the retracted work was; the work itself is gone.
+      expect(kinds(sum)).to_be("rewind,edit")
+      expect(sum.events[1].dropped).to_be(1)
+      expect(sum.events[1].label).to_be("bad idea")
+      expect(sum.events[1].ts).to_be(transcript._iso_to_epoch(T[4]))
+      expect(sum.first_prompt).to_be("first")
+    end)
+
+    it("is not fooled by a prompt that merely follows another", function()
+      put("/p/a.jsonl", {
+        turn("first", "u1", "root", T[0]),
+        edit_line("/proj/x.lua", 5, 0, T[1]),
+        turn("second", "u2", "u1", T[2]),
+        edit_line("/proj/y.lua", 2, 0, T[3]),
+      })
+      local sum = fold("/p/a.jsonl")
+      expect(#sum.rewinds).to_be(0)
+      expect(sum.added).to_be(7)
+      expect(kinds(sum)).to_be("edit,edit")
+    end)
+
+    it("starts the fold over when the rewind arrives after the work was counted", function()
+      put("/p/a.jsonl", {
+        turn("first", "u1", "root", T[0]),
+        turn("bad idea", "u2", "u1", T[1]),
+        call_line("toolu_bad", "Bash", T[2]),
+        edit_line("/proj/x.lua", 5, 0, T[3]),
+      })
+      local sum = fold("/p/a.jsonl")
+      expect(sum.added).to_be(5)
+      expect(sum.files["/proj/x.lua"]).to_be_truthy()
+
+      append("/p/a.jsonl", {
+        turn("better idea", "u3", "u1", T[4]),
+        edit_line("/proj/y.lua", 2, 0, T[5]),
+      })
+      local before = #reads
+      local again = fold("/p/a.jsonl")
+      expect(again).to_be(sum) -- the same table, refolded in place
+      expect(again.added).to_be(2)
+      expect(again.files["/proj/x.lua"]).to_be_nil()
+      expect(kinds(again)).to_be("rewind,edit")
+      expect(again.lines).to_be(6)
+      -- Started over from the top, not from where the last fold stopped.
+      local from_top = false
+      for i = before + 1, #reads do
+        if reads[i].offset == 0 then
+          from_top = true
+        end
+      end
+      expect(from_top).to_be_true()
+    end)
+
+    it("folds rewinds to the same point into one stretch, counting every call taken back", function()
+      put("/p/a.jsonl", {
+        turn("first", "u1", "root", T[0]),
+        turn("try one", "u2", "u1", T[1]),
+        call_line("toolu_1", "Bash", T[2]),
+        edit_line("/proj/x.lua", 1, 0, T[2]),
+        turn("try two", "u3", "u1", T[3]), -- rewinds try one
+        call_line("toolu_2", "Grep", T[4]),
+        edit_line("/proj/z.lua", 1, 0, T[4]),
+        turn("try three", "u4", "u1", T[5]), -- rewinds try two, and try one with it
+        edit_line("/proj/y.lua", 3, 0, T[6]),
+      })
+      local sum = fold("/p/a.jsonl")
+      expect(#sum.rewinds).to_be(1)
+      expect(sum.rewinds[1].from).to_be(2)
+      expect(sum.rewinds[1].to).to_be(7)
+      expect(sum.rewinds[1].prompt).to_be("try one")
+      expect(sum.added).to_be(3)
+      expect(sum.files["/proj/x.lua"]).to_be_nil()
+      expect(sum.files["/proj/z.lua"]).to_be_nil()
+      expect(kinds(sum)).to_be("rewind,edit")
+      expect(sum.events[1].dropped).to_be(2)
+      expect(sum.rewound_tools["toolu_1"]).to_be_true()
+      expect(sum.rewound_tools["toolu_2"]).to_be_true()
+    end)
+
+    it("keeps a rewind before an earlier one apart from it", function()
+      put("/p/a.jsonl", {
+        turn("first", "u1", "root", T[0]),
+        turn("draft", "u2", "u1", T[1]),
+        turn("draft, reworded", "u3", "u1", T[2]), -- rewinds the draft
+        edit_line("/proj/x.lua", 1, 0, T[3]),
+        turn("detour", "u4", "u3", T[4]),
+        edit_line("/proj/z.lua", 1, 0, T[5]),
+        turn("no detour", "u5", "u3", T[6]), -- rewinds the detour only
+        edit_line("/proj/y.lua", 3, 0, T[7]),
+      })
+      local sum = fold("/p/a.jsonl")
+      expect(#sum.rewinds).to_be(2)
+      expect(sum.rewinds[1].from).to_be(2)
+      expect(sum.rewinds[1].to).to_be(2)
+      expect(sum.rewinds[2].from).to_be(5)
+      expect(sum.rewinds[2].to).to_be(6)
+      expect(sum.added).to_be(4)
+      expect(sum.files["/proj/z.lua"]).to_be_nil()
+      expect(kinds(sum)).to_be("rewind,edit,rewind,edit")
+    end)
+
+    it("leaves rewound edits out of a file's history too", function()
+      put("/p/a.jsonl", {
+        turn("first", "u1", "root", T[0]),
+        turn("bad idea", "u2", "u1", T[1]),
+        edit_line("/proj/x.lua", 5, 0, T[2]),
+        turn("better idea", "u3", "u1", T[3]),
+        edit_line("/proj/x.lua", 2, 0, T[4]),
+      })
+      local hist = history("/p/a.jsonl", "/proj/x.lua")
+      expect(#hist.steps).to_be(1)
+      expect(#hist.hunks).to_be(1)
+      expect(hist.steps[1].ts).to_be(transcript._iso_to_epoch(T[4]))
+    end)
+  end)
+
   describe("staleness", function()
     it("says a transcript has moved on when its size or mtime has, by stat alone", function()
       put("/p/a.jsonl", { edit_line("/proj/x.lua", 1, 0) })
@@ -1030,6 +1216,9 @@ describe("agents.transcript", function()
 
     it("never decodes a Bash result", function()
       put("/p/a.jsonl", { bash_line(), edit_line("/proj/x.lua", 1, 0) })
+      -- The history reads the summary first (for the stretches a rewind took
+      -- back); that fold's own decode of the edit is not what is being counted.
+      fold("/p/a.jsonl")
       local before = decodes
       history("/p/a.jsonl", "/proj/x.lua")
       expect(decodes - before).to_be(1)

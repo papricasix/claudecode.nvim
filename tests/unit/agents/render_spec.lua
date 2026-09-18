@@ -402,6 +402,33 @@ describe("agents.render", function()
       expect(render.payload_at(feed, 1).name).to_be("before the refactor")
     end)
 
+    it("draws a rewind as a rule saying what it took back and which prompt it went back to", function()
+      local ts = os.time({ year = 2026, month = 9, day = 17, hour = 14, min = 34, sec = 0 })
+      local feed = render.create_buf("feed")
+      render.feed(feed, {
+        { ts = ts + 60, kind = "edit", path = "/proj/b.lua" },
+        { ts = ts, kind = "rewind", label = "fix the tests", dropped = 12 },
+        { ts = ts - 60, kind = "rewind", dropped = 1 },
+      }, { width = 80, cwd = "/proj", now = ts + 60 })
+      local lines = lines_of(feed)
+      expect(#lines).to_be(3)
+      expect(lines[2]:find(' ── rewound 14:34 · 12 calls taken back · "fix the tests" ─', 1, true)).to_be(1)
+      expect(vim.fn.strdisplaywidth(lines[2])).to_be(80)
+      expect(lines[2]:sub(-#"──")).to_be("──")
+      expect(lines[3]:find(" ── rewound 14:33 · 1 call taken back ─", 1, true)).to_be(1)
+      local payload = render.payload_at(feed, 2)
+      expect(payload.kind).to_be("rewind")
+      expect(payload.dropped).to_be(12)
+      expect(payload.path).to_be_nil()
+      local groups = {}
+      for _, mark in ipairs(vim._extmarks or {}) do
+        if mark.bufnr == feed and mark.row == 1 then
+          groups[#groups + 1] = mark.opts.hl_group
+        end
+      end
+      expect(groups[1]).to_be("ClaudeCodeAgentsRewind")
+    end)
+
     it("draws a tool call as the tool and what the call was for", function()
       local feed = render.create_buf("feed")
       render.feed(feed, {

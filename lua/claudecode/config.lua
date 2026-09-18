@@ -227,6 +227,9 @@ M.defaults = {
       prompt = "ClaudeCodeAgentsPrompt",
       -- The rule a checkpoint draws through a pane; defaults to a link to Comment.
       checkpoint = "ClaudeCodeAgentsCheckpoint",
+      -- The rule a rewind (`/rewind`, Esc Esc) leaves in Activity; defaults to a
+      -- link to DiagnosticWarn.
+      rewind = "ClaudeCodeAgentsRewind",
       -- Terminal pane background: follows SnacksNormal when snacks is loaded,
       -- else NormalFloat. The sidebars keep the editor's own Normal.
       normal = "ClaudeCodeAgentsNormal",
@@ -747,6 +750,7 @@ function M.validate(config)
         "foldable",
         "prompt",
         "checkpoint",
+        "rewind",
       }
       for _, field in ipairs(highlight_fields) do
         checker(ag.highlights, "agents.highlights")(field, function(v)

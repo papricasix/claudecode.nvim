@@ -158,6 +158,40 @@ describe("agents.subagents", function()
       expect(out[1].prefix).to_be("")
     end)
 
+    it("leaves out a run the user rewound away, and everything it started", function()
+      -- The run's files are still on disk; the call that started it is inside
+      -- the stretch the session's next prompt rewound (see transcript_spec).
+      local function turn(text, uuid, parent, ts)
+        return vim.json.encode({
+          type = "user",
+          uuid = uuid,
+          parentUuid = parent,
+          timestamp = iso(ts),
+          message = { role = "user", content = text },
+        })
+      end
+      put(SESSION, {
+        turn("first", "u1", "root", NOW - 500),
+        turn("spawn something", "u2", "u1", NOW - 400),
+        vim.json.encode({
+          type = "assistant",
+          timestamp = iso(NOW - 390),
+          message = {
+            role = "assistant",
+            content = { { type = "tool_use", id = "toolu_gone", name = "Agent", input = { prompt = "go" } } },
+          },
+        }),
+        turn("never mind", "u3", "u1", NOW - 200),
+      })
+      agent("gone", { tool_use_id = "toolu_gone", first = NOW - 380 })
+      agent("kid", { parent = "gone", first = NOW - 370 })
+      agent("kept", { tool_use_id = "toolu_kept", first = NOW - 100 })
+
+      local out = rows({ live = true })
+      expect(#out).to_be(1)
+      expect(out[1].id).to_be("kept")
+    end)
+
     it("draws a checkpoint as a rule between the top-level runs it falls between", function()
       agent("root", { first = NOW - 300 })
       agent("child", { parent = "root", first = NOW - 150 }) -- after the checkpoint, still under its parent

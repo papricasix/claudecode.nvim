@@ -1242,7 +1242,7 @@ local function count_shown(events, filter)
   end
   local n = 0
   for _, event in ipairs(events) do
-    if (filter == "tools") == (event.kind == "tool") then
+    if event.kind == "rewind" or (filter == "tools") == (event.kind == "tool") then
       n = n + 1
     end
   end
@@ -1331,7 +1331,10 @@ function M.feed(visible, keep)
   for index = #events, 1, -1 do
     local event = events[index]
     local is_tool = event.kind == "tool"
-    if filter == "all" or (filter == "tools") == is_tool then
+    -- A rewind's rule is neither a file nor a command and is shown under every
+    -- filter: whatever the pane is listing, rows above it happened after the
+    -- user took the conversation back.
+    if filter == "all" or event.kind == "rewind" or (filter == "tools") == is_tool then
       if #out >= limit and (missing == 0 or #out >= ceiling) then
         break
       end

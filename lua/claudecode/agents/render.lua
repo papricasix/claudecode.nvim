@@ -80,6 +80,7 @@ local DEFAULT_HIGHLIGHTS = {
   foldable = "ClaudeCodeAgentsFoldable",
   prompt = "ClaudeCodeAgentsPrompt",
   checkpoint = "ClaudeCodeAgentsCheckpoint",
+  rewind = "ClaudeCodeAgentsRewind",
 }
 
 local HIGHLIGHT_LINKS = {
@@ -121,6 +122,10 @@ local HIGHLIGHT_LINKS = {
   -- The rule a checkpoint draws through a pane. Metadata, like the clock column,
   -- so it follows the same quiet group; the shape is what sets it apart.
   ClaudeCodeAgentsCheckpoint = "Comment",
+  -- The rule a rewind leaves in Activity where the retracted calls were. The
+  -- one row that records the user undoing work rather than the agent doing it,
+  -- so it borrows the editor's warning colour instead of the checkpoint's grey.
+  ClaudeCodeAgentsRewind = "DiagnosticWarn",
 }
 
 ---Where the panes take their background from.
@@ -643,6 +648,43 @@ function M.checkpoint_line(entry, width, now)
     }
 end
 
+---The rule a rewind leaves in Activity, and its payload.
+---
+---`── rewound 14:34 · 12 calls taken back · "commit this and…" ──`: the rewind
+---sits where the retracted calls were, newest first like every row, and says how
+---much it took back and which prompt the conversation went back to before. The
+---calls themselves are not drawn — they are not the conversation's any more — so
+---the count is the only trace of them. Cut like a checkpoint's name, so a stub of
+---rule survives at the right edge.
+---@param event ClaudeCodeAgentsEvent A `rewind` event.
+---@param width integer
+---@param now number|nil
+---@return string line
+---@return table payload
+function M.rewind_line(event, width, now)
+  local head = GUTTER .. "── rewound " .. require("claudecode.agents.checkpoints").label(event.ts, now)
+  local dropped = tonumber(event.dropped) or 0
+  if dropped > 0 then
+    head = head .. " · " .. dropped .. (dropped == 1 and " call" or " calls") .. " taken back"
+  end
+  if type(event.label) == "string" and event.label ~= "" then
+    local room = width - vim.fn.strdisplaywidth(head) - #' · ""' - #" ──"
+    if room >= 2 then
+      head = head .. ' · "' .. M.truncate(event.label, room) .. '"'
+    end
+  end
+  head = head .. " "
+  local rest = width - vim.fn.strdisplaywidth(head)
+  local line = head .. string.rep("─", math.max(2, rest))
+  return line,
+    {
+      kind = "rewind",
+      ts = event.ts,
+      dropped = dropped,
+      key = transcript.event_key(event),
+    }
+end
+
 ---Add a checkpoint's rule to a pane being drawn: the line, its payload, and one
 ---mark across it.
 ---@param out { lines: string[], marks: table[], payloads: table<integer, table> }
@@ -767,6 +809,11 @@ function M.feed(buf, events, opts)
       -- Lit on arrival and settling like any row: a checkpoint just taken is
       -- news, and the one from yesterday is not.
       push_checkpoint(out, index, event, width, opts.now, fade.dim_group(hl("checkpoint"), ages[index]))
+    elseif event.kind == "rewind" then
+      local line, payload = M.rewind_line(event, width, opts.now)
+      lines[#lines + 1] = line
+      payload_map[index] = payload
+      marks[#marks + 1] = { row = index - 1, col = 0, end_col = #line, hl = fade.dim_group(hl("rewind"), ages[index]) }
     else
       draw(index, event)
     end
