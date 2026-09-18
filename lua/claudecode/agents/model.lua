@@ -1850,14 +1850,23 @@ function M.refresh_git(force)
     return
   end
   local utils = require("claudecode.utils")
-  local paths, gone = {}, {}
+  local paths, gone, seen = {}, {}, {}
   for _, entry in ipairs(entries) do
-    paths[#paths + 1] = entry.path
-    if M._is_gone(entry.path) then
-      gone[utils.path_key(entry.path)] = true
+    -- A checkpoint rule is a row with no file; a file in several eras is one
+    -- path, asked about once.
+    local path = entry.path
+    if path and not seen[path] then
+      seen[path] = true
+      paths[#paths + 1] = path
+      if M._is_gone(path) then
+        gone[utils.path_key(path)] = true
+      end
     end
   end
   state.gone = gone
+  if #paths == 0 then
+    return
+  end
 
   if opts().git == false then
     notify_change()

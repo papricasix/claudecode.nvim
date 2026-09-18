@@ -1483,6 +1483,23 @@ describe("agents.model", function()
       expect(model.delete_session("aaa")).to_be_true()
       expect(#checkpoints.list("aaa")).to_be(0)
     end)
+
+    it("asks git and the disk about each file once, and never about a rule", function()
+      -- The rule row has no path, and `fs_stat(nil)` threw from the poll timer.
+      local stats, git_paths = {}, nil
+      model._is_gone = function(path)
+        stats[#stats + 1] = path
+        return false
+      end
+      package.loaded["claudecode.agents.git"].status = function(_, paths, cb)
+        git_paths = paths
+        cb({})
+      end
+      checkpoints.add("aaa", 20)
+      model.refresh_git(true)
+      assert.same({ "/proj/a.lua", "/proj/new.lua" }, stats)
+      assert.same({ "/proj/a.lua", "/proj/new.lua" }, git_paths)
+    end)
   end)
 
   describe("change notifications", function()
