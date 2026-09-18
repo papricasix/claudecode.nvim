@@ -661,14 +661,16 @@ function M.feed(buf, events, opts)
         key = transcript.event_key(event),
       }
     else
-      -- The event's own kind and read window travel with the row: opening a read
-      -- shows the lines that read covered, not the whole session's changes.
+      -- The event's own kind, read window and call id travel with the row: opening
+      -- a read shows the lines that read covered, and opening an edit shows that
+      -- one call's edit, not the whole session's changes.
       payload_map[index] = {
         kind = "file",
         path = event.path,
         event_kind = event.kind,
         start_line = event.start_line,
         num_lines = event.num_lines,
+        tool_id = event.tool_id,
         key = transcript.event_key(event),
       }
     end

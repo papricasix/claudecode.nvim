@@ -816,12 +816,15 @@ function M.open_call(session_id, view, call)
     local ok, file_view = pcall(require, "claudecode.agents.file_view")
     if ok then
       local read = call.tool == "Read" and call.read or nil
+      -- A call line is one call: a read shows its window, an edit shows that one
+      -- edit rather than everything the run did to the file.
       file_view.open({
         session_id = session_id,
         transcript = view.path,
         path = call.path,
         read = read,
-        prefer = read and "read" or "diff",
+        prefer = read and "read" or "step",
+        tool_id = call.tool_id,
         cwd = view.cwd,
       })
     end

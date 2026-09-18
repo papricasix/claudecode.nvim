@@ -7,7 +7,11 @@
 --- cursor renders while an edit happens, only cumulative: today's file against what
 --- the session started from (`agents/patch.lua` reconstructs that by undoing the
 --- session's own hunks). An Activity row is one tool call, so `<CR>` on a read
---- highlights the lines that read covered, exactly as the live cursor does.
+--- highlights the lines that read covered, exactly as the live cursor does — and
+--- `<CR>` on an edit shows *that edit*: the file as the call left it, against what
+--- the call found, with the title saying which of the session's edits to the file
+--- it is (`(edit 3 of 7)`). Before this every edit row opened the same cumulative
+--- diff, so a file edited five times had five rows that all showed the final state.
 ---
 --- Three things can stand in the way, and each has an answer rather than a failure:
 ---
@@ -252,6 +256,98 @@ local function open_text_diff(session_id, path, before, after, title, reuse, rev
   return win
 end
 
+---A `Write`'s content as lines, the way `readfile` would hand the file back:
+---CRs dropped, and a trailing newline ending the last line rather than adding an
+---empty one after it.
+---@param content string
+---@return string[]
+local function content_lines(content)
+  local out, from = {}, 1
+  while true do
+    local nl = content:find("\n", from, true)
+    if not nl then
+      local last = content:sub(from)
+      if last ~= "" then
+        out[#out + 1] = (last:gsub("\r$", ""))
+      end
+      return out
+    end
+    out[#out + 1] = (content:sub(from, nl - 1):gsub("\r$", ""))
+    from = nl + 1
+  end
+end
+
+---Show one call's edit: the file as that call left it, against what it found.
+---
+---An Activity row is one tool call, so its diff is that call's, not the session's.
+---The file at that moment is rebuilt from today's by undoing every later step
+---first (`patch.reverse_apply`, newest first), and that step's own hunks are then
+---undone for the other side. A `Write` needs no rebuilding: its result carries the
+---whole file as it left it.
+---
+---Any hunk that no longer locates — a later step's or this one's — means the
+---moment cannot be rebuilt, because something outside the session has touched
+---those lines since. Then the call's own patch is shown as diff text, which is
+---the record itself, and the title says why.
+---@param opts table `M.open`'s opts.
+---@param history ClaudeCodeAgentsFileHistory
+---@param index integer Position of the step in `history.steps`.
+---@param title_for fun(note: string|nil): string
+---@return integer|nil win
+local function open_step(opts, history, index, title_for)
+  local steps = history.steps
+  local step = steps[index]
+  local path = opts.path
+  local what = string.format("%s %d of %d", step.kind, index, #steps)
+
+  ---@param reason string|nil
+  ---@return integer|nil
+  local function patches(reason)
+    local note = reason and (what .. ", " .. reason) or what
+    if reason then
+      logger.debug("agents", "file_view: step", index, "of", path, "-", reason, "- showing its patch")
+    end
+    return open_patch_text(opts.session_id, path, step.hunks, title_for("(" .. note .. ")"), opts.reuse)
+  end
+
+  if not unified_available() then
+    return patches(nil)
+  end
+
+  local after
+  if step.content then
+    after = content_lines(step.content)
+  else
+    local lines = read_lines(path)
+    if not lines then
+      return patches("deleted")
+    end
+    local later = {}
+    for i = index + 1, #steps do
+      for _, hunk in ipairs(steps[i].hunks) do
+        later[#later + 1] = hunk
+      end
+    end
+    local rebuilt, _, skipped = patch.reverse_apply(lines, later)
+    if skipped > 0 then
+      return patches("file moved on")
+    end
+    after = rebuilt
+  end
+
+  local before = {}
+  if not step.created then
+    local applied, skipped
+    before, applied, skipped = patch.reverse_apply(after, step.hunks)
+    if skipped > 0 or applied == 0 then
+      return patches("file moved on")
+    end
+  end
+
+  local win = open_inline_diff(opts.session_id, path, after, before, title_for("(" .. what .. ")"), opts.reuse)
+  return win or patches(nil)
+end
+
 ---Whether two files are line-for-line identical.
 ---
 ---Compared element-wise rather than by concatenating both into one string each:
@@ -360,9 +456,12 @@ function M.open_against_head(opts, done)
 end
 
 ---Open a file from one of the panes, showing what the session did to it.
+---
+---`prefer = "step"` with a `tool_id` shows that one call's edit (see `open_step`);
+---a call the history holds no step for falls back to the session's whole diff.
 ---@param opts { session_id: string?, transcript: string?, path: string, line: integer?,
----             read: { start_line: integer, num_lines: integer }?, prefer: "diff"|"read"?,
----             cwd: string?, reuse: integer? }
+---             read: { start_line: integer, num_lines: integer }?, prefer: "diff"|"read"|"step"?,
+---             tool_id: string?, cwd: string?, reuse: integer? }
 ---@param done fun(win: integer|nil)|nil Called once the float is up (the history read is async).
 function M.open(opts, done)
   local path = opts and opts.path
@@ -398,7 +497,10 @@ function M.open(opts, done)
     return finish(float.open_file(opts.session_id, path, opts.line, opts.reuse, title_for(nil)))
   end
 
-  transcript.file_history(opts.transcript, path, function(history)
+  ---The session's whole work on the file: today's content against what it
+  ---started from.
+  ---@param history ClaudeCodeAgentsFileHistory|nil
+  local function show_history(history)
     local hunks = (history and history.hunks) or {}
     local created = history and history.created
 
@@ -450,6 +552,17 @@ function M.open(opts, done)
       return finish(open_patch_text(opts.session_id, path, hunks, title_for("(session changes)"), opts.reuse))
     end
     return finish(win)
+  end
+
+  transcript.file_history(opts.transcript, path, function(history)
+    if opts.prefer == "step" and opts.tool_id and history then
+      for index, step in ipairs(history.steps or {}) do
+        if step.tool_id == opts.tool_id then
+          return finish(open_step(opts, history, index, title_for))
+        end
+      end
+    end
+    return show_history(history)
   end)
 end
 

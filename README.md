@@ -344,8 +344,9 @@ there too.
   behind. A file that is no longer on disk says so instead of opening an empty
   buffer.
 - `<CR>` in the Activity or Changes pane opens that file in a floating window,
-  showing **what the agent did to it**: an inline diff of the session's changes,
-  or, for a read in the Activity pane, the lines it read highlighted. See
+  showing **what the agent did to it**: in the Changes pane an inline diff of
+  everything the session changed; in the Activity pane just that one call — the
+  edit it made, or the lines it read, highlighted. See
   [what the file view shows](#what-the-file-view-shows).
 - Inside such a float, `<C-n>` and `<C-p>` step to the **next and previous row of
   the pane it came from** rather than to the next session — so you can read
@@ -376,9 +377,16 @@ letter beside each file is git's, and is the on-disk truth.
 A row in the Changes or Activity pane is a record of work, so opening it shows
 that work rather than the file:
 
-- **A file the agent changed** opens as the file as it is now, with the session's
+- **A file in the Changes pane** opens as the file as it is now, with the session's
   changes rendered inline — the same view you get while an edit is happening,
   only for everything that session did to the file.
+- **An edit in the Activity pane** opens that one edit: the file as that call
+  left it, with only that call's change rendered inline, and the title saying
+  which it is (`foo.lua  (edit 3 of 7)`). A file edited five times has five rows
+  that show five different steps, not the final state five times. The file at
+  that moment is rebuilt by undoing the later edits; when something outside the
+  session has since touched those lines, that is not possible and the call's own
+  patch is shown instead (`(edit 3 of 7, file moved on)`).
 - **A read in the Activity pane** opens the file with the lines that read covered
   highlighted.
 - **A file the agent created** reads as one long addition, since there was

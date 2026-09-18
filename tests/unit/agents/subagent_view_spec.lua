@@ -346,7 +346,9 @@ describe("agents.subagent_view", function()
       expect(opened[2].opts.tool_id).to_be("t2")
       expect(opened[2].opts.status).to_be("error")
       expect(opened[3].kind).to_be("file")
-      expect(opened[3].opts.prefer).to_be("diff")
+      -- An edit line is one call: it opens as that edit, named by its id.
+      expect(opened[3].opts.prefer).to_be("step")
+      expect(opened[3].opts.tool_id).to_be("t3")
     end)
 
     it("cuts a long command to one line with an ellipsis", function()

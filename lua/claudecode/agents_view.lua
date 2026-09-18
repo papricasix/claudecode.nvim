@@ -3109,6 +3109,14 @@ function open_row(payload, pane, lnum, action, nav_opts)
   if payload.event_kind == "read" and payload.start_line then
     read = { start_line = payload.start_line, num_lines = payload.num_lines or 1 }
   end
+  -- An Activity edit row names its call, and opens as that one edit. A Changes
+  -- row names no call, and opens as everything the session did to the file.
+  local prefer = "diff"
+  if read then
+    prefer = "read"
+  elseif payload.tool_id and (payload.event_kind == "edit" or payload.event_kind == "add") then
+    prefer = "step"
+  end
 
   file_view.open({
     session_id = model.selected(),
@@ -3116,7 +3124,8 @@ function open_row(payload, pane, lnum, action, nav_opts)
     path = payload.path,
     line = payload.line,
     read = read,
-    prefer = read and "read" or "diff",
+    prefer = prefer,
+    tool_id = prefer == "step" and payload.tool_id or nil,
     cwd = model.selected_cwd(),
     reuse = nav_opts.reuse,
   }, opened)

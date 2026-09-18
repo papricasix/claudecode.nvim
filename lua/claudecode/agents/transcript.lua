@@ -127,7 +127,16 @@ local config = nil
 ---@field created boolean The session created the file (its first touch was a write with no patch).
 ---@field reads { start_line: integer, num_lines: integer, ts: number }[]
 ---@field content string|nil Content of the last `Write`, when the session wrote the whole file.
+---@field steps ClaudeCodeAgentsFileStep[] The same edits one call at a time, oldest first.
 ---@field last_ts number
+
+---@class ClaudeCodeAgentsFileStep One call that changed the file.
+---@field tool_id string|nil The `toolu_…` id of the call (nil when the result names none).
+---@field kind "edit"|"write" A `Write` carries the whole file; an `Edit` only its patch.
+---@field hunks table[] This call's own hunks — the same tables `hunks` above holds.
+---@field content string|nil The file as the `Write` left it.
+---@field created boolean The call created the file.
+---@field ts number
 
 ---@class ClaudeCodeAgentsFile
 ---@field added integer
@@ -2243,11 +2252,24 @@ local function fold_history(hist, entry)
   -- The patch writes tabs as spaces; the result's own strings do not, and they are
   -- what lets the removed lines be put back as the file had them.
   patch.annotate(hunks, result)
+  -- One call is one step: the Activity pane opens a row as *that* edit, which
+  -- needs the call's own hunks apart from the session's, and in order.
+  ---@type ClaudeCodeAgentsFileStep
+  local step = {
+    tool_id = result_tool_id(entry),
+    kind = type(result.content) == "string" and "write" or "edit",
+    hunks = {},
+    content = type(result.content) == "string" and result.content or nil,
+    created = result.type == "create" or (#hunks == 0 and type(result.content) == "string"),
+    ts = ts,
+  }
   for _, hunk in ipairs(hunks) do
     if type(hunk) == "table" and type(hunk.lines) == "table" then
       hist.hunks[#hist.hunks + 1] = hunk
+      step.hunks[#step.hunks + 1] = hunk
     end
   end
+  hist.steps[#hist.steps + 1] = step
   if type(result.content) == "string" then
     hist.content = result.content
   end
@@ -2299,7 +2321,7 @@ function M.file_history(transcript_path, file_path, cb)
   end
 
   ---@type ClaudeCodeAgentsFileHistory
-  local hist = { path = file_path, hunks = {}, created = false, reads = {}, last_ts = 0 }
+  local hist = { path = file_path, hunks = {}, steps = {}, created = false, reads = {}, last_ts = 0 }
   -- The basename appears in every entry naming this file (the CLI records absolute
   -- paths), and in few others. Matching on it rather than the whole path also
   -- sidesteps JSON's escaping of a Windows separator.

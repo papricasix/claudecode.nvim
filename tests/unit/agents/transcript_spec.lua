@@ -850,6 +850,55 @@ describe("agents.transcript", function()
       expect(hist.created).to_be_true()
       expect(#hist.hunks).to_be(0)
       expect(hist.content).to_be("a\nb\n")
+      -- The one call is the one step, and it is the creating one.
+      expect(#hist.steps).to_be(1)
+      expect(hist.steps[1].kind).to_be("write")
+      expect(hist.steps[1].created).to_be_true()
+      expect(hist.steps[1].content).to_be("a\nb\n")
+    end)
+
+    it("keeps each call's hunks apart as a step, in order and named by its call", function()
+      -- The Activity pane opens a row as *that* edit, which needs the call's own
+      -- hunks and its place among the session's edits to the file.
+      local function result_line(id, result, ts)
+        return vim.json.encode({
+          type = "user",
+          timestamp = ts,
+          message = { role = "user", content = { { type = "tool_result", tool_use_id = id, content = "ok" } } },
+          toolUseResult = result,
+        })
+      end
+      local patch = function(lines)
+        return { { oldStart = 1, oldLines = 1, newStart = 1, newLines = 1, lines = lines } }
+      end
+      put("/p/a.jsonl", {
+        result_line("toolu_1", {
+          filePath = "/proj/x.lua",
+          oldString = "a",
+          newString = "b",
+          structuredPatch = patch({ "-a", "+b" }),
+        }, "2026-08-02T20:19:59.000Z"),
+        edit_line("/proj/other.lua", 1, 1),
+        result_line("toolu_2", {
+          filePath = "/proj/x.lua",
+          type = "update",
+          content = "c\n",
+          structuredPatch = patch({ "-b", "+c" }),
+        }, "2026-08-02T20:20:59.000Z"),
+      })
+      local hist = history("/p/a.jsonl", "/proj/x.lua")
+      expect(#hist.hunks).to_be(2)
+      expect(#hist.steps).to_be(2)
+      expect(hist.steps[1].tool_id).to_be("toolu_1")
+      expect(hist.steps[1].kind).to_be("edit")
+      expect(hist.steps[1].created).to_be_false()
+      expect(#hist.steps[1].hunks).to_be(1)
+      expect(hist.steps[1].hunks[1]).to_be(hist.hunks[1])
+      expect(hist.steps[2].tool_id).to_be("toolu_2")
+      expect(hist.steps[2].kind).to_be("write")
+      expect(hist.steps[2].created).to_be_false()
+      expect(hist.steps[2].content).to_be("c\n")
+      expect(hist.steps[2].hunks[1]).to_be(hist.hunks[2])
     end)
 
     it("collects the windows the session read", function()
