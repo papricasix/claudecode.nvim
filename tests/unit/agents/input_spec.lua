@@ -59,6 +59,26 @@ describe("agents.input", function()
     expect(answers[1]).to_be(nil)
   end)
 
+  it("leaves insert mode once answered, unless a terminal ended up current", function()
+    -- Closing the float does not end insert mode: focus fell back to the pane
+    -- still in insert, on a buffer nothing can be typed into.
+    local mode = vim.fn.mode
+    vim.fn.mode = function()
+      return "i"
+    end
+    vim._last_command = nil
+    expect(input._leave_insert()).to_be_true()
+    expect(vim._last_command).to_be("stopinsert")
+
+    vim._last_command = nil
+    vim.fn.mode = function()
+      return "n"
+    end
+    expect(input._leave_insert()).to_be(false)
+    expect(vim._last_command).to_be(nil)
+    vim.fn.mode = mode
+  end)
+
   it("answers an empty line as an empty string, which is how a name is cleared", function()
     local answer = "unset"
     input.ask({ default = "old" }, function(text)

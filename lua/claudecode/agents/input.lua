@@ -88,6 +88,7 @@ function M.ask(opts, cb)
       open = nil
     end
     vim.schedule(function()
+      M._leave_insert()
       cb(text)
     end)
   end
@@ -125,6 +126,25 @@ function M.ask(opts, cb)
   -- already there.
   pcall(vim.api.nvim_win_set_cursor, win, { 1, #default })
   pcall(vim.cmd, "startinsert!")
+  return true
+end
+
+---Leave the insert mode the prompt put us in.
+---
+---Closing a window does not end insert mode: focus fell back to the pane the
+---prompt was opened from still in insert, on a buffer nothing can be typed into
+---(the search picker had the same bug, verified through a pty). Guarded the way
+---`search._leave_insert` is — a terminal that ends up current keeps its mode.
+---@return boolean left
+function M._leave_insert()
+  if not tostring(vim.fn.mode()):find("^i") then
+    return false
+  end
+  local ok, buftype = pcall(vim.api.nvim_get_option_value, "buftype", { buf = 0 })
+  if ok and buftype == "terminal" then
+    return false
+  end
+  pcall(vim.cmd, "stopinsert")
   return true
 end
 
