@@ -317,7 +317,9 @@ there too.
 - **Workflow runs** (Claude's `Workflow` tool) are in the tree too, marked `»`, with their agents beneath them and each agent's own background tasks beneath that. The row shows the run's total tokens and runtime and ends as `✓`, `✗` or `⊘`. `<CR>` opens the run: what it is for, how it stands, its agents phase by phase (`<CR>` on one reads its transcript), and once it has ended its result, the error it failed with and what the script logged — followed live while it runs. A workflow's agent opens its transcript directly from the tree too.
 - `<CR>` on a subagent opens its **transcript in a float**: the whole purpose as the headline with its type, state, tokens and runtime, then the prompt it was given, what it said, its reasoning folded away on its own background (`<Tab>` opens and closes a block), and one line per tool call saying how it went — `✓ 12 lines`, `+3 -1`, `✗ Exit code 1`. Tool output itself is left out (it is almost all of a subagent's transcript); `<CR>` on an Activity row is where one call's output is read. A subagent it started is a line of its own, and `<CR>` there opens that one in the same float; `<BS>` goes back to the one you came from, onto the line you left. `<CR>` on any other tool line opens that call the way the Activity pane does — what the subagent did to the file, or the command and its output — in a float of its own that `q` closes. While the run is working the float follows it, and `<C-n>`/`<C-p>` step to the next or previous subagent.
 - The Activity pane lists the selected agent's tool calls **newest first**, so
-  what it is doing now is at the top rather than scrolled off the bottom.
+  what it is doing now is at the top rather than scrolled off the bottom. It
+  draws a screenful at a time and grows as you scroll, back to the newest
+  `feed_limit` (500) events the store keeps for a session.
 - It lists **everything the agent did**, not only its file work: the shell
   commands it ran, the searches it made, the subagents it launched, each named by
   the tool it used and by what the call was for. A call still running is marked

@@ -819,6 +819,75 @@ describe("agents_view", function()
       package.loaded["claudecode.agents_view"] = nil
     end)
 
+    it("draws more of the activity feed as it is scrolled, down to the store's cap", function()
+      -- The pane used to draw one screenful and stop: scrolling down hit the end
+      -- after a screen however long the history was.
+      local asked = {}
+      local events = {}
+      for n = 1, 200 do
+        events[n] = { ts = n, kind = "tool", tool = "Bash", label = "call " .. n, tool_id = "t" .. n }
+      end
+      package.loaded["claudecode.agents.model"].feed = function(visible)
+        asked[#asked + 1] = visible
+        local out = {}
+        for n = 1, math.min(visible or #events, #events) do
+          out[n] = events[n]
+        end
+        return out, {}
+      end
+      open_view()
+      local win = agents_view._state().wins.feed
+      vim.api.nvim_win_set_height(win, 20)
+      agents_view.redraw()
+      local at_rest = asked[#asked]
+      expect(at_rest).to_be(25) -- a screenful plus slack
+
+      -- Scrolled well past the first screen: a screenful beyond the cursor.
+      vim.api.nvim_win_set_cursor(win, { 24, 0 })
+      agents_view.redraw()
+      expect(asked[#asked]).to_be(24 + 20 + 5)
+      expect(agents_view._state().feed_drawn).to_be(49)
+
+      -- The scroll autocmd repaints only when the drawn rows are running out.
+      local redraws = 0
+      local redraw = agents_view.redraw
+      agents_view.redraw = function()
+        redraws = redraws + 1
+        return redraw()
+      end
+      local function scroll()
+        local fired = 0
+        for _, group in pairs(vim._autocmds or {}) do
+          for _, au in ipairs(group.events or {}) do
+            if au.opts and au.opts.buffer == agents_view._state().bufs.feed then
+              fired = fired + 1
+              au.opts.callback()
+            end
+          end
+        end
+        return fired
+      end
+      expect(scroll() > 0).to_be_true()
+      expect(redraws).to_be(0) -- 24 + 5 < 49
+      vim.api.nvim_win_set_cursor(win, { 46, 0 })
+      scroll()
+      expect(redraws).to_be(1)
+      expect(asked[#asked]).to_be(46 + 20 + 5)
+
+      -- Past the end of the store nothing more is asked for on a scroll.
+      vim.api.nvim_win_set_cursor(win, { 200, 0 })
+      agents_view.redraw = redraw
+      agents_view.redraw()
+      expect(agents_view._state().feed_exhausted).to_be_true()
+      redraws = 0
+      agents_view.redraw = function()
+        redraws = redraws + 1
+      end
+      scroll()
+      expect(redraws).to_be(0)
+      agents_view.redraw = redraw
+    end)
+
     it("offers the newest session as soon as the view opens", function()
       -- Otherwise the centre is the blank, *modifiable* buffer `tabnew` left, and
       -- `i` from any pane drops the user into insert mode in a scratch file.

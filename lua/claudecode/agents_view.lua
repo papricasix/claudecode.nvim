@@ -115,9 +115,11 @@ local PANES = { "center", "sessions", "feed", "changes", "subagents" }
 --- fires no event, so it does not need the frame clock's pace.
 local SIZE_SNAPSHOT_MS = 1000
 
---- Rows drawn beyond what the Activity pane can show. Slack, not scrollback: the
---- pane is read from the top, and a row further down is drawn only while
---- something holds on to it (see `model.feed`).
+--- Rows drawn beyond what the Activity pane can show at rest. Slack, so a row is
+--- not missing if the window grows between the measurement and the paint. The
+--- pane is read from the top, and rows further down are drawn only as the user
+--- scrolls towards them (`feed_reach`) or while something holds on to one (see
+--- `model.feed`).
 local FEED_OVERDRAW = 5
 
 ---@return table
@@ -186,6 +188,14 @@ end
 --- repainting.)
 ---@type fun(): boolean
 local tab_visible
+--- Same reason: `redraw` and the scroll autocmds ask how much of the Activity
+--- feed to draw, and the bodies sit with `tab_visible` below.
+---@type fun(win: integer): integer
+local feed_reach
+---@type fun(win: integer): integer
+local feed_visible
+---@type fun()
+local on_feed_scroll
 
 --- Declared here because `setup` and `open` both reach for it, and its body has
 --- to sit below `reveal_session`. A `local function` further down would not be in
@@ -1594,12 +1604,77 @@ function M.arm_autocmds()
       desc = "Select the Claude session under the cursor",
     })
   end
+
+  -- The Activity pane grows as it is scrolled. `CursorMoved` covers `j` and
+  -- `<C-d>`; `WinScrolled` covers the wheel, which moves no cursor.
+  if state.bufs.feed then
+    vim.api.nvim_create_autocmd("CursorMoved", {
+      group = state.augroup,
+      buffer = state.bufs.feed,
+      callback = on_feed_scroll,
+      desc = "Draw more of the Claude agents activity feed",
+    })
+    vim.api.nvim_create_autocmd("WinScrolled", {
+      group = state.augroup,
+      callback = function()
+        if pane_win("feed") == vim.api.nvim_get_current_win() then
+          on_feed_scroll()
+        end
+      end,
+      desc = "Draw more of the Claude agents activity feed",
+    })
+  end
 end
 
 ---@return boolean
 function tab_visible()
   local ok, current = pcall(vim.api.nvim_get_current_tabpage)
   return ok and state.tab ~= nil and current == state.tab
+end
+
+---How far down the Activity pane the user has gone: the last line on screen, or
+---the cursor's line when that is further (a held key runs the cursor ahead of
+---the scroll).
+---@param win integer
+---@return integer
+function feed_reach(win)
+  local reach = 0
+  local ok, bottom = pcall(vim.fn.line, "w$", win)
+  if ok and type(bottom) == "number" then
+    reach = bottom
+  end
+  local ok_cur, pos = pcall(vim.api.nvim_win_get_cursor, win)
+  if ok_cur and type(pos) == "table" and (pos[1] or 0) > reach then
+    reach = pos[1]
+  end
+  return reach
+end
+
+---How many Activity rows to draw for the pane: a screenful plus slack at rest,
+---and once the user has scrolled past the first screen, a screenful beyond
+---where they are — so the next scroll has rows to land on.
+---@param win integer
+---@return integer
+function feed_visible(win)
+  local height = vim.api.nvim_win_get_height(win)
+  local reach = feed_reach(win)
+  if reach > height then
+    return reach + height + FEED_OVERDRAW
+  end
+  return height + FEED_OVERDRAW
+end
+
+---Draw more of the Activity feed when a scroll or a cursor move nears the end
+---of what is drawn. Nothing else repaints on a scroll: the redraw is driven by
+---events and the poll, and in hooks mode a quiet agent means no repaint at all.
+function on_feed_scroll()
+  local win = pane_win("feed")
+  if not win or state.feed_exhausted then
+    return
+  end
+  if feed_reach(win) + FEED_OVERDRAW > (state.feed_drawn or 0) then
+    M.redraw()
+  end
 end
 
 function M.sync_timers()
@@ -2113,12 +2188,17 @@ function M.redraw()
     if held then
       keep[held.key] = true
     end
-    -- Only what the pane can show, plus a little slack so a row is not missing
-    -- if the window grows between the measurement and the paint — and whatever is
-    -- held, however far down new events have pushed it.
-    local visible = vim.api.nvim_win_get_height(feed_win) + FEED_OVERDRAW
+    -- Only what the pane can show, plus a little slack — and, once the user has
+    -- scrolled, a screenful past where they are, so the list grows under them
+    -- down to the store's own cap instead of ending after one screen. Plus
+    -- whatever is held, however far down new events have pushed it.
+    local visible = feed_visible(feed_win)
     local events
     events, ages = model.feed(visible, next(keep) ~= nil and keep or nil)
+    state.feed_drawn = #events
+    -- Fewer rows than asked for means the store had no more: scrolling further
+    -- has nothing to reveal, and the scroll autocmd need not repaint for it.
+    state.feed_exhausted = #events < visible
     -- A caller (or a spec) may hand back events without ages; the pane then just
     -- draws them at their resting colour.
     ages = ages or {}
