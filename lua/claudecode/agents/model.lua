@@ -1453,8 +1453,9 @@ function M.changes()
 
   -- With checkpoints, a file is listed once per era it was edited in, with that
   -- era's own counts, and a rule between the eras. Each era keeps the pane's
-  -- first-touch order within itself, and the eras run oldest to newest — where
-  -- new files have always appeared in this pane.
+  -- first-touch order within itself; the eras run newest first, the way Activity
+  -- does, so what the agent has done since the checkpoint is at the top and a
+  -- new file lands above the rule rather than under everything.
   local eras = {}
   for _, path in ipairs(summary.order or {}) do
     local file = summary.files[path]
@@ -1484,7 +1485,7 @@ function M.changes()
   end
 
   local now = M._now_s()
-  for index = 1, #marks + 1 do
+  for index = #marks + 1, 1, -1 do
     local era = eras[index]
     if era then
       local from, to = checkpoints.bounds(marks, index)
@@ -1494,8 +1495,9 @@ function M.changes()
         push(path, era.by_path[path], span)
       end
     end
-    if index <= #marks then
-      entries[#entries + 1] = { kind = "checkpoint", ts = marks[index], index = index, count = #marks }
+    -- The rule below an era is the checkpoint that opened it.
+    if index > 1 then
+      entries[#entries + 1] = { kind = "checkpoint", ts = marks[index - 1], index = index - 1, count = #marks }
     end
   end
   return entries

@@ -1390,16 +1390,16 @@ describe("agents.model", function()
             string.format("%s +%d -%d (%d/%d)", row.path, row.added, row.removed, row.era.index, row.era.count)
         end
       end
-      -- Oldest era first, the rule between, the file edited on both sides twice.
+      -- Newest era on top, the rule under it, the file edited on both sides twice.
       assert.same({
-        "/proj/a.lua +15 -3 (1/1)",
-        "── 20",
         "/proj/a.lua +15 -3 (2/1)",
         "/proj/new.lua +4 -0 (2/1)",
+        "── 20",
+        "/proj/a.lua +15 -3 (1/1)",
       }, drawn)
-      expect(rows[1].era.to).to_be(20)
-      expect(rows[3].era.from).to_be(20)
-      expect(rows[3].era.to).to_be(nil)
+      expect(rows[1].era.from).to_be(20)
+      expect(rows[1].era.to).to_be(nil)
+      expect(rows[4].era.to).to_be(20)
     end)
 
     it("stacks: each checkpoint splits again", function()
@@ -1407,18 +1407,18 @@ describe("agents.model", function()
       checkpoints.add("aaa", 22)
       local drawn = {}
       for _, row in ipairs(model.changes()) do
-        drawn[#drawn + 1] = row.kind == "checkpoint" and "──" or (row.path .. " +" .. row.added)
+        drawn[#drawn + 1] = row.kind == "checkpoint" and ("──" .. row.ts) or (row.path .. " +" .. row.added)
       end
       assert.same(
-        { "/proj/a.lua +10", "──", "/proj/a.lua +5", "──", "/proj/a.lua +15", "/proj/new.lua +4" },
+        { "/proj/a.lua +15", "/proj/new.lua +4", "──22", "/proj/a.lua +5", "──10", "/proj/a.lua +10" },
         drawn
       )
     end)
 
-    it("draws a rule even when nothing has happened since it", function()
+    it("draws a rule at the top when nothing has happened since it", function()
       checkpoints.add("aaa", 100)
       local rows = model.changes()
-      expect(rows[#rows].kind).to_be("checkpoint")
+      expect(rows[1].kind).to_be("checkpoint")
       expect(#rows).to_be(3)
     end)
 
@@ -1435,7 +1435,7 @@ describe("agents.model", function()
       for _, row in ipairs(model.changes()) do
         drawn[#drawn + 1] = row.kind == "checkpoint" and "──" or (row.path .. " +" .. row.added)
       end
-      assert.same({ "──", "/proj/a.lua +30", "/proj/new.lua +4" }, drawn)
+      assert.same({ "/proj/a.lua +30", "/proj/new.lua +4", "──" }, drawn)
     end)
 
     it("lists every file once with no checkpoint, as before", function()

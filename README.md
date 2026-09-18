@@ -352,9 +352,10 @@ there too.
 - `gc` (or `:ClaudeCodeAgentsCheckpoint`) **draws a line through the selected
   session's history**: everything it does from now on is listed apart from what
   it did before. Each pane shows a `── checkpoint 14:32 ──` rule where the line
-  falls — Activity above it is new, below it is old; Changes and Tasks the other
-  way up, since those list oldest first — and a file the agent edits again after
-  the checkpoint gets a **second row** with only the new edits' counts. `<CR>` on
+  falls — in Changes and Activity what is above it is new and what is below is
+  old; Tasks, which lists runs in the order they started, the other way up — and
+  a file the agent edits again after the checkpoint gets a **second row**, above
+  the rule, with only the new edits' counts. `<CR>` on
   the old row shows the file as it stood at the checkpoint against what the
   session started from; `<CR>` on the new row shows what changed since. Take
   another to split again: an era is what lies between two neighbouring lines, and

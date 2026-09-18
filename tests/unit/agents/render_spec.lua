@@ -656,9 +656,9 @@ describe("agents.render", function()
       local ts = os.time({ year = 2026, month = 9, day = 17, hour = 14, min = 32, sec = 0 })
       local changes = render.create_buf("changes")
       render.changes(changes, {
-        { path = "/proj/a.lua", status = "M", added = 1, removed = 0, era = { index = 1, count = 1, to = ts } },
-        { kind = "checkpoint", ts = ts, index = 1, count = 1 },
         { path = "/proj/a.lua", status = "M", added = 2, removed = 0, era = { index = 2, count = 1, from = ts } },
+        { kind = "checkpoint", ts = ts, index = 1, count = 1 },
+        { path = "/proj/a.lua", status = "M", added = 1, removed = 0, era = { index = 1, count = 1, to = ts } },
       }, { width = 40, cwd = "/proj", now = ts + 60 })
 
       local lines = lines_of(changes)
@@ -678,7 +678,7 @@ describe("agents.render", function()
       expect(group).to_be("ClaudeCodeAgentsCheckpoint")
       -- Two rows of one file, each its own row to the cursor and to `<CR>`.
       expect(render.payload_at(changes, 1).key ~= render.payload_at(changes, 3).key).to_be_true()
-      expect(render.payload_at(changes, 3).era.from).to_be(ts)
+      expect(render.payload_at(changes, 1).era.from).to_be(ts)
     end)
   end)
 
