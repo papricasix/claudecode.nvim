@@ -128,12 +128,15 @@ local config = nil
 ---@field reads { start_line: integer, num_lines: integer, ts: number }[]
 ---@field content string|nil Content of the last `Write`, when the session wrote the whole file.
 ---@field steps ClaudeCodeAgentsFileStep[] The same edits one call at a time, oldest first.
+---@field read_anchor { step: integer, content: string }|nil A whole-file read after the last step: the file as it stood then.
+---@field reconstruction table<integer, string[]>|nil `patch.reconstruct`'s answer, memoised by `file_view`.
 ---@field last_ts number
 
 ---@class ClaudeCodeAgentsFileStep One call that changed the file.
 ---@field tool_id string|nil The `toolu_…` id of the call (nil when the result names none).
 ---@field kind "edit"|"write" A `Write` carries the whole file; an `Edit` only its patch.
 ---@field hunks table[] This call's own hunks — the same tables `hunks` above holds.
+---@field before string|nil The file as the call found it: `originalFile`, a whole read just before, or `""` for a creation.
 ---@field content string|nil The file as the `Write` left it.
 ---@field created boolean The call created the file.
 ---@field ts number
@@ -2233,6 +2236,17 @@ local function fold_history(hist, entry)
         ts = ts,
       }
     end
+    -- A read of the whole file *is* the file at that moment (measured equal to
+    -- the next edit's `originalFile`, 65 of 65): an anchor for `patch.reconstruct`.
+    -- A windowed or token-capped read is a fragment and anchors nothing.
+    if
+      start_line == 1
+      and tonumber(file.numLines) == tonumber(file.totalLines)
+      and type(file.content) == "string"
+      and not file.truncatedByTokenCap
+    then
+      hist.read_anchor = { step = #hist.steps, content = file.content }
+    end
     if ts > hist.last_ts then
       hist.last_ts = ts
     end
@@ -2269,6 +2283,17 @@ local function fold_history(hist, entry)
       step.hunks[#step.hunks + 1] = hunk
     end
   end
+  -- What the call found: its own `originalFile` when the CLI kept it, nothing for
+  -- a creation, else a whole read since the previous step. The read is consumed
+  -- either way — after this step it no longer describes the file.
+  if type(result.originalFile) == "string" then
+    step.before = result.originalFile
+  elseif step.created then
+    step.before = ""
+  elseif hist.read_anchor and hist.read_anchor.step == #hist.steps then
+    step.before = hist.read_anchor.content
+  end
+  hist.read_anchor = nil
   hist.steps[#hist.steps + 1] = step
   if type(result.content) == "string" then
     hist.content = result.content

@@ -857,20 +857,41 @@ describe("agents.transcript", function()
       expect(hist.steps[1].content).to_be("a\nb\n")
     end)
 
+    ---A tool result naming its call.
+    local function result_line(id, result, ts)
+      return vim.json.encode({
+        type = "user",
+        timestamp = ts or "2026-08-02T20:19:59.000Z",
+        message = { role = "user", content = { { type = "tool_result", tool_use_id = id, content = "ok" } } },
+        toolUseResult = result,
+      })
+    end
+    local function patch(lines)
+      return { { oldStart = 1, oldLines = 1, newStart = 1, newLines = 1, lines = lines } }
+    end
+    ---A read, whole or windowed, carrying the content the CLI records.
+    local function read_content_line(file, content, opts)
+      opts = opts or {}
+      return vim.json.encode({
+        type = "user",
+        timestamp = opts.ts or "2026-08-02T20:19:58.000Z",
+        toolUseResult = {
+          type = "text",
+          file = {
+            filePath = file,
+            content = content,
+            startLine = opts.start_line or 1,
+            numLines = opts.num_lines or 2,
+            totalLines = opts.total_lines or 2,
+            truncatedByTokenCap = opts.truncated or nil,
+          },
+        },
+      })
+    end
+
     it("keeps each call's hunks apart as a step, in order and named by its call", function()
       -- The Activity pane opens a row as *that* edit, which needs the call's own
       -- hunks and its place among the session's edits to the file.
-      local function result_line(id, result, ts)
-        return vim.json.encode({
-          type = "user",
-          timestamp = ts,
-          message = { role = "user", content = { { type = "tool_result", tool_use_id = id, content = "ok" } } },
-          toolUseResult = result,
-        })
-      end
-      local patch = function(lines)
-        return { { oldStart = 1, oldLines = 1, newStart = 1, newLines = 1, lines = lines } }
-      end
       put("/p/a.jsonl", {
         result_line("toolu_1", {
           filePath = "/proj/x.lua",
@@ -899,6 +920,74 @@ describe("agents.transcript", function()
       expect(hist.steps[2].created).to_be_false()
       expect(hist.steps[2].content).to_be("c\n")
       expect(hist.steps[2].hunks[1]).to_be(hist.hunks[2])
+    end)
+
+    it("records what each call found, as the anchors a reconstruction starts from", function()
+      put("/p/a.jsonl", {
+        -- A whole read just before the first edit: the file as it stood.
+        read_content_line("/proj/x.lua", "a\nb\n"),
+        result_line("toolu_1", {
+          filePath = "/proj/x.lua",
+          oldString = "a",
+          newString = "A",
+          originalFile = vim.NIL,
+          structuredPatch = patch({ "-a", "+A", " b" }),
+        }),
+        -- The CLI kept originalFile on this one: it wins over anything read.
+        read_content_line("/proj/x.lua", "stale\n"),
+        result_line("toolu_2", {
+          filePath = "/proj/x.lua",
+          oldString = "b",
+          newString = "B",
+          originalFile = "A\nb\n",
+          structuredPatch = patch({ " A", "-b", "+B" }),
+        }, "2026-08-02T20:20:59.000Z"),
+        -- A whole read after the last step anchors the end.
+        read_content_line("/proj/x.lua", "A\nB\n", { ts = "2026-08-02T20:21:59.000Z" }),
+      })
+      local hist = history("/p/a.jsonl", "/proj/x.lua")
+      expect(hist.steps[1].before).to_be("a\nb\n")
+      expect(hist.steps[2].before).to_be("A\nb\n")
+      expect(hist.read_anchor.step).to_be(2)
+      expect(hist.read_anchor.content).to_be("A\nB\n")
+    end)
+
+    it("does not let a windowed or capped read stand in for the file", function()
+      put("/p/a.jsonl", {
+        read_content_line("/proj/x.lua", "b\n", { start_line = 2, num_lines = 1, total_lines = 2 }),
+        result_line(
+          "toolu_1",
+          { filePath = "/proj/x.lua", oldString = "b", newString = "B", structuredPatch = patch({ "-b", "+B" }) }
+        ),
+        read_content_line("/proj/x.lua", "a\nB", { truncated = true }),
+      })
+      local hist = history("/p/a.jsonl", "/proj/x.lua")
+      expect(hist.steps[1].before).to_be_nil()
+      expect(hist.read_anchor).to_be_nil()
+    end)
+
+    it("starts a created file from nothing", function()
+      put("/p/a.jsonl", { write_create_line("/proj/new.lua", "a\nb\n") })
+      local hist = history("/p/a.jsonl", "/proj/new.lua")
+      expect(hist.steps[1].before).to_be("")
+    end)
+
+    it("forgets a read once an edit has happened, since it no longer describes the file", function()
+      put("/p/a.jsonl", {
+        read_content_line("/proj/x.lua", "a\nb\n"),
+        result_line(
+          "toolu_1",
+          { filePath = "/proj/x.lua", oldString = "a", newString = "A", structuredPatch = patch({ "-a", "+A" }) }
+        ),
+        result_line(
+          "toolu_2",
+          { filePath = "/proj/x.lua", oldString = "b", newString = "B", structuredPatch = patch({ "-b", "+B" }) }
+        ),
+      })
+      local hist = history("/p/a.jsonl", "/proj/x.lua")
+      expect(hist.steps[1].before).to_be("a\nb\n")
+      expect(hist.steps[2].before).to_be_nil()
+      expect(hist.read_anchor).to_be_nil()
     end)
 
     it("collects the windows the session read", function()

@@ -211,7 +211,8 @@ describe("agents.file_view", function()
       expect(shown[1].old_text).to_be("one\ntwo\nthree\n")
       local buf, title = float_buf()
       assert.same({ "one", "TWO", "three" }, vim.api.nvim_buf_get_lines(buf, 0, -1, false))
-      expect(title:find("(edit 1 of 2)", 1, true) ~= nil).to_be_true()
+      -- No anchor in the record, so this came from today's file, and says so.
+      expect(title:find("(edit 1 of 2, on disk)", 1, true) ~= nil).to_be_true()
     end)
 
     it("shows the last edit against the file just before it", function()
@@ -226,7 +227,7 @@ describe("agents.file_view", function()
       expect(shown[1].old_text).to_be("one\nTWO\nthree\n")
       local buf, title = float_buf()
       assert.same({ "one", "TWO", "THREE" }, vim.api.nvim_buf_get_lines(buf, 0, -1, false))
-      expect(title:find("(edit 2 of 2)", 1, true) ~= nil).to_be_true()
+      expect(title:find("(edit 2 of 2, on disk)", 1, true) ~= nil).to_be_true()
     end)
 
     it("shows the call's own patch when a later edit can no longer be undone", function()
@@ -289,7 +290,8 @@ describe("agents.file_view", function()
       expect(shown[1].old_text).to_be("x\nb\n")
       local buf, title = float_buf()
       assert.same({ "a", "b" }, vim.api.nvim_buf_get_lines(buf, 0, -1, false))
-      expect(title:find("(write 1 of 2)", 1, true) ~= nil).to_be_true()
+      -- The content is the record's own, so this one is a reconstruction.
+      expect(title:find("(write 1 of 2, reconstructed)", 1, true) ~= nil).to_be_true()
     end)
 
     it("reads a write that created the file as all new", function()
@@ -317,6 +319,22 @@ describe("agents.file_view", function()
       expect(shown[1].old_text).to_be("one\ntwo\nthree\n")
     end)
 
+    it("shows the call from the record when an anchor reaches it, not from disk", function()
+      install_unified()
+      disk["/proj/a.lua"] = { "rewritten", "entirely", "since" }
+      histories["/proj/a.lua"] = history_of({
+        step("toolu_1", "edit", { hunk(2, { "-two", "+TWO" }) }, { before = "one\ntwo\nthree\n" }),
+        step("toolu_2", "edit", { hunk(3, { "-three", "+THREE" }) }),
+      })
+
+      open_step("toolu_2")
+      expect(#shown).to_be(1)
+      expect(shown[1].old_text).to_be("one\nTWO\nthree\n")
+      local buf, title = float_buf()
+      assert.same({ "one", "TWO", "THREE" }, vim.api.nvim_buf_get_lines(buf, 0, -1, false))
+      expect(title:find("(edit 2 of 2, reconstructed)", 1, true) ~= nil).to_be_true()
+    end)
+
     it("shows the patch without unified.nvim, scoped to the one call", function()
       disk["/proj/a.lua"] = { "one", "TWO", "THREE" }
       histories["/proj/a.lua"] = history_of({
@@ -331,6 +349,102 @@ describe("agents.file_view", function()
       local text = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
       expect(text:find("+TWO", 1, true)).to_be_nil()
       expect(text:find("+THREE", 1, true) ~= nil).to_be_true()
+    end)
+  end)
+
+  describe("the session's changes, from the record", function()
+    local function step(tool_id, hunks, extra)
+      local s = { tool_id = tool_id, kind = "edit", hunks = hunks, created = false }
+      for k, v in pairs(extra or {}) do
+        s[k] = v
+      end
+      return s
+    end
+    local function history_of(steps, extra)
+      local hunks = {}
+      for _, s in ipairs(steps) do
+        for _, h in ipairs(s.hunks) do
+          hunks[#hunks + 1] = h
+        end
+      end
+      local hist = { hunks = hunks, steps = steps, created = false, reads = {} }
+      for k, v in pairs(extra or {}) do
+        hist[k] = v
+      end
+      return hist
+    end
+
+    it("diffs the file the session found against the file it left, whatever is on disk now", function()
+      -- The file has moved on entirely since; the record still knows both sides.
+      install_unified()
+      disk["/proj/a.lua"] = { "rewritten", "since" }
+      histories["/proj/a.lua"] = history_of({
+        step("toolu_1", { hunk(2, { "-two", "+TWO" }) }, { before = "one\ntwo\nthree\n" }),
+        step("toolu_2", { hunk(3, { "-three", "+THREE" }) }),
+      })
+
+      open({ session_id = "s", transcript = "/p/a.jsonl", path = "/proj/a.lua" })
+      expect(#shown).to_be(1)
+      expect(shown[1].old_text).to_be("one\ntwo\nthree\n")
+      local buf, title = float_buf()
+      assert.same({ "one", "TWO", "THREE" }, vim.api.nvim_buf_get_lines(buf, 0, -1, false))
+      expect(title:find("(session changes, reconstructed)", 1, true) ~= nil).to_be_true()
+    end)
+
+    it("anchors on a whole read after the last edit", function()
+      install_unified()
+      disk["/proj/a.lua"] = { "rewritten" }
+      histories["/proj/a.lua"] = history_of({
+        step("toolu_1", { hunk(2, { "-two", "+TWO" }) }),
+      }, { read_anchor = { step = 1, content = "one\nTWO\n" } })
+
+      open({ session_id = "s", transcript = "/p/a.jsonl", path = "/proj/a.lua" })
+      expect(shown[1].old_text).to_be("one\ntwo\n")
+    end)
+
+    it("says so rather than opening an empty diff when the session left the file as it found it", function()
+      install_unified()
+      disk["/proj/a.lua"] = { "one", "two" }
+      histories["/proj/a.lua"] = history_of({
+        step("toolu_1", { hunk(2, { "-two", "+TWO" }) }, { before = "one\ntwo\n" }),
+        step("toolu_2", { hunk(2, { "-TWO", "+two" }) }),
+      })
+      local notes = {}
+      local notify = vim.notify
+      vim.notify = function(msg)
+        notes[#notes + 1] = msg
+      end
+      local win = open({ session_id = "s", transcript = "/p/a.jsonl", path = "/proj/a.lua" })
+      vim.notify = notify
+      expect(win).to_be_nil()
+      expect(#shown).to_be(0)
+      expect(notes[1]:find("as it found it", 1, true) ~= nil).to_be_true()
+    end)
+
+    it("falls back to today's file when the record holds no anchor, and says so", function()
+      install_unified()
+      disk["/proj/a.lua"] = { "one", "TWO", "three" }
+      histories["/proj/a.lua"] = history_of({
+        step("toolu_1", { hunk(2, { "-two", "+TWO" }) }),
+      })
+
+      open({ session_id = "s", transcript = "/p/a.jsonl", path = "/proj/a.lua" })
+      expect(shown[1].old_text).to_be("one\ntwo\nthree\n")
+      local _, title = float_buf()
+      expect(title:find("(on disk)", 1, true) ~= nil).to_be_true()
+    end)
+
+    it("falls back to today's file when an outside edit broke the chain and nothing re-anchors it", function()
+      install_unified()
+      disk["/proj/a.lua"] = { "one", "TWO", "utterly different" }
+      histories["/proj/a.lua"] = history_of({
+        step("toolu_1", { hunk(2, { "-two", "+TWO" }) }, { before = "one\ntwo\nthree\n" }),
+        step("toolu_2", { hunk(3, { "-gone", "+THREE" }) }),
+      })
+
+      open({ session_id = "s", transcript = "/p/a.jsonl", path = "/proj/a.lua" })
+      local _, title = float_buf()
+      expect(title:find("(on disk, 1/2 changes still present)", 1, true) ~= nil).to_be_true()
     end)
   end)
 

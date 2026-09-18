@@ -256,39 +256,31 @@ local function open_text_diff(session_id, path, before, after, title, reuse, rev
   return win
 end
 
----A `Write`'s content as lines, the way `readfile` would hand the file back:
----CRs dropped, and a trailing newline ending the last line rather than adding an
----empty one after it.
----@param content string
----@return string[]
-local function content_lines(content)
-  local out, from = {}, 1
-  while true do
-    local nl = content:find("\n", from, true)
-    if not nl then
-      local last = content:sub(from)
-      if last ~= "" then
-        out[#out + 1] = (last:gsub("\r$", ""))
-      end
-      return out
-    end
-    out[#out + 1] = (content:sub(from, nl - 1):gsub("\r$", ""))
-    from = nl + 1
+---Every state the file passed through in the session, from the record alone
+---(`patch.reconstruct`), computed once per history — a history is replaced, never
+---mutated, when the transcript grows.
+---@param history ClaudeCodeAgentsFileHistory
+---@return table<integer, string[]>
+local function reconstruction(history)
+  if not history.reconstruction then
+    history.reconstruction = patch.reconstruct(history.steps or {}, history.read_anchor)
   end
+  return history.reconstruction
 end
 
 ---Show one call's edit: the file as that call left it, against what it found.
 ---
 ---An Activity row is one tool call, so its diff is that call's, not the session's.
----The file at that moment is rebuilt from today's by undoing every later step
----first (`patch.reverse_apply`, newest first), and that step's own hunks are then
----undone for the other side. A `Write` needs no rebuilding: its result carries the
----whole file as it left it.
+---Both sides come from the record when it holds enough to rebuild them
+---(`patch.reconstruct`: an `originalFile`, a whole read or a `Write`'s content
+---somewhere in the session, and the hunks between), and the title says so —
+---`reconstructed` is the file as it stood then, not as it is now.
 ---
----Any hunk that no longer locates — a later step's or this one's — means the
----moment cannot be rebuilt, because something outside the session has touched
----those lines since. Then the call's own patch is shown as diff text, which is
----the record itself, and the title says why.
+---Without an anchor the moment is rebuilt from today's file instead: every later
+---step undone first (`patch.reverse_apply`, newest first), then this one for the
+---other side, titled `on disk`. A hunk that no longer locates means something
+---outside the session has touched those lines since; then the call's own patch
+---is shown as diff text, which is the record itself, and the title says why.
 ---@param opts table `M.open`'s opts.
 ---@param history ClaudeCodeAgentsFileHistory
 ---@param index integer Position of the step in `history.steps`.
@@ -314,37 +306,42 @@ local function open_step(opts, history, index, title_for)
     return patches(nil)
   end
 
-  local after
-  if step.content then
-    after = content_lines(step.content)
-  else
-    local lines = read_lines(path)
-    if not lines then
-      return patches("deleted")
+  local states = reconstruction(history)
+  local before, after = states[index - 1], states[index]
+  if before and after then
+    local title = title_for("(" .. what .. ", reconstructed)")
+    local win = open_inline_diff(opts.session_id, path, after, before, title, opts.reuse)
+    if win then
+      return win
     end
-    local later = {}
-    for i = index + 1, #steps do
-      for _, hunk in ipairs(steps[i].hunks) do
-        later[#later + 1] = hunk
-      end
-    end
-    local rebuilt, _, skipped = patch.reverse_apply(lines, later)
-    if skipped > 0 then
-      return patches("file moved on")
-    end
-    after = rebuilt
   end
 
-  local before = {}
+  local lines = read_lines(path)
+  if not lines then
+    return patches("deleted")
+  end
+  local later = {}
+  for i = index + 1, #steps do
+    for _, hunk in ipairs(steps[i].hunks) do
+      later[#later + 1] = hunk
+    end
+  end
+  local rebuilt, _, skipped = patch.reverse_apply(lines, later)
+  if skipped > 0 then
+    return patches("file moved on")
+  end
+  after = rebuilt
+
+  before = {}
   if not step.created then
-    local applied, skipped
+    local applied
     before, applied, skipped = patch.reverse_apply(after, step.hunks)
     if skipped > 0 or applied == 0 then
       return patches("file moved on")
     end
   end
 
-  local win = open_inline_diff(opts.session_id, path, after, before, title_for("(" .. what .. ")"), opts.reuse)
+  local win = open_inline_diff(opts.session_id, path, after, before, title_for("(" .. what .. ", on disk)"), opts.reuse)
   return win or patches(nil)
 end
 
@@ -511,15 +508,36 @@ function M.open(opts, done)
       return finish(win or float.open_file(opts.session_id, path, opts.line, opts.reuse, title_for(nil)))
     end
 
+    if not unified_available() then
+      return finish(open_patch_text(opts.session_id, path, hunks, title_for("(session changes)"), opts.reuse))
+    end
+
+    -- From the record alone, when it holds enough: the file as the session found
+    -- it against the file as it left it, whatever has happened to it since. The
+    -- title says `reconstructed` — this is not today's file.
+    local steps = (history and history.steps) or {}
+    local states = history and reconstruction(history) or {}
+    local start, last = states[0], states[#steps]
+    if #steps > 0 and start and last then
+      if M._same_lines(start, last) then
+        local name = vim.fn.fnamemodify(path, ":t")
+        vim.notify("ClaudeCode: the session left " .. name .. " as it found it", vim.log.levels.INFO)
+        return finish(nil)
+      end
+      local title = title_for("(session changes, reconstructed)")
+      local win = open_inline_diff(opts.session_id, path, last, start, title, opts.reuse)
+      if win then
+        return finish(win)
+      end
+    end
+
+    -- No anchor in the record: undo the session's hunks on today's file instead,
+    -- which decays as the file moves on — and the title says `on disk`.
     local lines = read_lines(path)
     if not lines then
       -- Gone from disk: the patches are all that is left of it, and they are enough.
       logger.debug("agents", "file_view: no file on disk for", path, "- showing its patches")
       return finish(open_patch_text(opts.session_id, path, hunks, title_for("(deleted)"), opts.reuse))
-    end
-
-    if not unified_available() then
-      return finish(open_patch_text(opts.session_id, path, hunks, title_for("(session changes)"), opts.reuse))
     end
 
     -- A file the session created has an empty baseline: every line is an addition.
@@ -540,11 +558,11 @@ function M.open(opts, done)
       return finish(open_patch_text(opts.session_id, path, hunks, title_for("(session changes)"), opts.reuse))
     end
 
-    local note = nil
+    local note = "(on disk)"
     if skipped > 0 then
       -- Say it rather than quietly showing a partial diff: the rest of the session's
       -- work is not missing, it was overwritten after the session ran.
-      note = string.format("(%d/%d changes still present)", applied, applied + skipped)
+      note = string.format("(on disk, %d/%d changes still present)", applied, applied + skipped)
     end
 
     local win = open_inline_diff(opts.session_id, path, lines, before, title_for(note), opts.reuse)

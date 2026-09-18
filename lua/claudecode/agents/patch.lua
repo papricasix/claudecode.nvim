@@ -45,20 +45,38 @@ function M.shown(line)
   return (line:gsub("\t", "  "):gsub("\r$", ""))
 end
 
----Split text on newlines, CRs dropped the way `readfile` drops them.
+---Split text on newlines the way `readfile` hands a file back: CRs dropped, and
+---a trailing newline ending the last line rather than adding an empty one after
+---it (so `""` is no lines at all).
 ---@param text string
 ---@return string[]
-local function split_lines(text)
+function M.split_lines(text)
   local out, from = {}, 1
   while true do
     local nl = text:find("\n", from, true)
     if not nl then
-      out[#out + 1] = (text:sub(from):gsub("\r$", ""))
+      local last = text:sub(from)
+      if last ~= "" then
+        out[#out + 1] = (last:gsub("\r$", ""))
+      end
       return out
     end
     out[#out + 1] = (text:sub(from, nl - 1):gsub("\r$", ""))
     from = nl + 1
   end
+end
+local split_lines = M.split_lines
+
+---Index lines by the text the CLI would write them as, first occurrence winning.
+---@param text string
+---@return table<string, string>
+local function by_shown_text(text)
+  local index = {}
+  for _, line in ipairs(split_lines(text)) do
+    local key = M.shown(line)
+    index[key] = index[key] or line
+  end
+  return index
 end
 
 ---Whether a line of a patch is ambiguous about its own text: only a line holding
@@ -79,8 +97,10 @@ end
 ---6967 removed lines where it could be checked: every one came back exact, from
 ---`oldString` or from the re-tabbing `reverse_apply` falls back to.
 ---
----Only lines that could have held a tab are recorded, as `hunk.exact_old`, keyed
----by the line's position on the old side.
+---Only lines that could have held a tab are recorded: removed ones as
+---`hunk.exact_old`, keyed by the line's position on the old side, and added ones
+---(from `newString`, for redoing the edit) as `hunk.exact_new`, keyed by their
+---position on the new side.
 ---@param hunks table[] Hunks from one `toolUseResult.structuredPatch`.
 ---@param result table The `toolUseResult` itself.
 function M.annotate(hunks, result)
@@ -89,19 +109,23 @@ function M.annotate(hunks, result)
   end
   local has_original = type(result.originalFile) == "string"
   local has_old_string = type(result.oldString) == "string"
-  if not has_original and not has_old_string then
+  local has_new_string = type(result.newString) == "string"
+  if not has_original and not has_old_string and not has_new_string then
     return
   end
 
-  -- Split lazily: most hunks have no ambiguous removed line at all.
-  local original, by_shown
+  -- Split lazily: most hunks have no ambiguous line at all.
+  local original, by_old, by_new
   for _, hunk in ipairs(hunks) do
-    local position = 0
+    local position, new_position = 0, 0
     for _, line in ipairs(type(hunk) == "table" and type(hunk.lines) == "table" and hunk.lines or {}) do
       if type(line) == "string" then
         local mark, text = line:sub(1, 1), line:sub(2)
         if mark ~= "+" and mark ~= "\\" then
           position = position + 1
+        end
+        if mark ~= "-" and mark ~= "\\" then
+          new_position = new_position + 1
         end
         if mark == "-" and ambiguous(text) then
           local exact
@@ -113,18 +137,19 @@ function M.annotate(hunks, result)
             end
           end
           if not exact and has_old_string then
-            if not by_shown then
-              by_shown = {}
-              for _, old_line in ipairs(split_lines(result.oldString)) do
-                local key = M.shown(old_line)
-                by_shown[key] = by_shown[key] or old_line
-              end
-            end
-            exact = by_shown[M.shown(text)]
+            by_old = by_old or by_shown_text(result.oldString)
+            exact = by_old[M.shown(text)]
           end
           if exact then
             hunk.exact_old = hunk.exact_old or {}
             hunk.exact_old[position] = exact
+          end
+        elseif mark == "+" and has_new_string and ambiguous(text) then
+          by_new = by_new or by_shown_text(result.newString)
+          local exact = by_new[M.shown(text)]
+          if exact then
+            hunk.exact_new = hunk.exact_new or {}
+            hunk.exact_new[new_position] = exact
           end
         end
       end
@@ -214,20 +239,21 @@ local function tab_indented(lines, from, to)
   return false
 end
 
----The file's own text for a removed line of a hunk.
----@param hunk table
----@param position integer The line's position on the hunk's old side.
+---The file's own text for a line the patch wrote and the file no longer holds: a
+---removed line being put back, or an added line being redone.
+---@param exact table|nil `hunk.exact_old` or `hunk.exact_new`.
+---@param position integer The line's position on that side of the hunk.
 ---@param text string The line as the patch wrote it.
 ---@param tabbed boolean The located block is tab-indented.
 ---@return string
-local function removed_line(hunk, position, text, tabbed)
+local function exact_line(exact, position, text, tabbed)
   text = text:gsub("\r$", "")
   if not ambiguous(text) then
     return text
   end
-  local exact = type(hunk.exact_old) == "table" and hunk.exact_old[position] or nil
-  if exact then
-    return exact
+  local known = type(exact) == "table" and exact[position] or nil
+  if known then
+    return known
   end
   if tabbed then
     -- Two spaces of indentation per tab, the way the CLI wrote them out.
@@ -256,7 +282,14 @@ function M.reverse_apply(lines, hunks)
   for index = #hunks, 1, -1 do
     local hunk = hunks[index]
     local new_side = M.sides(hunk)
-    local at = M.locate(view, new_side, (tonumber(hunk.newStart) or 1) - 1)
+    local at
+    if #new_side == 0 then
+      -- Everything removed and nothing around it (the file emptied, say): the
+      -- patch says where, and there is nothing to find.
+      at = math.max(0, math.min(#out, tonumber(hunk.newStart) or 0))
+    else
+      at = M.locate(view, new_side, (tonumber(hunk.newStart) or 1) - 1)
+    end
     if at then
       local tabbed = tab_indented(out, at + 1, at + #new_side)
       local rebuilt, rebuilt_view = {}, {}
@@ -274,7 +307,7 @@ function M.reverse_apply(lines, hunks)
             pos = pos + 1
           elseif mark == "-" then
             position = position + 1
-            local exact = removed_line(hunk, position, text, tabbed)
+            local exact = exact_line(hunk.exact_old, position, text, tabbed)
             rebuilt[#rebuilt + 1] = exact
             rebuilt_view[#rebuilt_view + 1] = M.shown(exact)
           elseif mark ~= "\\" then
@@ -298,6 +331,130 @@ function M.reverse_apply(lines, hunks)
   end
 
   return out, applied, skipped
+end
+
+---Redo one call's hunks on the file as that call found it.
+---
+---The mirror of `reverse_apply`: the *old* side is located, nearest the line the
+---patch recorded, and replaced by the new one — context from the file, added lines
+---from the result's own text (`hunk.exact_new`) or re-tabbed. Hunks of one call
+---are in file order and their positions all refer to the file before it, so they
+---are applied bottom-up to keep the earlier positions valid.
+---@param lines string[] The file before the call.
+---@param hunks table[] That call's hunks, in file order.
+---@return string[] after
+---@return integer applied
+---@return integer skipped Hunks whose old side is not in the file.
+function M.forward_apply(lines, hunks)
+  local out, view = {}, {}
+  for index, line in ipairs(lines) do
+    out[index] = line
+    view[index] = M.shown(line)
+  end
+  local applied, skipped = 0, 0
+
+  for index = #hunks, 1, -1 do
+    local hunk = hunks[index]
+    local _, old_side = M.sides(hunk)
+    local at
+    if #old_side == 0 then
+      -- A pure insertion with nothing around it (an empty file, say): the patch
+      -- says where, and there is nothing to find.
+      at = math.max(0, math.min(#out, tonumber(hunk.oldStart) or 0))
+    else
+      at = M.locate(view, old_side, (tonumber(hunk.oldStart) or 1) - 1)
+    end
+    if at then
+      local tabbed = tab_indented(out, at + 1, at + #old_side)
+      local rebuilt, rebuilt_view = {}, {}
+      for i = 1, at do
+        rebuilt[#rebuilt + 1] = out[i]
+        rebuilt_view[#rebuilt_view + 1] = view[i]
+      end
+      local pos, position = at + 1, 0
+      for _, line in ipairs(hunk.lines) do
+        if type(line) == "string" then
+          local mark, text = line:sub(1, 1), line:sub(2)
+          if mark == "-" then
+            pos = pos + 1
+          elseif mark == "+" then
+            position = position + 1
+            local exact = exact_line(hunk.exact_new, position, text, tabbed)
+            rebuilt[#rebuilt + 1] = exact
+            rebuilt_view[#rebuilt_view + 1] = M.shown(exact)
+          elseif mark ~= "\\" then
+            position = position + 1
+            rebuilt[#rebuilt + 1] = out[pos]
+            rebuilt_view[#rebuilt_view + 1] = view[pos]
+            pos = pos + 1
+          end
+        end
+      end
+      for i = pos, #out do
+        rebuilt[#rebuilt + 1] = out[i]
+        rebuilt_view[#rebuilt_view + 1] = view[i]
+      end
+      out, view = rebuilt, rebuilt_view
+      applied = applied + 1
+    else
+      skipped = skipped + 1
+    end
+  end
+
+  return out, applied, skipped
+end
+
+---Every state a file passed through in one session, from the record alone.
+---
+---The transcript holds the file itself at certain moments: an `Edit`'s
+---`originalFile` (kept up to ~10KB) is the file before it; a `Write`'s `content`
+---is the file after it; a whole-file `Read` is the file at that moment (measured
+---equal to the next edit's `originalFile`, 65 of 65). Each hunk was cut from the
+---file exactly as it stood before its call, so from any such anchor the other
+---states follow: forward with `forward_apply`, backward with `reverse_apply`
+---(measured across 60 transcripts: redoing a step reproduced the next step's own
+---`originalFile` in 931 of 955 cases; the rest were edits made outside the session
+---between the two, which a later anchor corrects).
+---
+---A step that cannot be applied whole leaves the states past it unknown until the
+---next anchor. Nothing here reads the file on disk, so the answer does not decay
+---as the file moves on afterwards.
+---@param steps ClaudeCodeAgentsFileStep[] Oldest first; `before` and `content` are the anchors.
+---@param read_after { step: integer, content: string }|nil A whole read landing after step `step`.
+---@return table<integer, string[]> states `states[0]` before the first step, `states[i]` after step `i`; missing where unknown.
+function M.reconstruct(steps, read_after)
+  local states = {}
+  for i, step in ipairs(steps) do
+    if type(step.before) == "string" and not states[i - 1] then
+      states[i - 1] = split_lines(step.before)
+    elseif step.created and not states[i - 1] then
+      states[i - 1] = {}
+    end
+    if type(step.content) == "string" then
+      states[i] = split_lines(step.content)
+    end
+  end
+  if read_after and type(read_after.content) == "string" and not states[read_after.step] then
+    states[read_after.step] = split_lines(read_after.content)
+  end
+
+  for i = 1, #steps do
+    if states[i - 1] and not states[i] then
+      local out, _, skipped = M.forward_apply(states[i - 1], steps[i].hunks or {})
+      if skipped == 0 then
+        states[i] = out
+      end
+    end
+  end
+  for i = #steps, 1, -1 do
+    if states[i] and not states[i - 1] then
+      local out, _, skipped = M.reverse_apply(states[i], steps[i].hunks or {})
+      if skipped == 0 then
+        states[i - 1] = out
+      end
+    end
+  end
+  return states
 end
 
 ---Render hunks as unified-diff text, for when there is nothing to diff against —

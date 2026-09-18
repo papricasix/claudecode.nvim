@@ -193,6 +193,146 @@ describe("agents.patch", function()
       patch.annotate({ h }, { originalFile = "\tsomething else\n" })
       expect(h.exact_old).to_be_nil()
     end)
+
+    it("takes an added line from newString, for redoing the edit", function()
+      local h = hunk(1, { "-old", "+  new()" })
+      patch.annotate({ h }, { oldString = "old", newString = "\tnew()" })
+      expect(h.exact_new[1]).to_be("\tnew()")
+      expect(h.exact_old).to_be_nil()
+    end)
+  end)
+
+  describe("split_lines", function()
+    it("reads text the way readfile reads a file", function()
+      assert.same({ "a", "b" }, patch.split_lines("a\nb\n"))
+      assert.same({ "a", "b" }, patch.split_lines("a\r\nb"))
+      assert.same({ "a", "" }, patch.split_lines("a\n\n"))
+      assert.same({}, patch.split_lines(""))
+    end)
+  end)
+
+  describe("forward_apply", function()
+    it("redoes an edit, yielding what the call left behind", function()
+      local after, applied, skipped = patch.forward_apply(
+        { "one", "two", "three" },
+        { hunk(2, { " one", "-two", "+TWO", " three" }) }
+      )
+      assert.same({ "one", "TWO", "three" }, after)
+      expect(applied).to_be(1)
+      expect(skipped).to_be(0)
+    end)
+
+    it("applies one call's hunks bottom-up, so earlier positions still hold", function()
+      -- Both hunks are numbered against the file before the call.
+      local after = patch.forward_apply({ "a", "b", "c" }, {
+        hunk(1, { "-a", "+A", "+A2" }, 1),
+        hunk(4, { "-c", "+C" }, 3),
+      })
+      assert.same({ "A", "A2", "b", "C" }, after)
+    end)
+
+    it("locates a hunk that moved, since the file grew above it", function()
+      local after = patch.forward_apply({ "new", "one", "two" }, { hunk(1, { "-two", "+TWO" }, 2) })
+      assert.same({ "new", "one", "TWO" }, after)
+    end)
+
+    it("inserts into an empty file where the patch says", function()
+      local after, applied = patch.forward_apply({}, {
+        { oldStart = 0, oldLines = 0, newStart = 1, newLines = 2, lines = { "+a", "+b" } },
+      })
+      assert.same({ "a", "b" }, after)
+      expect(applied).to_be(1)
+    end)
+
+    it("skips a hunk whose old side is not in the file, and says so", function()
+      local after, applied, skipped = patch.forward_apply({ "x" }, { hunk(1, { "-gone", "+new" }) })
+      assert.same({ "x" }, after)
+      expect(applied).to_be(0)
+      expect(skipped).to_be(1)
+    end)
+
+    it("puts an added line back with its tab, from newString", function()
+      local h = hunk(1, { " func a():", "-  old()", "+  new()" })
+      patch.annotate({ h }, { oldString = "\told()", newString = "\tnew()" })
+      local after = patch.forward_apply({ "func a():", "\told()" }, { h })
+      assert.same({ "func a():", "\tnew()" }, after)
+    end)
+
+    it("re-tabs an added line by its block when the result's text is missing", function()
+      local h = hunk(1, { " func a():", "-  old()", "+  new()" })
+      local after = patch.forward_apply({ "func a():", "\told()" }, { h })
+      assert.same({ "func a():", "\tnew()" }, after)
+    end)
+  end)
+
+  describe("reconstruct", function()
+    local function step(hunks, extra)
+      local s = { hunks = hunks, created = false }
+      for k, v in pairs(extra or {}) do
+        s[k] = v
+      end
+      return s
+    end
+
+    it("walks forward from an originalFile", function()
+      local states = patch.reconstruct({
+        step({ hunk(2, { "-two", "+TWO" }) }, { before = "one\ntwo\nthree\n" }),
+        step({ hunk(3, { "-three", "+THREE" }) }),
+      })
+      assert.same({ "one", "two", "three" }, states[0])
+      assert.same({ "one", "TWO", "three" }, states[1])
+      assert.same({ "one", "TWO", "THREE" }, states[2])
+    end)
+
+    it("walks back from a write's content", function()
+      local states = patch.reconstruct({
+        step({ hunk(2, { "-two", "+TWO" }) }),
+        step({ hunk(3, { "-three", "+THREE" }) }, { content = "one\nTWO\nTHREE\n" }),
+      })
+      assert.same({ "one", "two", "three" }, states[0])
+      assert.same({ "one", "TWO", "three" }, states[1])
+      assert.same({ "one", "TWO", "THREE" }, states[2])
+    end)
+
+    it("anchors the end on a whole read after the last step", function()
+      local states = patch.reconstruct({ step({ hunk(1, { "-a", "+A" }) }) }, { step = 1, content = "A\nb\n" })
+      assert.same({ "A", "b" }, states[1])
+      assert.same({ "a", "b" }, states[0])
+    end)
+
+    it("starts a created file from nothing", function()
+      local states = patch.reconstruct({ step({}, { content = "a\n", created = true }) })
+      assert.same({}, states[0])
+      assert.same({ "a" }, states[1])
+    end)
+
+    it("knows nothing without an anchor", function()
+      local states = patch.reconstruct({ step({ hunk(1, { "-a", "+A" }) }) })
+      expect(states[0]).to_be_nil()
+      expect(states[1]).to_be_nil()
+    end)
+
+    it("leaves states unknown past a step that no longer applies, until the next anchor", function()
+      -- Something outside the session changed the file between steps 1 and 2:
+      -- step 2's old side is nowhere in the state step 1 produced.
+      local states = patch.reconstruct({
+        step({ hunk(2, { "-two", "+TWO" }) }, { before = "one\ntwo\n" }),
+        step({ hunk(1, { "-gone", "+GONE" }) }),
+        step({ hunk(2, { "-x", "+X" }) }),
+      })
+      assert.same({ "one", "TWO" }, states[1])
+      expect(states[2]).to_be_nil()
+      expect(states[3]).to_be_nil()
+
+      states = patch.reconstruct({
+        step({ hunk(2, { "-two", "+TWO" }) }, { before = "one\ntwo\n" }),
+        step({ hunk(1, { "-gone", "+GONE" }) }),
+        step({ hunk(2, { "-x", "+X" }) }, { content = "GONE\nX\n" }),
+      })
+      assert.same({ "one", "TWO" }, states[1])
+      assert.same({ "GONE", "x" }, states[2])
+      assert.same({ "GONE", "X" }, states[3])
+    end)
   end)
 
   describe("to_diff_lines", function()

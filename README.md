@@ -377,16 +377,17 @@ letter beside each file is git's, and is the on-disk truth.
 A row in the Changes or Activity pane is a record of work, so opening it shows
 that work rather than the file:
 
-- **A file in the Changes pane** opens as the file as it is now, with the session's
-  changes rendered inline — the same view you get while an edit is happening,
-  only for everything that session did to the file.
+- **A file in the Changes pane** opens as the file as the session left it, with
+  everything the session did to it rendered inline against the file as the
+  session found it — the same view you get while an edit is happening, only for
+  the whole session. The title says `(session changes, reconstructed)`: this is
+  the file **as it stood then**, rebuilt from the transcript, not the file on
+  disk now. What happened to the file since — later sessions, your own editing,
+  a formatter — does not change this view. `.` is the view of today's file.
 - **An edit in the Activity pane** opens that one edit: the file as that call
   left it, with only that call's change rendered inline, and the title saying
-  which it is (`foo.lua  (edit 3 of 7)`). A file edited five times has five rows
-  that show five different steps, not the final state five times. The file at
-  that moment is rebuilt by undoing the later edits; when something outside the
-  session has since touched those lines, that is not possible and the call's own
-  patch is shown instead (`(edit 3 of 7, file moved on)`).
+  which it is (`foo.lua  (edit 3 of 7, reconstructed)`). A file edited five times
+  has five rows that show five different steps, not the final state five times.
 - **A read in the Activity pane** opens the file with the lines that read covered
   highlighted.
 - **A file the agent created** reads as one long addition, since there was
@@ -395,11 +396,16 @@ that work rather than the file:
   its colours intact; a search opens its matches, a subagent its reply, and
   anything else its result as formatted JSON.
 
-The diff is reconstructed by undoing the session's own edits, so a file that
-moved on afterwards — later sessions, your own editing — can have changes that
-are no longer there. Those are left out and the title says so
-(`foo.lua  (3/5 changes still present)`). When none of them survive, or the file
-was deleted, or you do not have unified.nvim, the patches themselves are shown
+The reconstruction needs one point in the session where the transcript holds the
+whole file: the CLI keeps the pre-edit file on every edit of a file up to about
+10KB, records the whole content on every write, and a read of the whole file is
+that file too. From there the edits are replayed. A larger file the session
+only ever read in windows has no such point; then the view falls back to today's
+file with the session's edits undone, and the title says `(on disk)` instead.
+That fallback decays as the file moves on: edits that are no longer there are
+left out and the title says so (`foo.lua  (on disk, 3/5 changes still present)`).
+When none of them survive, or the file was deleted, or you do not have
+unified.nvim, the patches themselves are shown
 as a diff instead; that is Claude's own record and cannot be stale.
 
 Live state comes from Claude Code's lifecycle hooks when you already have
