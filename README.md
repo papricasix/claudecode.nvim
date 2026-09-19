@@ -265,7 +265,7 @@ there too.
   anything a search pointed you at stay listed however old they are. When the
   window catches nothing the centre says so and counts what is older, rather than
   claiming the project is empty.
-- `gs` in any of the three list panes chooses the order — recent activity, name,
+- `gs` in the sessions pane chooses the order — recent activity, name,
   changes, or status — **and how far back the list reaches**: last day, 3 days,
   week, 2 weeks, month, or everything. Picking the order already in force
   reverses it, and the menu is where both are stated — it names the direction in
@@ -530,7 +530,7 @@ opts = {
     keymaps = {
       select = "<CR>", new = "a", stop = "x", delete = "dd", refresh = "r",
       search = "gf",              -- search the conversations (sessions pane)
-      sort = "gs",                -- choose what the list is ordered by
+      sort = "gs",                -- sessions pane: choose what the list is ordered by
       close = "q", open = "<CR>", git_diff = ".", goto_file = "gf", help = "?",
       filter = "f",               -- Activity: everything / files / commands
       subagent_label = "g.",      -- Tasks: description / agent type or command

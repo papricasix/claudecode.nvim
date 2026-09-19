@@ -1701,12 +1701,12 @@ describe("agents_view", function()
       expect(keys_for("sessions")["f"]).to_be(nil)
     end)
 
-    it("offers the sort menu from every pane that shows the list", function()
-      -- Re-ordering the list should not first mean navigating back to it.
+    it("offers the sort menu from the sessions pane alone", function()
       setup_with({ enabled = true })
       expect(keys_for("sessions")["gs"]).to_be_string()
-      expect(keys_for("feed")["gs"]).to_be_string()
-      expect(keys_for("changes")["gs"]).to_be_string()
+      for _, pane in ipairs({ "feed", "changes", "subagents" }) do
+        expect(keys_for(pane)["gs"]).to_be(nil)
+      end
       expect(keys_for("center")["gs"]).to_be(nil) -- `gs` belongs to Claude there
     end)
 

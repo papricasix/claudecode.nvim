@@ -693,9 +693,10 @@ local KEY_SPECS = {
   },
   {
     field = "sort",
-    -- Every pane you can read the list from, so re-ordering it does not first
-    -- mean navigating back to it. Not the terminal: `gs` belongs to Claude there.
-    panes = { "sessions", "feed", "changes", "subagents" },
+    -- The sessions pane alone: it is the list being ordered, and the other panes
+    -- keep `gs` free for their own use. The centre's empty-window notice binds it
+    -- too (`apply_notice_keys`), since that screen is where it is named.
+    panes = { "sessions" },
     group = "Sessions",
     desc = "Choose how the session list is ordered",
     run = function()
@@ -1016,7 +1017,7 @@ local function apply_notice_keys(buf, kind)
     end, "Claude agents: start a new agent")
   end
 
-  -- The window screen names `gs`, which is otherwise a list-pane key: a centre
+  -- The window screen names `gs`, which is otherwise a sessions-pane key: a centre
   -- that says "nothing from the last two weeks" has to be answerable where it is
   -- read, or the user is told about a key that does nothing under their cursor.
   local sort_lhs = keymap_for("sort", "gs")

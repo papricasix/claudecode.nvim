@@ -181,7 +181,7 @@ M.defaults = {
       -- Search the conversations for what was said in them. Sessions pane only:
       -- `gf` opens a file in the other two panes, and no pane offers both.
       search = "gf",
-      sort = "gs", -- choose what the list is ordered by (it does not re-sort itself)
+      sort = "gs", -- sessions pane: choose what the list is ordered by (it does not re-sort itself)
       close = "q",
       open = "<CR>", -- open the file under the cursor (Activity / Changes panes)
       git_diff = ".", -- diff that file against git HEAD (svn BASE) instead of against the session
