@@ -439,13 +439,23 @@ function M.shell_state(shell, facts, opts)
   return { state = "stopped", runtime_s = since(math.max(written or 0, started)), ended = false }
 end
 
+---An environment variable, or nil when it is unset or empty (JavaScript's `||`
+---skips both, and the CLI's lookups are written with it).
+---@param name string
+---@return string|nil
+local function env(name)
+  local value = os.getenv(name)
+  return value ~= "" and value or nil
+end
+
 ---The `tasks/` directory a session's background output is written to.
 ---
 ---Taken from any path the session's records already state (a shell's result, a
 ---notification's `<output-file>`), since a monitor's result states none. Failing
----that, the CLI's rule, read out of the binary (2.1.270):
----`<realpath($CLAUDE_CODE_TMPDIR or /tmp)>/claude-<uid>/<slug of cwd>/<session>/tasks`.
----Not applied on Windows, where the rule was not verified.
+---that, the CLI's rule, read out of the binary (2.1.270; win32-x64 2.1.280):
+---`<realpath($CLAUDE_CODE_TMPDIR or /tmp)>/claude-<uid>/<slug of cwd>/<session>/tasks`,
+---and on Windows `<realpath($CLAUDE_CODE_TMPDIR or os.tmpdir())>\claude\…` — no
+---uid there.
 ---@param transcript_path string
 ---@param sums table[] The session's summary and its subagents'.
 ---@return string|nil
@@ -466,20 +476,30 @@ function M.tasks_dir(transcript_path, sums)
   end
   local session = sums[1]
   local uv = vim.loop
-  if not session or not session.cwd or not uv or vim.fn.has("win32") == 1 then
+  if not session or not session.cwd or not uv then
     return nil
   end
   local id = transcript_path:match("([^/\\]+)%.jsonl$")
   if not id then
     return nil
   end
-  local root = os.getenv("CLAUDE_CODE_TMPDIR")
-  if not root or root == "" then
-    root = "/tmp"
-  end
+  local win = vim.fn.has("win32") == 1
+  local root = env("CLAUDE_CODE_TMPDIR") or (win and M._win_tmpdir() or "/tmp")
   root = (uv.fs_realpath and uv.fs_realpath(root)) or root
-  local uid = uv.getuid and uv.getuid() or 0
-  return ("%s/claude-%d/%s/%s/tasks"):format(root, uid, transcript.slugify(session.cwd), id)
+  local claude = win and "claude" or ("claude-%d"):format(uv.getuid and uv.getuid() or 0)
+  return ("%s/%s/%s/%s/tasks"):format(root, claude, transcript.slugify(session.cwd), id)
+end
+
+---Bun's `os.tmpdir()` on Windows, which the CLI's temp root falls back to:
+---`TEMP`, then `TMP`, then `<SystemRoot or windir>\temp`, with a trailing
+---backslash dropped unless it is a drive's root.
+---@return string
+function M._win_tmpdir()
+  local path = env("TEMP") or env("TMP") or ((env("SystemRoot") or env("windir") or "") .. "\\temp")
+  if #path > 1 and path:sub(-1) == "\\" and path:sub(-2) ~= ":\\" then
+    path = path:sub(1, -2)
+  end
+  return path
 end
 
 --------------------------------------------------------------------------------

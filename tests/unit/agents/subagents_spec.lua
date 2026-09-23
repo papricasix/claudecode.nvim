@@ -127,6 +127,55 @@ describe("agents.subagents", function()
       expect(subagents.dir("/a/b/123.jsonl")).to_be("/a/b/123/subagents")
       expect(subagents.dir("/a/b/notes.txt")).to_be(nil)
     end)
+
+    describe("the tasks directory, when no record names it", function()
+      local vars, win, getenv, has
+      local ID = "0b3c2f4e-1a2b-4c3d-8e9f-0123456789ab"
+
+      before_each(function()
+        vars, win = {}, false
+        getenv, has = os.getenv, vim.fn.has
+        os.getenv = function(name) -- luacheck: ignore 122
+          return vars[name]
+        end
+        vim.fn.has = function(feature)
+          if feature == "win32" then
+            return win and 1 or 0
+          end
+          return has(feature)
+        end
+      end)
+
+      after_each(function()
+        os.getenv, vim.fn.has = getenv, has -- luacheck: ignore 122
+      end)
+
+      it("is the CLI's Unix rule: claude-<uid> under /tmp or the variable", function()
+        local sums = { { cwd = "/Users/me/proj" } }
+        local dir = subagents.tasks_dir("/store/-Users-me-proj/" .. ID .. ".jsonl", sums)
+        expect(dir).to_be("/tmp/claude-0/-Users-me-proj/" .. ID .. "/tasks")
+        vars.CLAUDE_CODE_TMPDIR = "/scratch"
+        dir = subagents.tasks_dir("/store/-Users-me-proj/" .. ID .. ".jsonl", sums)
+        expect(dir).to_be("/scratch/claude-0/-Users-me-proj/" .. ID .. "/tasks")
+      end)
+
+      it("is a bare claude under %TEMP% on Windows, where there is no uid", function()
+        win = true
+        vars.TEMP = "C:\\Users\\me\\AppData\\Local\\Temp\\"
+        local sums = { { cwd = "D:\\Git\\proj" } }
+        local dir = subagents.tasks_dir("C:\\Users\\me\\.claude\\projects\\D--Git-proj\\" .. ID .. ".jsonl", sums)
+        expect(dir).to_be("C:\\Users\\me\\AppData\\Local\\Temp/claude/D--Git-proj/" .. ID .. "/tasks")
+      end)
+
+      it("follows Bun's os.tmpdir() order on Windows, skipping empty variables", function()
+        vars = { TEMP = "", TMP = "E:\\t" }
+        expect(subagents._win_tmpdir()).to_be("E:\\t")
+        vars = { SystemRoot = "C:\\Windows" }
+        expect(subagents._win_tmpdir()).to_be("C:\\Windows\\temp")
+        vars = { TEMP = "C:\\" }
+        expect(subagents._win_tmpdir()).to_be("C:\\")
+      end)
+    end)
   end)
 
   describe("the tree", function()

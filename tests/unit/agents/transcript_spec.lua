@@ -440,13 +440,15 @@ describe("agents.transcript", function()
 
     it("knows the scratchpad by its shape, whatever the temp root", function()
       -- macOS resolves `/tmp` through its symlink; Linux does not; the variable
-      -- moves it anywhere; and Windows has neither a `/tmp` nor a numeric uid.
+      -- moves it anywhere; and Windows has neither a `/tmp` nor a uid, so its
+      -- directory is a bare `claude` under `%TEMP%` (win32-x64 build, 2.1.280).
       for _, path in ipairs({
         "/private/tmp/claude-501/-Users-me-proj/" .. ID .. "/scratchpad/probe.lua",
         "/tmp/claude-1000/-home-me-proj/" .. ID .. "/scratchpad/notes/run.txt",
         "/var/folders/ct/claude-501/-Users-me-proj/" .. ID .. "/scratchpad/a.md",
-        "C:\\Users\\me\\AppData\\Local\\Temp\\claude-0\\D--Git-proj\\" .. ID .. "\\scratchpad\\a.py",
-        "C:/Users/me/AppData/Local/Temp/claude-/D--Git-proj/" .. ID .. "/scratchpad/a.py",
+        "C:\\Users\\me\\AppData\\Local\\Temp\\claude\\D--Git-proj\\" .. ID .. "\\scratchpad\\a.py",
+        "C:/Users/me/AppData/Local/Temp/claude/D--Git-proj/" .. ID .. "/scratchpad/a.py",
+        "D:\\tmp\\claude\\D--Git-proj\\" .. ID .. "\\scratchpad\\notes\\run.txt",
       }) do
         expect(transcript.is_scratchpad(path)).to_be_true()
       end

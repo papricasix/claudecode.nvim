@@ -477,18 +477,20 @@ local UUID = table.concat({
   string.rep("%x", 12),
 }, "%-")
 
---- `claude-<uid>/<slug>/<session>/scratchpad/<something>`, whole segments, either
---- separator. See `M.is_scratchpad`.
-local SCRATCHPAD_PATTERN = "[/\\]claude%-%d*[/\\][^/\\]+[/\\]" .. UUID .. "[/\\]scratchpad[/\\][^/\\]"
+--- `claude[-<uid>]/<slug>/<session>/scratchpad/<something>`, whole segments,
+--- either separator. See `M.is_scratchpad`.
+local SCRATCHPAD_PATTERN = "[/\\]claude%-?%d*[/\\][^/\\]+[/\\]" .. UUID .. "[/\\]scratchpad[/\\][^/\\]"
 
 ---Whether a path lies inside a CLI session's scratchpad directory.
 ---
----The CLI builds it as `<temp root>/claude-<uid>/<slug of cwd>/<session>/scratchpad`
----(2.1.274), but only the part from `claude-` on is the same everywhere: the root
----is `/tmp` resolved through symlinks on macOS (`/private/tmp`), `/tmp` on Linux,
----`$CLAUDE_CODE_TMPDIR` when set, and on Windows is not `/tmp` at all (the
----platform branch is compiled out of each build, so it cannot be read from this
----one) — nor is the uid a number there. So the shape is matched rather than the
+---The CLI builds it as `<temp root>/<claude dir>/<slug of cwd>/<session>/scratchpad`,
+---and only the part from the claude directory on is the same everywhere. On
+---Unix that directory is `claude-<uid>` under `/tmp` resolved through symlinks
+---(`/private/tmp` on macOS). On Windows it is a bare `claude` — there is no uid —
+---under `os.tmpdir()` (`%TEMP%`, e.g. `C:\Users\me\AppData\Local\Temp\claude\
+---D--Git-proj\<session>\scratchpad`; read out of the win32-x64 build, 2.1.280).
+---`$CLAUDE_CODE_TMPDIR` replaces the root on both. The platform branch is
+---compiled out of each build, which is why the shape is matched rather than the
 ---directory derived.
 ---
 ---Not tied to the transcript's own id: a resumed or forked conversation writes
