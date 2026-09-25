@@ -375,8 +375,8 @@ there too.
   follows, and the baseline stays whichever you opened with (the session's
   changes for `<CR>`, git HEAD or svn BASE for `.`). Holding the key scrolls through the list
   and opens the row you settle on.
-- `q` closes the view; the agents keep running unless you set
-  `kill_on_close = true`.
+- `q` closes the view, after asking (`y`/`<CR>` to close, `n`/`q`/`<Esc>` to stay); the agents keep running unless you set
+  `kill_on_close = true`, and the question says which. `:ClaudeCodeAgents` closes it without asking.
 
 Floating windows — diffs, files, command output — use **your own display
 settings**: `wrap`, `number`, `list`, `signcolumn` and the rest come from your

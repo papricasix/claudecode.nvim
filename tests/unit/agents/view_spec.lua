@@ -252,6 +252,74 @@ describe("agents_view", function()
     end)
   end)
 
+  describe("the close key", function()
+    local asked
+
+    before_each(function()
+      asked = {}
+      package.loaded["claudecode.agents.confirm"] = {
+        ask = function(opts, cb)
+          asked[#asked + 1] = opts
+          cb(asked.answer ~= false)
+        end,
+      }
+    end)
+
+    after_each(function()
+      package.loaded["claudecode.agents.confirm"] = nil
+      if agents_view.is_open() then
+        agents_view.close()
+      end
+    end)
+
+    it("asks before closing", function()
+      agents_view.setup(base_config({ enabled = true, keymaps = { close = "q" } }))
+      expect(agents_view.open()).to_be_true()
+      local sessions_buf = agents_view._state().bufs.sessions
+      local mapping = vim._buf_keymaps[sessions_buf].n.q
+      expect(mapping).to_be_table()
+
+      asked.answer = false
+      mapping.rhs()
+      expect(#asked).to_be(1)
+      expect(asked[1].confirm).to_be("close")
+      expect(agents_view.is_open()).to_be_true()
+
+      asked.answer = true
+      mapping.rhs()
+      expect(#asked).to_be(2)
+      expect(agents_view.is_open()).to_be(false)
+    end)
+
+    it("asks nothing while the view is closed", function()
+      agents_view.setup(base_config({ enabled = true }))
+      agents_view.ask_close()
+      expect(#asked).to_be(0)
+    end)
+
+    it("says running agents are stopped when the view kills them", function()
+      -- The view's own copy: it requires the registry once, at load.
+      local registry = require("claudecode.agents.registry")
+      local real_live_ids, real_get = registry.live_ids, registry.get
+      agents_view.setup(base_config({ enabled = true, kill_on_close = true }))
+      expect(agents_view.open()).to_be_true()
+      local tab = agents_view._state().tab
+      registry.live_ids = function()
+        return { "aaa", "bbb" }
+      end
+      registry.get = function()
+        return { tab = tab }
+      end
+
+      asked.answer = false
+      local ok, err = pcall(agents_view.ask_close)
+      registry.live_ids, registry.get = real_live_ids, real_get
+      expect(ok).to_be_true()
+      expect(err).to_be(nil)
+      expect(asked[1].message).to_be("Stops the 2 running agents.")
+    end)
+  end)
+
   describe("naming the tab", function()
     ---@return any
     local function tab_var(tab, name)

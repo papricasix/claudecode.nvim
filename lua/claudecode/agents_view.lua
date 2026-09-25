@@ -842,9 +842,9 @@ local KEY_SPECS = {
   {
     field = "close",
     group = "Anywhere in the view",
-    desc = "Close the view (agents keep running)",
+    desc = "Close the view, after asking (agents keep running)",
     run = function()
-      M.close()
+      M.ask_close()
     end,
   },
 }
@@ -1455,6 +1455,43 @@ function M.close(close_opts)
     pcall(vim.api.nvim_set_current_tabpage, origin)
   end
   logger.debug("agents", "agents view closed")
+end
+
+---Close the view once the user has said yes — what the `close` key does.
+---
+---`q` dismisses nearly every other window in Neovim, so it gets pressed in a pane
+---out of habit, and closing throws away the layout, the selection, the sort, a
+---search and every float on screen. The question names what becomes of the
+---agents, since `kill_on_close` is what makes the answer differ.
+function M.ask_close()
+  if not state.tab then
+    return
+  end
+  local running = 0
+  for _, session_id in ipairs(registry.live_ids()) do
+    local term = registry.get(session_id)
+    if term and term.tab == state.tab then
+      running = running + 1
+    end
+  end
+  local message
+  if running == 0 then
+    message = "No agent is running."
+  elseif opts().kill_on_close then
+    message = running == 1 and "Stops the running agent." or ("Stops the %d running agents."):format(running)
+  else
+    message = running == 1 and "The running agent keeps working."
+      or ("The %d running agents keep working."):format(running)
+  end
+  require("claudecode.agents.confirm").ask({
+    title = "Close agents view",
+    confirm = "close",
+    message = message,
+  }, function(ok)
+    if ok then
+      M.close()
+    end
+  end)
 end
 
 ---@param arg string|nil "on" | "off" | nil to toggle
