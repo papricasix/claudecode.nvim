@@ -90,6 +90,477 @@ end
 --- tool view, which builds its buffers exactly the same way.
 local scratch = float.scratch
 
+---Open a file in a new tabpage, on `line` and `col` when given.
+---
+---A row records work, and that work may have been a delete — or the file may
+---have moved since. `tabnew` on a path that is not there opens an empty buffer
+---whose first `:w` resurrects the file, so a path that is not readable is refused.
+---@param path string
+---@param line integer|nil
+---@param col integer|nil 0-based byte column.
+---@return boolean opened
+function M.open_in_tab(path, line, col)
+  if type(path) ~= "string" or path == "" or vim.fn.filereadable(path) ~= 1 then
+    return false
+  end
+  local ok = pcall(vim.cmd, "tabnew " .. vim.fn.fnameescape(path))
+  if not ok then
+    return false
+  end
+  if line then
+    local ok_count, count = pcall(vim.api.nvim_buf_line_count, 0)
+    if ok_count and type(count) == "number" and count > 0 then
+      line = math.max(1, math.min(line, count))
+    end
+    pcall(vim.api.nvim_win_set_cursor, 0, { line, col or 0 })
+  end
+  return true
+end
+
+--------------------------------------------------------------------------------
+-- A key that edits opens the file
+--
+-- Every float here is a reading frame: a scratch buffer holding a version of the
+-- file, or a patch of it, that cannot be modified and that `q` throws away. Yet
+-- reading a diff is exactly when a line that wants changing turns up, and the hand
+-- is on `o` or `ciw` before the head remembers where it is — which answered E21.
+-- So a key that would change the text opens the file itself in a new tab, the way
+-- `gf` does from a pane, closes the float, puts the cursor where it was and runs
+-- the key there: `dd` deletes that line of the file, `o` opens one below it.
+--------------------------------------------------------------------------------
+
+--- Keys that change text, by mode.
+---
+--- An operator is bound alone, with `nowait`, and whatever follows it (the second
+--- `d`, the `iw`, a surround plugin's `s"`) stays in typeahead for the replayed key
+--- to pick up in the file. Binding `dd` as well would make `d` wait on the
+--- timeout, and bound alone without the replay, that second `d` would land in the
+--- new tab as an operator waiting for a motion.
+---
+--- Not undo, redo or `.`: a float has nothing to undo, and repeating the last
+--- change in a file that was just opened would repeat whatever was last done
+--- somewhere else. Not `gr` either, which Neovim prefixes its LSP keys with.
+M.EDIT_KEYS = {
+  n = {
+    "i",
+    "a",
+    "I",
+    "A",
+    "o",
+    "O",
+    "gi",
+    "gI",
+    "<Insert>",
+    "c",
+    "C",
+    "s",
+    "S",
+    "r",
+    "R",
+    "gR",
+    "d",
+    "D",
+    "x",
+    "X",
+    "<Del>",
+    "p",
+    "P",
+    "gp",
+    "gP",
+    "]p",
+    "[p",
+    "J",
+    "gJ",
+    "~",
+    "g~",
+    "gu",
+    "gU",
+    "g?",
+    "<lt>",
+    ">",
+    "=",
+    "!",
+    "gq",
+    "gw",
+    "gc",
+    "[<Space>",
+    "]<Space>",
+    "<C-a>",
+    "<C-x>",
+  },
+  x = {
+    "c",
+    "C",
+    "s",
+    "S",
+    "r",
+    "R",
+    "d",
+    "D",
+    "x",
+    "X",
+    "<Del>",
+    "p",
+    "P",
+    "J",
+    "gJ",
+    "~",
+    "u",
+    "U",
+    "g?",
+    "<lt>",
+    ">",
+    "=",
+    "!",
+    "gq",
+    "gw",
+    "gc",
+    "I",
+    "A",
+    "<C-a>",
+    "<C-x>",
+    "g<C-a>",
+    "g<C-x>",
+  },
+}
+
+--- Keys taken even when something is mapped to them, because every mapping anyone
+--- gives them is an edit: Neovim's own `gc` and blank-line keys, and every comment
+--- plugin's `gc`.
+local ALWAYS_TAKEN = { gc = true, ["[<Space>"] = true, ["]<Space>"] = true }
+
+---Whether a key already does something of the user's here.
+---
+---A mapping is left alone: flash, leap and sneak put a jump on `s`, and a reading
+---float is where a jump is wanted most. The cost is a mapping that is itself an
+---edit (a yank-ring `p`, a black-hole `x`) answering E21 as before.
+---@param buf integer
+---@param mode string
+---@param lhs string
+---@return boolean
+local function claimed(buf, mode, lhs)
+  if ALWAYS_TAKEN[lhs] then
+    return false
+  end
+  for _, name in ipairs({ "mapleader", "maplocalleader" }) do
+    if vim.g[name] == lhs then
+      return true
+    end
+  end
+  -- In the float's own buffer: `maparg` also answers with the current buffer's
+  -- mappings, and that can be a pane's (the sessions pane's `x` stops an agent).
+  local ok, map = pcall(vim.api.nvim_buf_call, buf, function()
+    return vim.fn.maparg(lhs, mode, false, true)
+  end)
+  return ok and type(map) == "table" and next(map) ~= nil
+end
+
+---@param total integer
+---@param line integer
+---@return integer
+local function clamp(line, total)
+  return math.max(1, math.min(line, math.max(total, 1)))
+end
+
+---Where a line of one version of a file is in another.
+---
+---A line in a stretch both versions share moves by whatever was added or removed
+---above it. A line inside a change lands on its counterpart in the other version,
+---or where the change left off when there is none.
+---@param hunks integer[][] `vim.diff` indices from one version to the other.
+---@param row integer 1-based line in the first version.
+---@param total integer Lines in the second.
+---@return integer
+function M._map_line(hunks, row, total)
+  local offset = 0
+  for _, hunk in ipairs(hunks) do
+    local from, from_count, to, to_count = hunk[1], hunk[2], hunk[3], hunk[4]
+    if from_count == 0 then
+      -- Lines added after `from`.
+      if row <= from then
+        break
+      end
+      offset = offset + to_count
+    else
+      if row < from then
+        break
+      end
+      if row < from + from_count then
+        if to_count == 0 then
+          return clamp(to + 1, total)
+        end
+        return clamp(to + math.min(row - from, to_count - 1), total)
+      end
+      offset = offset + to_count - from_count
+    end
+  end
+  return clamp(row + offset, total)
+end
+
+---The line of the new file a line of a patch stands for, and its text when the
+---new file has it (a context or added line; nil for a removed line or a header).
+---@param lines string[] Diff text.
+---@param row integer
+---@return integer line
+---@return string|nil text
+function M._patch_line(lines, row)
+  local header = nil
+  for i = math.min(row, #lines), 1, -1 do
+    if lines[i]:find("^@@ %-") then
+      header = i
+      break
+    end
+  end
+  if not header then
+    -- The file headers above the first hunk: that hunk's start.
+    for i = row + 1, #lines do
+      if lines[i]:find("^@@ %-") then
+        header = i
+        break
+      end
+    end
+    if not header then
+      return 1, nil
+    end
+    row = header
+  end
+
+  local start, count = lines[header]:match("^@@ %-%d+,?%d* %+(%d+),?(%d*) @@")
+  local line = tonumber(start) or 1
+  -- An empty new side names the line *before* where the old one was.
+  if count == "0" then
+    line = line + 1
+  end
+  local function kept(text)
+    local mark = text:sub(1, 1)
+    return mark == " " or mark == "+" or text == ""
+  end
+  for i = header + 1, row - 1 do
+    if kept(lines[i]) then
+      line = line + 1
+    end
+  end
+  if row ~= header and kept(lines[row]) then
+    return line, lines[row]:sub(2)
+  end
+  return line, nil
+end
+
+---The line of `lines` holding `text` that is nearest `near`.
+---
+---Compared as `patch.shown` has both: the CLI writes every tab in a patch as two
+---spaces.
+---@param lines string[]
+---@param text string
+---@param near integer
+---@return integer|nil
+local function nearest(lines, text, near)
+  local wanted = patch.shown(text)
+  local best = nil
+  for i, line in ipairs(lines) do
+    if patch.shown(line) == wanted and (not best or math.abs(i - near) < math.abs(best - near)) then
+      best = i
+    end
+  end
+  return best
+end
+
+---@param a string[]
+---@param b string[]
+---@return integer[][]|nil
+local function line_hunks(a, b)
+  local diff = (vim.text and vim.text.diff) or vim.diff
+  if not diff then
+    return nil
+  end
+  local function text_of(lines)
+    return #lines == 0 and "" or (table.concat(lines, "\n") .. "\n")
+  end
+  local ok, hunks = pcall(diff, text_of(a), text_of(b), { result_type = "indices" })
+  if ok and type(hunks) == "table" then
+    return hunks
+  end
+  return nil
+end
+
+---Where a position in a float is in the file being edited.
+---
+---A float showing a version of the file (`kind = "file"`) is mapped through a
+---line diff against the file as it is now — the same lines unless the float shows
+---the file as a session left it and it has moved on since. A patch (`"patch"`) is
+---read for the line of the new file each of its lines stands for, then found by
+---its text nearest there, since the patch may be older than the file.
+---@param shown string[] What the float shows.
+---@param lines string[] The file as it will be edited.
+---@param kind "file"|"patch"
+---@param row integer 1-based.
+---@param col integer 0-based byte column.
+---@return { line: integer, col: integer }
+function M._disk_position(shown, lines, kind, row, col)
+  local total = #lines
+  if kind == "patch" then
+    local line, text = M._patch_line(shown, row)
+    local found = text and nearest(lines, text, line) or nil
+    if found and lines[found] == text then
+      -- Less the patch's own `+`/` ` column.
+      return { line = found, col = math.max(0, col - 1) }
+    end
+    local at = found or clamp(line, total)
+    return { line = at, col = #((lines[at] or ""):match("^%s*")) }
+  end
+
+  local hunks = line_hunks(shown, lines)
+  if hunks then
+    return { line = M._map_line(hunks, row, total), col = col }
+  end
+  local found = shown[row] and nearest(lines, shown[row], row) or nil
+  return { line = found or clamp(row, total), col = col }
+end
+
+---The file's lines as the user is about to edit them: its buffer's when one is
+---loaded (which may hold changes not yet written), else what is on disk.
+---@param path string
+---@return string[]|nil
+local function lines_to_edit(path)
+  local disk = read_lines(path)
+  if not disk then
+    return nil
+  end
+  local ok_full, full = pcall(vim.fn.fnamemodify, path, ":p")
+  local ok_bufs, bufs = pcall(vim.api.nvim_list_bufs)
+  if ok_full and ok_bufs and type(bufs) == "table" then
+    for _, buf in ipairs(bufs) do
+      local ok_name, name = pcall(vim.api.nvim_buf_get_name, buf)
+      if ok_name and name ~= "" and vim.fn.fnamemodify(name, ":p") == full then
+        local ok_loaded, loaded = pcall(vim.api.nvim_buf_is_loaded, buf)
+        if ok_loaded and loaded then
+          local ok_lines, lines = pcall(vim.api.nvim_buf_get_lines, buf, 0, -1, false)
+          if ok_lines and type(lines) == "table" then
+            return lines
+          end
+        end
+        break
+      end
+    end
+  end
+  return disk
+end
+
+---The register and count typed before a key, spelled so they can be typed again.
+---
+---A register is left out when it is the one a plain `p` would use anyway, which
+---with `'clipboard'` set is not `"`.
+---@param count integer|nil
+---@param register string|nil
+---@return string
+function M._key_prefix(count, register)
+  local default = '"'
+  local clipboard = {}
+  for item in tostring(vim.o.clipboard or ""):gmatch("[^,]+") do
+    clipboard[item] = true
+  end
+  if clipboard.unnamedplus then
+    default = "+"
+  elseif clipboard.unnamed then
+    default = "*"
+  end
+  local prefix = ""
+  if type(register) == "string" and register ~= "" and register ~= default then
+    prefix = '"' .. register
+  end
+  count = tonumber(count) or 0
+  if count > 0 then
+    prefix = prefix .. tostring(count)
+  end
+  return prefix
+end
+
+---@param keys string
+---@return string
+local function termcodes(keys)
+  return vim.api.nvim_replace_termcodes(keys, true, false, true)
+end
+
+---Close the float, open the file in a new tab where the cursor was, and type the
+---key there.
+---
+---Both calls to `nvim_feedkeys` insert at the *front* of typeahead (`i`), ahead of
+---whatever the user typed after the key and before the float closed: appended, a
+---quick `ciw` would reach the file as `iwc`. The key itself is remapped (`m`), so a
+---plugin's mapping in the file (`ds` of a surround plugin) still completes; the
+---reselection is not, so no mapping of `v` gets in its way.
+---@param buf integer The float's buffer.
+---@param path string
+---@param kind "file"|"patch"
+---@param lhs string
+---@param visual boolean
+local function edit_on_disk(buf, path, kind, lhs, visual)
+  local count, register = vim.v.count, vim.v.register
+  local lines = lines_to_edit(path)
+  if not lines then
+    -- Nothing on disk to edit, and a tab on the path would be one `:w` from
+    -- resurrecting it.
+    logger.debug("agents", "file_view: no file on disk at", path, "- ignoring", lhs)
+    return
+  end
+
+  -- Everything read before the float closes: its buffer is wiped with it.
+  local win = vim.api.nvim_get_current_win()
+  local shown = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  local cursor = vim.api.nvim_win_get_cursor(win)
+  local to = M._disk_position(shown, lines, kind, cursor[1], cursor[2])
+  local selection = nil
+  if visual then
+    local start = vim.fn.getpos("v")
+    selection = {
+      mode = vim.fn.mode(),
+      from = M._disk_position(shown, lines, kind, start[2], math.max(0, start[3] - 1)),
+    }
+    pcall(vim.cmd, "normal! \27")
+  end
+
+  if vim.w[win].claudecode_float then
+    float.close(win)
+  end
+  local at = selection and selection.from or to
+  if not M.open_in_tab(path, at.line, at.col) then
+    return
+  end
+
+  vim.api.nvim_feedkeys(termcodes(M._key_prefix(count, register) .. lhs), "mi", false)
+  if selection then
+    local reselect = string.format("<Cmd>call cursor(%d, %d)<CR>", to.line, to.col + 1)
+    vim.api.nvim_feedkeys(selection.mode .. termcodes(reselect), "ni", false)
+  end
+end
+
+---Give a float's buffer the keys that edit the file it shows.
+---
+---Only on the scratch buffers this module builds: they are wiped with their float,
+---so the maps go with them.
+---@param win integer|nil
+---@param path string
+---@param kind "file"|"patch" What the buffer holds; see `_disk_position`.
+local function bind_edit_keys(win, path, kind)
+  if not win then
+    return
+  end
+  local ok, buf = pcall(vim.api.nvim_win_get_buf, win)
+  if not ok or not buf then
+    return
+  end
+  local desc = "Edit " .. vim.fn.fnamemodify(path, ":t") .. " in a new tab"
+  for mode, keys in pairs(M.EDIT_KEYS) do
+    for _, lhs in ipairs(keys) do
+      if not claimed(buf, mode, lhs) then
+        pcall(vim.keymap.set, mode, lhs, function()
+          edit_on_disk(buf, path, kind, lhs, mode == "x")
+        end, { buffer = buf, nowait = true, silent = true, desc = desc })
+      end
+    end
+  end
+end
+
 ---Highlight whole lines, the way the live cursor marks what Claude read — in
 ---the same group, so `live_cursor.highlight` reaches this view too.
 ---@param buf integer
@@ -145,6 +616,7 @@ local function open_read(session_id, path, title, ranges, line, reuse)
   local first = paint_reads(buf, ranges)
   float.jump_to(win, line or first)
   float.bind_close(win)
+  bind_edit_keys(win, path, "file")
   return win
 end
 
@@ -166,6 +638,7 @@ local function open_patch_text(session_id, path, hunks, title, reuse)
     return nil
   end
   float.bind_close(win)
+  bind_edit_keys(win, path, "patch")
   return win
 end
 
@@ -213,6 +686,7 @@ local function open_inline_diff(session_id, path, lines, before, title, reuse)
   local hunks = vim.b[buf].unified_hunks or {}
   float.jump_to(win, hunks[1] or 1, true)
   float.bind_close(win)
+  bind_edit_keys(win, path, "file")
   return win, buf
 end
 
@@ -253,6 +727,7 @@ local function open_text_diff(session_id, path, before, after, title, reuse, rev
     return nil
   end
   float.bind_close(win)
+  bind_edit_keys(win, path, "patch")
   return win
 end
 

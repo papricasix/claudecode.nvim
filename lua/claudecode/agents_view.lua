@@ -3442,21 +3442,12 @@ end
 ---@param line integer|nil
 ---@return boolean opened
 function M.open_file_in_tab(path, line)
-  -- A row records work, and that work may have been a delete — or the file may
-  -- have moved since. `tabnew` on a path that is not there opens an empty buffer
-  -- whose first `:w` resurrects the file, which is not what `gf` asks for.
+  -- Refused without a readable file (see `file_view.open_in_tab`); `gf` says so.
   if vim.fn.filereadable(path) ~= 1 then
     logger.warn("agents", "no file on disk at " .. path)
     return false
   end
-  local ok = pcall(vim.cmd, "tabnew " .. vim.fn.fnameescape(path))
-  if not ok then
-    return false
-  end
-  if line then
-    pcall(vim.api.nvim_win_set_cursor, 0, { line, 0 })
-  end
-  return true
+  return require("claudecode.agents.file_view").open_in_tab(path, line)
 end
 
 ---Open a file somewhere that is not one of our panes.

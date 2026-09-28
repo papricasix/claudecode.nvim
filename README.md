@@ -346,6 +346,7 @@ there too.
   The other two keys answer questions about the row; this one leaves the row
   behind. A file that is no longer on disk says so instead of opening an empty
   buffer.
+- **A key that edits, pressed in one of those file floats, edits the file.** The float is read-only, so `i`, `o`, `dd`, `ciw`, `x`, `p`, `>>`, a visual `d` and the rest open the file on disk in a new tab, close the float, put the cursor on the same line and column (followed through whatever changed since, when the float shows an older version) and run the key there — count, register and visual selection included. A file no longer on disk leaves the key doing nothing. A key you have mapped yourself (a jump plugin's `s`, say) keeps your mapping; `y`, `u` and `.` are left alone.
 - `<CR>` in the Activity or Changes pane opens that file in a floating window,
   showing **what the agent did to it**: in the Changes pane an inline diff of
   everything the session changed; in the Activity pane just that one call — the

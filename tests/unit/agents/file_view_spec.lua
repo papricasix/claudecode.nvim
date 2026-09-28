@@ -822,4 +822,202 @@ describe("agents.file_view", function()
       expect(vim.api.nvim_buf_get_option(buf, "filetype")).to_be("diff")
     end)
   end)
+
+  describe("a key that edits", function()
+    -- A float is a reading frame, not modifiable; reaching for `o` or `dd` while
+    -- reading a diff used to answer E21. Now it opens the file in a new tab, on
+    -- the same line, closes the float and types the key there.
+    local fed, real
+
+    ---The buffer-local mapping for `lhs` in `mode` on a buffer, or nil.
+    local function map_of(buf, mode, lhs)
+      local per_buf = vim._buf_keymaps[buf] and vim._buf_keymaps[buf][mode]
+      return per_buf and per_buf[lhs] or nil
+    end
+
+    local function press(buf, lhs, mode)
+      local map = map_of(buf, mode or "n", lhs)
+      assert.is_not_nil(map, "no " .. (mode or "n") .. " mapping for " .. lhs)
+      map.rhs()
+    end
+
+    before_each(function()
+      fed = {}
+      real = {
+        filereadable = vim.fn.filereadable,
+        maparg = vim.fn.maparg,
+        feedkeys = vim.api.nvim_feedkeys,
+        termcodes = vim.api.nvim_replace_termcodes,
+        count = vim.v.count,
+        register = vim.v.register,
+        clipboard = vim.o.clipboard,
+      }
+      vim.fn.filereadable = function(path)
+        return disk[path] and 1 or 0
+      end
+      vim.api.nvim_feedkeys = function(keys, mode)
+        fed[#fed + 1] = { keys = keys, mode = mode }
+      end
+      vim.api.nvim_replace_termcodes = function(keys)
+        return keys
+      end
+      vim.v.count, vim.v.register, vim.o.clipboard = 0, '"', ""
+      vim._last_command = nil
+    end)
+
+    after_each(function()
+      vim.fn.filereadable = real.filereadable
+      vim.fn.maparg = real.maparg
+      vim.api.nvim_feedkeys = real.feedkeys
+      vim.api.nvim_replace_termcodes = real.termcodes
+      vim.v.count, vim.v.register, vim.o.clipboard = real.count, real.register, real.clipboard
+    end)
+
+    ---A session diff of `/proj/a.lua`, open in a float; its buffer.
+    local function open_diff()
+      install_unified()
+      disk["/proj/a.lua"] = { "one", "TWO", "three" }
+      histories["/proj/a.lua"] = { hunks = { hunk(2, { "-two", "+TWO" }) }, created = false, reads = {} }
+      local win = open({ session_id = "s", transcript = "/p/a.jsonl", path = "/proj/a.lua" })
+      return (vim.api.nvim_win_get_buf(win)), win
+    end
+
+    it("opens the file in a new tab, closes the float and types the key there", function()
+      local buf, win = open_diff()
+      vim.api.nvim_win_set_cursor(win, { 2, 1 })
+
+      press(buf, "o")
+      expect(float.count()).to_be(0)
+      expect(vim._last_command).to_be("tabnew /proj/a.lua")
+      -- At the front of typeahead, remapped: whatever was typed after the key
+      -- (the `iw` of a quick `ciw`) must follow it, not precede it.
+      expect(#fed).to_be(1)
+      expect(fed[1].keys).to_be("o")
+      expect(fed[1].mode).to_be("mi")
+    end)
+
+    it("binds an operator alone, so what follows it completes in the file", function()
+      local buf = open_diff()
+      expect(map_of(buf, "n", "d")).not_to_be_nil()
+      expect(map_of(buf, "n", "d").opts.nowait).to_be_true()
+      expect(map_of(buf, "n", "dd")).to_be_nil()
+      expect(map_of(buf, "x", "d")).not_to_be_nil()
+      -- Reading keys stay what they are.
+      expect(map_of(buf, "n", "y")).to_be_nil()
+      expect(map_of(buf, "n", "u")).to_be_nil()
+      expect(map_of(buf, "n", ".")).to_be_nil()
+    end)
+
+    it("types the count and register again", function()
+      local buf = open_diff()
+      vim.v.count, vim.v.register = 3, "a"
+      press(buf, "d")
+      expect(fed[1].keys).to_be('"a3d')
+    end)
+
+    it("leaves out the register a plain key would use anyway", function()
+      expect(file_view._key_prefix(0, '"')).to_be("")
+      vim.o.clipboard = "unnamedplus"
+      expect(file_view._key_prefix(2, "+")).to_be("2")
+      expect(file_view._key_prefix(0, '"')).to_be('""')
+    end)
+
+    it("does nothing when the file is gone from disk", function()
+      local buf = open_diff()
+      disk["/proj/a.lua"] = nil
+      vim._last_command = nil
+      press(buf, "i")
+      expect(float.count()).to_be(1)
+      expect(vim._last_command).to_be_nil()
+      expect(#fed).to_be(0)
+    end)
+
+    it("leaves a key the user mapped alone", function()
+      -- flash, leap and sneak put a jump on `s`; a reading float is where one is wanted.
+      vim.fn.maparg = function(lhs)
+        if lhs == "s" or lhs == "gc" then
+          return { lhs = lhs }
+        end
+        return {}
+      end
+      local buf = open_diff()
+      expect(map_of(buf, "n", "s")).to_be_nil()
+      expect(map_of(buf, "n", "x")).not_to_be_nil()
+      -- A comment toggle is an edit under every mapping anyone gives it.
+      expect(map_of(buf, "n", "gc")).not_to_be_nil()
+    end)
+
+    it("reselects a visual selection in the file before typing the key", function()
+      local buf, win = open_diff()
+      vim.api.nvim_win_set_cursor(win, { 3, 0 })
+      local real_mode, real_getpos = vim.fn.mode, vim.fn.getpos
+      vim.fn.mode = function()
+        return "V"
+      end
+      vim.fn.getpos = function()
+        return { 0, 1, 1, 0 }
+      end
+      press(buf, "d", "x")
+      vim.fn.mode, vim.fn.getpos = real_mode, real_getpos
+
+      expect(vim._last_command).to_be("tabnew /proj/a.lua")
+      -- Fed in reverse, each at the front: the selection runs first.
+      expect(#fed).to_be(2)
+      expect(fed[1].keys).to_be("d")
+      expect(fed[2].keys).to_be("V<Cmd>call cursor(3, 1)<CR>")
+      expect(fed[2].mode).to_be("ni")
+    end)
+
+    it("is bound on a patch shown as text too", function()
+      disk["/proj/a.lua"] = { "one", "TWO" }
+      histories["/proj/a.lua"] = { hunks = { hunk(2, { "-two", "+TWO" }) }, created = false, reads = {} }
+      open({ session_id = "s", transcript = "/p/a.jsonl", path = "/proj/a.lua" })
+      local buf = float_buf()
+      expect(vim.api.nvim_buf_get_option(buf, "filetype")).to_be("diff")
+      expect(map_of(buf, "n", "o")).not_to_be_nil()
+    end)
+
+    describe("where the cursor lands", function()
+      it("moves a line by what was added above it since", function()
+        -- `vim.diff` indices: two lines added at the top.
+        expect(file_view._map_line({ { 0, 0, 1, 2 } }, 3, 6)).to_be(5)
+      end)
+
+      it("puts a changed line on its counterpart", function()
+        -- "b" (line 2) became "B", "B2".
+        local hunks = { { 2, 1, 2, 2 } }
+        expect(file_view._map_line(hunks, 2, 4)).to_be(2)
+        expect(file_view._map_line(hunks, 3, 4)).to_be(4)
+      end)
+
+      it("puts a deleted line where it was", function()
+        -- Lines 2-3 removed; line 1 of the new file is what precedes them.
+        expect(file_view._map_line({ { 2, 2, 1, 0 } }, 3, 3)).to_be(2)
+        expect(file_view._map_line({ { 2, 2, 1, 0 } }, 4, 3)).to_be(2)
+      end)
+
+      it("reads a patch line for the new file's line and text", function()
+        local lines = { "--- a/x", "+++ b/x", "@@ -4,3 +4,3 @@", " four", "-five", "+FIVE", " six" }
+        expect(file_view._patch_line(lines, 4)).to_be(4)
+        local line, text = file_view._patch_line(lines, 6)
+        expect(line).to_be(5)
+        expect(text).to_be("FIVE")
+        line, text = file_view._patch_line(lines, 5)
+        expect(line).to_be(5)
+        expect(text).to_be_nil()
+        -- The file headers: the first hunk.
+        expect(file_view._patch_line(lines, 1)).to_be(4)
+      end)
+
+      it("finds a patch line by its text, tabs written as two spaces", function()
+        -- The patch is older than the file: three lines were added above since.
+        local patch_lines = { "@@ -1,2 +1,2 @@", " func a():", "+  TWO" }
+        local disk_lines = { "x", "y", "z", "func a():", "\tTWO" }
+        local at = file_view._disk_position(patch_lines, disk_lines, "patch", 3, 3)
+        expect(at.line).to_be(5)
+        -- Not the same bytes, so the column is the line's indent rather than a guess.
+        expect(at.col).to_be(1)
+      end)
+    end)
+  end)
 end)
