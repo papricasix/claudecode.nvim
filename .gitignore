@@ -72,6 +72,9 @@ luacov.stats.out
 /.notes/
 /out.txt
 
+# Working journals for in-flight tasks: session-scoped planning notes, not docs.
+/docs/journals/
+
 # Conversation transcripts. Copying one in from ~/.claude/projects/ is the
 # obvious way to debug the parser against real data, and every line of one is
 # somebody's private conversation — file paths, prompts, command output.
