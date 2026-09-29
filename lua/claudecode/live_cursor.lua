@@ -240,6 +240,14 @@ function M.build_launch_injection()
     -- notification matchers ignores the matcher and sends us everything, which
     -- `status.note` still classifies correctly from the message.
     register("Notification", "permission_prompt|agent_needs_input|idle_prompt")
+    -- A question belongs to the thread that asked it (`status.advance`), and
+    -- these two are the events that say which thread that is. `PermissionRequest`
+    -- fires as a prompt goes up and names the subagent behind it; the
+    -- `Notification` six seconds later names nobody. `SubagentStop` ends the
+    -- question of a subagent that finishes without calling anything else. One
+    -- hook per prompt and one per subagent, against one per tool call above.
+    register("PermissionRequest", "*")
+    register("SubagentStop")
     register("Stop")
     register("SessionEnd")
   else

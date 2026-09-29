@@ -13,6 +13,7 @@
 ---   UserPromptSubmit          -> busy     (you asked, Claude started)
 ---   PreToolUse / PostToolUse  -> busy     (a tool is running / just finished)
 ---   PreToolUse(ExitPlanMode)  -> waiting  (a plan is on screen for you to accept)
+---   PermissionRequest         -> waiting  (a permission prompt or a question)
 ---   Notification              -> waiting  (permission prompt), or idle when the
 ---                                         message is the "waiting for your input"
 ---                                         idle nudge
@@ -24,6 +25,13 @@
 --- result. That is also why enabling this feature widens the injected `PreToolUse`
 --- matcher to every tool — the file-tool matcher the live cursor uses would leave
 --- a `Bash` call reading as idle.
+---
+--- **A question belongs to the thread that asked it** (see `M.advance`). A
+--- conversation is several threads — its own, and every subagent it started,
+--- background ones included — and they all report under the conversation's
+--- `session_id`. So "the next event ends the wait" read a background subagent's
+--- tool call as the answer to the question on screen, and the conversation spun
+--- as busy for as long as the question stayed up.
 ---
 --- `done` versus `idle` is the "you have not read this yet" distinction: a turn
 --- that ends while you are on some other tab (or with Neovim in the background)
@@ -77,6 +85,28 @@ local HIGHLIGHT_LINKS = {
 --- The `Notification` message Claude sends when it has simply been idle at the
 --- prompt, as opposed to actually asking you something.
 local IDLE_NOTIFICATION = "waiting for your input"
+
+--- The conversation's own thread, as a key of `questions`. Claude Code stamps
+--- `agent_id` on a hook event only when it fires inside a subagent ("absent for
+--- the main thread", in the CLI's own schema), so its absence names this one.
+local MAIN = "main"
+
+--- The owner of a question raised by a `Notification` with no `PermissionRequest`
+--- before it. A notification names no thread — measured against CLI 2.1.284, it
+--- carries no `agent_id` even when a subagent's prompt caused it — so whoever
+--- reports next is taken to have moved past it, which is the rule every question
+--- followed before questions had owners.
+local ANYONE = "*"
+
+--- How late a question's own `PreToolUse` may arrive and still be recognised as
+--- that call rather than a new one. Each hook is its own process, so the call's
+--- `PreToolUse` and the `PermissionRequest` spawned a few milliseconds after it
+--- race to Neovim, and the first can lose. Read as news, it would end the question
+--- it belongs to, and nothing would raise it again until the `Notification` six
+--- seconds later — owned by `ANYONE`, so the next subagent event would end that
+--- too. A genuine retry of the same tool follows a declined prompt, which takes a
+--- human reaction and a new model turn.
+local LATE_CALL_MS = 2000
 
 ---Whether this terminal draws emoji-capable codepoints with the colour emoji
 ---font instead of the text font. `✳` (U+2733) is the one frame Unicode lists as
@@ -288,12 +318,25 @@ local function tabnr_of(tab)
   return (ok and type(nr) == "number") and nr or nil
 end
 
+---@param questions table<string, { tool: string?, at: number }>|nil
+---@return table<string, { tool: string?, at: number }>
+local function copy_questions(questions)
+  local out = {}
+  for thread, question in pairs(questions or {}) do
+    out[thread] = { tool = question.tool, at = question.at }
+  end
+  return out
+end
+
 ---@param entry table
 ---@return ClaudeCodeStatus
 local function copy(entry)
   local out = {}
   for k, v in pairs(entry) do
     out[k] = v
+  end
+  if entry.questions then
+    out.questions = copy_questions(entry.questions)
   end
   out.tabnr = tabnr_of(entry.tab)
   return out
@@ -509,7 +552,7 @@ end
 ---Record a tab's state, emitting `ClaudeCodeStatusChanged` when it is news.
 ---@param tab integer|nil
 ---@param state ClaudeCodeStatusState
----@param info { tool: string?, message: string?, session_id: string? }|nil
+---@param info { tool: string?, message: string?, session_id: string?, questions: table? }|nil
 local function apply(tab, state, info)
   tab = normalize_tab(tab)
   if not tab then
@@ -525,6 +568,8 @@ local function apply(tab, state, info)
     tool = info.tool,
     message = info.message,
     session_id = info.session_id or (prev and prev.session_id) or nil,
+    -- Who asked what is on screen (`M.advance`); only a waiting tab has any.
+    questions = state == "waiting" and info.questions or nil,
     -- `since` marks when this *state* was entered, so a tabline can age it
     -- ("busy for 30s"); a busy->busy tool change must not reset it.
     since = (prev_state == state and prev and prev.since) or now_ms(),
@@ -538,13 +583,16 @@ local function apply(tab, state, info)
   end
   sync_spinner()
 
-  -- A cancelled turn is reported by no hook at all, so `busy` is the one state
-  -- that cannot end on its own. Arm the transcript watcher on the way in — it
-  -- records where the file ends, which is what makes any marker it later sees
-  -- belong to *this* turn — and let it re-check whether it still has work.
+  -- A cancelled turn is reported by no hook at all, and neither is a question
+  -- dismissed with <Esc>, so those are the two states that cannot end on their
+  -- own. Arm the transcript watcher on the way into either — it records where
+  -- the file ends, which is what makes any marker it later sees belong to *this*
+  -- turn — and let it re-check whether it still has work. Moving between the two
+  -- is the same turn, and re-arming there could step over a marker not yet read.
   pcall(function()
     local watch = require("claudecode.interrupt_watch")
-    if state == "busy" and prev_state ~= "busy" then
+    local live = { busy = true, waiting = true }
+    if live[state] and not live[prev_state] then
       watch.arm(entry.session_id)
     end
     watch.sync()
@@ -575,7 +623,8 @@ end
 ---       in. The caller decides, because "have you read this yet" depends on where
 ---       the answer arrived. Defaults to `done`.
 ---@return ClaudeCodeStatusState|nil state nil when the event says nothing about state.
----@return { tool: string?, message: string?, session_id: string? } info
+---@return { tool: string?, message: string?, session_id: string?, agent_id: string?, questions: table? } info
+---       `agent_id` is set when the event came from inside a subagent.
 function M.classify(event, opts)
   if type(event) ~= "table" then
     return nil, {}
@@ -585,14 +634,16 @@ function M.classify(event, opts)
   local ehn = event.hook_event_name
   local tool = type(event.tool_name) == "string" and event.tool_name or nil
   local session_id = type(event.session_id) == "string" and event.session_id or nil
-  local info = { tool = tool, session_id = session_id }
+  local agent_id = (type(event.agent_id) == "string" and event.agent_id ~= "") and event.agent_id or nil
+  local info = { tool = tool, session_id = session_id, agent_id = agent_id }
+  local bare = { session_id = session_id, agent_id = agent_id }
 
   if ehn == "SessionStart" then
-    return "idle", { session_id = session_id }
+    return "idle", bare
   elseif ehn == "SessionEnd" then
     return "none", {}
   elseif ehn == "UserPromptSubmit" then
-    return "busy", { session_id = session_id }
+    return "busy", bare
   elseif ehn == "PreToolUse" then
     if tool == "ExitPlanMode" then
       -- The plan is on screen and Claude cannot continue until you accept or
@@ -601,21 +652,168 @@ function M.classify(event, opts)
       return "waiting", info
     end
     return "busy", info
+  elseif ehn == "PermissionRequest" then
+    -- Fired as the prompt goes up, AskUserQuestion's included — six seconds
+    -- before the `Notification`, and unlike it, naming the subagent that asked.
+    return "waiting", info
   elseif ehn == "PostToolUse" or ehn == "PreCompact" then
     return "busy", info
   elseif ehn == "Notification" then
     local message = type(event.message) == "string" and event.message or ""
     if message:lower():find(IDLE_NOTIFICATION, 1, true) then
       -- Not a question: the "you have been idle" nudge Claude sends at the prompt.
-      return finished, { session_id = session_id }
+      return finished, bare
     end
     info.message = message ~= "" and message or nil
     return "waiting", info
   elseif ehn == "Stop" then
-    return finished, { session_id = session_id }
+    return finished, bare
   end
 
   return nil, info
+end
+
+---Fold one hook event into a conversation's current state.
+---
+---`classify` reads an event on its own; this is the part that needs to know what
+---is already on screen, and it exists for one rule: **a question belongs to the
+---thread that asked it**, and only that thread moving on answers it.
+---
+---Measured against CLI 2.1.284 through a pty: while the conversation's own
+---AskUserQuestion was up, a background subagent kept calling `Bash`, and every
+---one of its `PreToolUse`/`PostToolUse` events — stamped with the conversation's
+---`session_id`, told apart only by `agent_id` — read as "the tool ran, so the
+---question was answered". The prompt stayed on screen for twenty minutes under a
+---busy spinner. The other direction is real too: a subagent's permission prompt
+---can be up while the conversation's own thread finishes its turn (`Stop`).
+---
+---So a waiting record carries `questions`, keyed by thread (`MAIN`, or the
+---subagent's id; `ANYONE` when only a `Notification` said so), and:
+---
+---* an event from a thread with no question up changes nothing;
+---* one from the thread that asked ends its question — except that call's own
+---  `PreToolUse` arriving after its `PermissionRequest` (`LATE_CALL_MS`);
+---* `SubagentStop` from the thread that asked ends its question too: it will not
+---  report again, and what it found goes back to the conversation, which carries
+---  on (`busy`);
+---* another question adds to the set, and the state leaves `waiting` only once
+---  the set is empty;
+---* a session starting or ending takes every question with it.
+---
+---Pure, like `classify`: the tab status and the agents view each keep their own
+---records and pass them in.
+---@param prev { state: ClaudeCodeStatusState, questions: table?, tool: string?, message: string? }|nil
+---@param event table Decoded hook payload.
+---@param opts { finished: ClaudeCodeStatusState?, now: number? }|nil `now` is in
+---       milliseconds, on any clock the caller keeps using.
+---@return ClaudeCodeStatusState|nil state nil when the event changes nothing.
+---@return table info As `classify`'s, plus `questions` for a waiting state.
+function M.advance(prev, event, opts)
+  local state, info = M.classify(event, opts)
+  local ehn = type(event) == "table" and event.hook_event_name or nil
+  local now = (opts and opts.now) or 0
+  local thread = info.agent_id or MAIN
+  local pending = prev and prev.state == "waiting" and prev.questions or nil
+  if pending and next(pending) == nil then
+    pending = nil
+  end
+  local prev_tool, prev_message = prev and prev.tool, prev and prev.message
+
+  if ehn == "SessionStart" or ehn == "SessionEnd" then
+    return state, info
+  end
+
+  if state == "waiting" then
+    local questions = copy_questions(pending)
+    if ehn ~= "Notification" then
+      questions[thread] = { tool = info.tool, at = now }
+    elseif not pending then
+      questions[ANYONE] = { at = now }
+    end
+    -- A Notification with a question already up is that question's reminder,
+    -- and says less about it than what raised it.
+    if pending then
+      info.tool = info.tool or prev_tool
+      info.message = info.message or prev_message
+    end
+    info.questions = questions
+    return "waiting", info
+  end
+
+  if not pending then
+    return state, info
+  end
+
+  -- Something is being asked. Notifications name no thread, and the only other
+  -- one is the idle nudge, which a timer sends rather than anyone answering.
+  if ehn == "Notification" then
+    return nil, info
+  end
+  local own = pending[thread]
+  if not own and (state == nil or not pending[ANYONE]) then
+    return nil, info
+  end
+  if own and ehn == "PreToolUse" and own.tool == info.tool and now - (own.at or 0) < LATE_CALL_MS then
+    return nil, info
+  end
+
+  local questions = copy_questions(pending)
+  questions[thread] = nil
+  questions[ANYONE] = nil
+  if next(questions) ~= nil then
+    return "waiting",
+      {
+        tool = prev_tool,
+        message = prev_message,
+        session_id = info.session_id,
+        agent_id = info.agent_id,
+        questions = questions,
+      }
+  end
+  return state or "busy", info
+end
+
+---What `<Esc>` on the conversation's own thread does to a record, read from the
+---transcript's interrupt marker (no hook reports either).
+---
+---A running turn stops. A question stops too — measured against CLI 2.1.284,
+---dismissing AskUserQuestion writes `[Request interrupted by user for tool use]`
+---and fires nothing — but only one the conversation's own thread asked: the
+---marker is in the conversation's transcript, and a subagent's prompt is neither
+---recorded there nor taken down by it.
+---@param entry { state: ClaudeCodeStatusState, questions: table? }|nil
+---@return ClaudeCodeStatusState|nil state nil when the interrupt changes nothing.
+---@return table|nil questions The questions still up, when `state` is `waiting`.
+function M.dismiss(entry)
+  if not entry then
+    return nil
+  end
+  if entry.state == "busy" then
+    return "idle"
+  end
+  if entry.state ~= "waiting" then
+    return nil
+  end
+  -- A record without owners predates them, or was written by hand: every
+  -- question in it followed the old rule, which is `ANYONE`'s.
+  local questions = entry.questions and copy_questions(entry.questions) or { [ANYONE] = {} }
+  if not questions[MAIN] and not questions[ANYONE] then
+    return nil
+  end
+  questions[MAIN] = nil
+  questions[ANYONE] = nil
+  if next(questions) ~= nil then
+    return "waiting", questions
+  end
+  return "idle"
+end
+
+---Whether an interrupt marker could change this record — what the transcript
+---watcher needs to know to decide which tabs are worth reading.
+---@param entry table|nil
+---@return boolean
+function M.interruptible(entry)
+  return M.dismiss(entry) ~= nil
 end
 
 ---Fold one Claude Code hook event into the status of the tab it came from.
@@ -626,7 +824,11 @@ function M.note(event, source_tab)
     return
   end
 
-  local state, info = M.classify(event, { finished = finished_state(source_tab) })
+  local resolved = normalize_tab(source_tab)
+  local state, info = M.advance(resolved and entries[resolved], event, {
+    finished = finished_state(source_tab),
+    now = now_ms(),
+  })
   if state then
     apply(source_tab, state, info)
   end
@@ -682,7 +884,8 @@ end
 ---a dozen other things in Claude's TUI (dismissing a panel, clearing the input),
 ---and during a turn with no tool calls there is no later event to correct a
 ---wrong guess with, so a tab could read idle for minutes while Claude worked.
----Only a `busy` tab can be interrupted; anything else ignores the call.
+---A `busy` tab stops, and so does a question its own thread asked (`M.dismiss`);
+---anything else ignores the call.
 ---@param tab integer|nil
 ---@return boolean noted
 function M.note_interrupt(tab)
@@ -691,10 +894,20 @@ function M.note_interrupt(tab)
   end
   local resolved = normalize_tab(tab)
   local entry = resolved and entries[resolved]
-  if not entry or entry.state ~= "busy" then
+  local state, questions = M.dismiss(entry)
+  if not state or not entry then
     return false
   end
-  apply(resolved, "idle", { session_id = entry.session_id })
+  if state == "waiting" then
+    apply(resolved, state, {
+      session_id = entry.session_id,
+      tool = entry.tool,
+      message = entry.message,
+      questions = questions,
+    })
+  else
+    apply(resolved, state, { session_id = entry.session_id })
+  end
   return true
 end
 

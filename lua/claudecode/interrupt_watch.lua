@@ -24,9 +24,12 @@
 ---
 --- Three things keep the cost proportional to what it fixes:
 ---
---- *The clock only runs while a tab is `busy`.* That is the only state an
---- interrupt can end, and it is exactly when the spinner is already burning a
---- repeating full-UI redraw. Idle Neovim does nothing.
+--- *The clock only runs while a tab is `busy`, or `waiting` on a question its
+--- own thread asked* (`status.interruptible`). Those are the states an interrupt
+--- can end: dismissing a prompt with `<Esc>` — AskUserQuestion included — writes
+--- `[Request interrupted by user for tool use]` and fires no hook either
+--- (measured against 2.1.284), so the tab kept showing a question nobody was
+--- asking any more. Idle Neovim does nothing.
 ---
 --- *Only the bytes appended since the turn started are read.* `arm` records the
 --- file's size at the moment the tab goes busy, so a tick is a `stat` plus, at
@@ -197,7 +200,22 @@ local function scan(session_id, tab)
   end)
 end
 
----One pass over every busy tab. Exposed so a spec can drive it without a timer.
+---Whether a tab's record is one an interrupt marker could change.
+---@param st table The `claudecode.status` module.
+---@param entry table
+---@return boolean
+local function watchable(st, entry)
+  if type(entry.session_id) ~= "string" then
+    return false
+  end
+  if st.interruptible then
+    return st.interruptible(entry)
+  end
+  return entry.state == "busy"
+end
+
+---One pass over every tab an interrupt could change. Exposed so a spec can
+---drive it without a timer.
 function M._tick()
   local st = status()
   if not st or not st.all then
@@ -205,7 +223,7 @@ function M._tick()
   end
   local any = false
   for tab, entry in pairs(st.all()) do
-    if entry.state == "busy" and type(entry.session_id) == "string" then
+    if watchable(st, entry) then
       any = true
       scan(entry.session_id, tab)
     end
@@ -215,15 +233,15 @@ function M._tick()
   end
 end
 
----Whether any tab is in the one state an interrupt can end.
+---Whether any tab is in a state an interrupt can end.
 ---@return boolean
-local function anyone_busy()
+local function anyone_interruptible()
   local st = status()
   if not st or not st.all then
     return false
   end
   for _, entry in pairs(st.all()) do
-    if entry.state == "busy" and type(entry.session_id) == "string" then
+    if watchable(st, entry) then
       return true
     end
   end
@@ -249,7 +267,7 @@ function M.sync()
     M.stop()
     return
   end
-  if not anyone_busy() then
+  if not anyone_interruptible() then
     M.stop()
     return
   end

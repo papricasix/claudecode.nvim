@@ -211,18 +211,146 @@ describe("status", function()
       expect(status.get_state(1)).to_be("idle")
     end)
 
-    it("leaves a tab that is not working alone", function()
-      -- The reason this is not driven off the keypress: <Esc> also closes panels
-      -- in Claude's TUI, and during a turn with no tool calls no later event
-      -- would correct a wrong guess.
-      note("Notification", { message = "Claude needs your permission to run git push" }, 1)
+    it("takes down a question the conversation itself asked", function()
+      -- Dismissing AskUserQuestion with <Esc> writes the marker and fires no hook
+      -- (measured against 2.1.284), so the tab kept showing a question nobody
+      -- was asking any more.
+      note("PreToolUse", { tool_name = "AskUserQuestion" }, 1)
+      note("PermissionRequest", { tool_name = "AskUserQuestion" }, 1)
       expect(status.get_state(1)).to_be("waiting")
+      expect(status.note_interrupt(1)).to_be_true()
+      expect(status.get_state(1)).to_be("idle")
+    end)
+
+    it("leaves a subagent's question up", function()
+      -- The marker is in the conversation's transcript; a subagent's prompt is
+      -- neither recorded there nor taken down by it.
+      note("PermissionRequest", { tool_name = "Bash", agent_id = "a1" }, 1)
       expect(status.note_interrupt(1)).to_be(false)
       expect(status.get_state(1)).to_be("waiting")
     end)
 
+    it("takes down only the conversation's own question when a subagent's is up too", function()
+      note("PermissionRequest", { tool_name = "AskUserQuestion" }, 1)
+      note("PermissionRequest", { tool_name = "Bash", agent_id = "a1" }, 1)
+      expect(status.note_interrupt(1)).to_be_true()
+      local entry = status.get(1)
+      expect(entry.state).to_be("waiting")
+      expect(entry.questions.main).to_be_nil()
+      expect(entry.questions.a1).to_be_table()
+    end)
+
+    it("leaves a tab that is neither working nor asking alone", function()
+      -- The reason this is not driven off the keypress: <Esc> also closes panels
+      -- in Claude's TUI, and during a turn with no tool calls no later event
+      -- would correct a wrong guess.
+      note("Stop", {}, 2)
+      expect(status.note_interrupt(2)).to_be(false)
+      expect(status.get_state(2)).to_be("done")
+    end)
+
     it("ignores a tab with no Claude", function()
       expect(status.note_interrupt(3)).to_be(false)
+    end)
+  end)
+
+  describe("a question belongs to the thread that asked it", function()
+    before_each(function()
+      enable()
+    end)
+
+    it("stays up while a background subagent works", function()
+      -- The sequence measured against CLI 2.1.284: the conversation asks while a
+      -- background subagent it started keeps calling Bash. Every subagent event
+      -- carries the conversation's session id and read as "the tool ran, so the
+      -- question was answered" — the tab showed busy for as long as it was up.
+      note("PreToolUse", { tool_name = "AskUserQuestion" })
+      note("PermissionRequest", { tool_name = "AskUserQuestion" })
+      expect(status.get_state(1)).to_be("waiting")
+      note("PreToolUse", { tool_name = "Bash", agent_id = "a1" })
+      note("PostToolUse", { tool_name = "Bash", agent_id = "a1" })
+      note("Notification", { message = "Claude needs your permission" })
+      note("PreToolUse", { tool_name = "Bash", agent_id = "a1" })
+      note("PostToolUse", { tool_name = "Bash", agent_id = "a1" })
+      expect(status.get_state(1)).to_be("waiting")
+
+      note("PostToolUse", { tool_name = "AskUserQuestion" })
+      expect(status.get_state(1)).to_be("busy")
+    end)
+
+    it("keeps the Notification's message and the prompt's tool", function()
+      note("PermissionRequest", { tool_name = "AskUserQuestion" })
+      note("Notification", { message = "Claude needs your permission" })
+      local entry = status.get(1)
+      expect(entry.tool).to_be("AskUserQuestion")
+      expect(entry.message).to_be("Claude needs your permission")
+    end)
+
+    it("ends a subagent's question only when that subagent moves on", function()
+      -- Also measured: the conversation's own thread finished its turn while a
+      -- subagent's permission prompt was on screen.
+      note("PermissionRequest", { tool_name = "Bash", agent_id = "a1" })
+      note("Stop")
+      note("PreToolUse", { tool_name = "Read", agent_id = "a2" })
+      expect(status.get_state(1)).to_be("waiting")
+
+      note("PostToolUse", { tool_name = "Bash", agent_id = "a1" })
+      expect(status.get_state(1)).to_be("busy")
+    end)
+
+    it("ends a subagent's question when that subagent stops", function()
+      note("PermissionRequest", { tool_name = "Bash", agent_id = "a1" })
+      note("SubagentStop", { agent_id = "a2" })
+      expect(status.get_state(1)).to_be("waiting")
+      -- What it found goes back to the conversation, which carries on.
+      note("SubagentStop", { agent_id = "a1" })
+      expect(status.get_state(1)).to_be("busy")
+    end)
+
+    it("waits until every question is answered", function()
+      note("PermissionRequest", { tool_name = "AskUserQuestion" })
+      note("PermissionRequest", { tool_name = "Bash", agent_id = "a1" })
+      note("PostToolUse", { tool_name = "AskUserQuestion" })
+      expect(status.get_state(1)).to_be("waiting")
+      note("PostToolUse", { tool_name = "Bash", agent_id = "a1" })
+      expect(status.get_state(1)).to_be("busy")
+    end)
+
+    it("does not take the asked-about call's own late PreToolUse as the answer", function()
+      -- Every hook is its own process, and the call's PreToolUse can reach us
+      -- after the PermissionRequest spawned just behind it.
+      note("PermissionRequest", { tool_name = "AskUserQuestion" })
+      note("PreToolUse", { tool_name = "AskUserQuestion" })
+      expect(status.get_state(1)).to_be("waiting")
+    end)
+
+    it("never reads the idle nudge as an answer", function()
+      note("PermissionRequest", { tool_name = "AskUserQuestion" })
+      note("Notification", { message = "Claude is waiting for your input" })
+      expect(status.get_state(1)).to_be("waiting")
+    end)
+
+    it("ends a question only a Notification reported at the next event of anyone", function()
+      -- A notification names no thread, so this is the rule every question
+      -- followed before PermissionRequest said who asked.
+      note("Notification", { message = "Claude needs your permission" })
+      note("PreToolUse", { tool_name = "Bash", agent_id = "a1" })
+      expect(status.get_state(1)).to_be("busy")
+    end)
+
+    it("drops every question when the session ends or restarts", function()
+      note("PermissionRequest", { tool_name = "Bash", agent_id = "a1" })
+      note("SessionStart")
+      expect(status.get_state(1)).to_be("idle")
+      note("PermissionRequest", { tool_name = "Bash", agent_id = "a1" })
+      note("SessionEnd")
+      expect(status.get_state(1)).to_be("none")
+    end)
+
+    it("hands out copies of the questions", function()
+      note("PermissionRequest", { tool_name = "Bash", agent_id = "a1" })
+      status.get(1).questions.a1 = nil
+      expect(status.get(1).questions.a1).to_be_table()
     end)
   end)
 
@@ -499,7 +627,15 @@ describe("status", function()
       local injection = live_cursor.build_launch_injection()
       assert.is_not_nil(injection)
       local contents = injected_settings(injection)
-      for _, event in ipairs({ "UserPromptSubmit", "Notification", "Stop", "SessionEnd", "PostToolUse" }) do
+      for _, event in ipairs({
+        "UserPromptSubmit",
+        "Notification",
+        "PermissionRequest",
+        "SubagentStop",
+        "Stop",
+        "SessionEnd",
+        "PostToolUse",
+      }) do
         assert.is_truthy(contents:match(event))
       end
       -- Activity means *every* tool call, not just the file tools live cursor wants.

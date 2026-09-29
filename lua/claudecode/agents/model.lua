@@ -203,8 +203,10 @@ local function note_transcript_interrupt(session_id, summary)
   state.interrupted[session_id] = ts
 
   local entry = state.status[session_id]
-  if entry and entry.state == "busy" and ts < (entry.since or 0) then
-    -- An interrupt from an earlier turn. The one running now is still running.
+  local live = entry and (entry.state == "busy" or entry.state == "waiting")
+  if live and ts < (entry.since or 0) then
+    -- An interrupt from an earlier turn, or from before the question went up.
+    -- What is running or asking now still is.
     return
   end
   M.note_interrupt(session_id)
@@ -1632,20 +1634,28 @@ function M.note(event)
   end
 
   local ok, status = pcall(require, "claudecode.status")
-  if ok and status.classify then
-    local classified, info = status.classify(event, { finished = finished_state(session_id, status) })
+  if ok and status.advance then
+    -- `advance`, not `classify`: a conversation's subagents report under its
+    -- id, and a background one's tool calls must not read as the answer to a
+    -- question the conversation itself has on screen.
+    local previous = state.status[session_id]
+    local classified, info = status.advance(previous, event, {
+      finished = finished_state(session_id, status),
+      now = now_ms(),
+    })
     if classified then
-      local previous = state.status[session_id]
       if not previous or previous.state ~= classified then
         state.status[session_id] = {
           state = classified,
           tool = info.tool,
           message = info.message,
+          questions = info.questions,
           since = os.time(),
         }
       else
         previous.tool = info.tool
         previous.message = info.message
+        previous.questions = info.questions
       end
     end
   end
@@ -1672,19 +1682,34 @@ end
 ---The per-conversation counterpart of `status.note_interrupt`, and it exists for
 ---the same measured reason: pressing `<Esc>` mid-turn fires no Claude Code hook
 ---at all, so a conversation stays `busy` until its next prompt and its row spins
----for ever. Only a `busy` conversation can be interrupted; anything else ignores
----the key, and a wrong guess is corrected by the next event.
+---for ever. Dismissing a question the conversation asked is the same keypress
+---and just as silent. What an interrupt ends is `status.dismiss`'s rule; anything
+---else ignores the key, and a wrong guess is corrected by the next event.
 ---@param session_id string
 ---@return boolean noted
 function M.note_interrupt(session_id)
   local entry = type(session_id) == "string" and state.status[session_id]
-  if not entry or entry.state ~= "busy" then
+  if not entry then
     return false
   end
-  entry.state = "idle"
-  entry.tool = nil
-  entry.message = nil
-  entry.since = os.time()
+  local ok, status = pcall(require, "claudecode.status")
+  if not ok or not status.dismiss then
+    return false
+  end
+  local next_state, questions = status.dismiss(entry)
+  if not next_state then
+    return false
+  end
+  if next_state == entry.state then
+    -- A subagent's question is still up; only the conversation's own went away.
+    entry.questions = questions
+  else
+    entry.state = next_state
+    entry.tool = nil
+    entry.message = nil
+    entry.questions = nil
+    entry.since = os.time()
+  end
   M.request_refresh()
   return true
 end

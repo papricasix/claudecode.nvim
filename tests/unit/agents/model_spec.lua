@@ -1087,11 +1087,29 @@ describe("agents.model", function()
       expect(model.status_of("aaa").state).to_be("idle")
     end)
 
-    it("leaves a conversation that is not working alone", function()
-      model.note({ hook_event_name = "Notification", message = "needs your permission", session_id = "aaa" })
+    it("takes down a question the conversation dismissed", function()
+      -- <Esc> on AskUserQuestion is the same keypress, just as silent.
+      model.note({ hook_event_name = "PermissionRequest", tool_name = "AskUserQuestion", session_id = "aaa" })
       expect(model.status_of("aaa").state).to_be("waiting")
+      expect(model.note_interrupt("aaa")).to_be_true()
+      expect(model.status_of("aaa").state).to_be("idle")
+    end)
+
+    it("reads a dismissal off a marker newer than the question", function()
+      model.note({ hook_event_name = "PermissionRequest", tool_name = "AskUserQuestion", session_id = "aaa" })
+      summaries.aaa.interrupted_ts = os.time() + 5
+      model.select("aaa")
+      tick()
+      expect(model.status_of("aaa").state).to_be("idle")
+    end)
+
+    it("leaves a subagent's question, and a finished conversation, alone", function()
+      model.note({ hook_event_name = "PermissionRequest", tool_name = "Bash", agent_id = "a1", session_id = "aaa" })
       expect(model.note_interrupt("aaa")).to_be(false)
       expect(model.status_of("aaa").state).to_be("waiting")
+
+      model.note({ hook_event_name = "Stop", session_id = "bbb" })
+      expect(model.note_interrupt("bbb")).to_be(false)
       expect(model.note_interrupt("unknown")).to_be(false)
     end)
   end)
@@ -1181,6 +1199,20 @@ describe("agents.model", function()
       model.select("bbb")
 
       expect(model.status_of("bbb").state).to_be("idle")
+    end)
+
+    it("keeps a conversation's question up while its background subagent works", function()
+      -- The reported bug: an agent asked, a subagent it had started in the
+      -- background kept calling tools under the same session id, and the row
+      -- spun as busy for as long as the question was on screen.
+      model.note({ hook_event_name = "PreToolUse", tool_name = "AskUserQuestion", session_id = "aaa" })
+      model.note({ hook_event_name = "PermissionRequest", tool_name = "AskUserQuestion", session_id = "aaa" })
+      model.note({ hook_event_name = "PreToolUse", tool_name = "Bash", agent_id = "a1", session_id = "aaa" })
+      model.note({ hook_event_name = "PostToolUse", tool_name = "Bash", agent_id = "a1", session_id = "aaa" })
+      expect(model.status_of("aaa").state).to_be("waiting")
+
+      model.note({ hook_event_name = "PostToolUse", tool_name = "AskUserQuestion", session_id = "aaa" })
+      expect(model.status_of("aaa").state).to_be("busy")
     end)
 
     it("never clears waiting by reading it", function()

@@ -71,6 +71,55 @@ describe("agents seams", function()
       classify({ hook_event_name = "PreToolUse", tool_name = "Edit" })
       expect(next(status.all())).to_be(nil)
     end)
+
+    it("treats a prompt going up as waiting, and says which subagent raised it", function()
+      local state, info = classify({ hook_event_name = "PermissionRequest", tool_name = "Bash", agent_id = "a1" })
+      expect(state).to_be("waiting")
+      expect(info.tool).to_be("Bash")
+      expect(info.agent_id).to_be("a1")
+      local _, main = classify({ hook_event_name = "Stop" })
+      expect(main.agent_id).to_be_nil()
+    end)
+  end)
+
+  describe("status.advance", function()
+    local status
+
+    before_each(function()
+      package.loaded["claudecode.status"] = nil
+      status = require("claudecode.status")
+    end)
+
+    ---Feed events through `advance` the way a caller keeps its record.
+    local function run(events)
+      local record
+      for _, step in ipairs(events) do
+        local state, info = status.advance(record, step.event, { now = step.now or 0 })
+        if state then
+          record = { state = state, tool = info.tool, message = info.message, questions = info.questions }
+        end
+      end
+      return record
+    end
+
+    it("recognises the asked-about call's own PreToolUse only while it can still be late", function()
+      local asked = { hook_event_name = "PermissionRequest", tool_name = "Bash" }
+      local late = { hook_event_name = "PreToolUse", tool_name = "Bash" }
+      expect(run({ { event = asked, now = 1000 }, { event = late, now = 1400 } }).state).to_be("waiting")
+      -- A retry after a declined prompt takes a person and a new model turn.
+      expect(run({ { event = asked, now = 1000 }, { event = late, now = 9000 } }).state).to_be("busy")
+      -- Another tool from the same thread is news however soon it comes.
+      local other = { hook_event_name = "PreToolUse", tool_name = "Read" }
+      expect(run({ { event = asked, now = 1000 }, { event = other, now = 1001 } }).state).to_be("busy")
+    end)
+
+    it("says nothing about events it does not change", function()
+      local record = run({ { event = { hook_event_name = "PermissionRequest", tool_name = "Bash" } } })
+      expect((status.advance(record, { hook_event_name = "PostToolUse", tool_name = "Read", agent_id = "a1" }))).to_be(
+        nil
+      )
+      expect((status.advance(nil, { hook_event_name = "SubagentStop", agent_id = "a1" }))).to_be(nil)
+    end)
   end)
 
   describe("session_state disown", function()

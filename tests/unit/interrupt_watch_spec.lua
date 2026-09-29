@@ -164,16 +164,59 @@ describe("interrupt_watch", function()
       expect(status.get_state(2)).to_be("idle")
     end)
 
-    it("leaves a tab that is not busy alone", function()
+    it("takes down a question the conversation dismissed", function()
+      -- <Esc> on AskUserQuestion writes `[Request interrupted by user for tool
+      -- use]` and fires no hook (measured against 2.1.284).
       files["/store/s1.jsonl"] = ""
       go_busy(2, "s1")
-      status.note({ hook_event_name = "Notification", message = "needs your permission", session_id = "s1" }, 2)
+      status.note({ hook_event_name = "PermissionRequest", tool_name = "AskUserQuestion", session_id = "s1" }, 2)
       expect(status.get_state(2)).to_be("waiting")
+      expect(watch._is_running()).to_be_true()
 
       files["/store/s1.jsonl"] = marker_line() .. "\n"
       watch._tick()
-      -- Looking at a question is not answering it, and neither is a stale marker.
+      expect(status.get_state(2)).to_be("idle")
+    end)
+
+    it("leaves a subagent's question alone, and stops the clock for it", function()
+      files["/store/s1.jsonl"] = ""
+      go_busy(2, "s1")
+      status.note({
+        hook_event_name = "PermissionRequest",
+        tool_name = "Bash",
+        agent_id = "a1",
+        session_id = "s1",
+      }, 2)
       expect(status.get_state(2)).to_be("waiting")
+      expect(watch._is_running()).to_be(false)
+
+      files["/store/s1.jsonl"] = marker_line() .. "\n"
+      watch._tick()
+      expect(status.get_state(2)).to_be("waiting")
+    end)
+
+    it("reads a question raised from rest only from where the file then ended", function()
+      -- No busy turn armed the watcher first, so the question has to: a marker
+      -- already in the file belongs to some earlier turn.
+      vim._tabs[2] = true
+      files["/store/s1.jsonl"] = marker_line() .. "\n"
+      status.note({ hook_event_name = "Stop", session_id = "s1" }, 2)
+      status.note({ hook_event_name = "PermissionRequest", tool_name = "ExitPlanMode", session_id = "s1" }, 2)
+      watch._tick()
+      expect(status.get_state(2)).to_be("waiting")
+
+      files["/store/s1.jsonl"] = files["/store/s1.jsonl"] .. marker_line() .. "\n"
+      watch._tick()
+      expect(status.get_state(2)).to_be("idle")
+    end)
+
+    it("leaves a tab that is neither working nor asking alone", function()
+      files["/store/s1.jsonl"] = ""
+      go_busy(2, "s1")
+      status.note({ hook_event_name = "Stop", session_id = "s1" }, 2)
+      files["/store/s1.jsonl"] = marker_line() .. "\n"
+      watch._tick()
+      expect(status.get_state(2)).to_be("done")
     end)
 
     it("re-reads only what was appended", function()
