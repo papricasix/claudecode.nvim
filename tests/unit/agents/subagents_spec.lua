@@ -32,6 +32,9 @@ describe("agents.subagents", function()
         parentAgentId = spec.parent,
         spawnDepth = spec.parent and 2 or 1,
         requestShape = spec.shape or "background",
+        -- What a run spawned with `isolation: "worktree"` also records.
+        worktreePath = spec.worktree,
+        spawnedWithWorktree = spec.worktree and true or nil,
       }),
     }, spec.started or (spec.first or NOW - 60))
     local lines = {
@@ -198,6 +201,19 @@ describe("agents.subagents", function()
       expect(table.concat(drawn, "|")).to_be("root|├─child1|│ └─grandchild|└─child2|late")
       expect(out[3].depth).to_be(2)
       expect(out[2].agent_type).to_be("Explore")
+    end)
+
+    it("says which runs were given a worktree of their own", function()
+      -- `isolation: "worktree"`: the run's transcript stays beside its siblings',
+      -- and only its descriptor says its files are in another checkout.
+      agent("plain", { first = NOW - 300 })
+      agent("isolated", { first = NOW - 200, worktree = "/proj/.claude/worktrees/agent-isolated" })
+
+      local out = rows({ live = true })
+      expect(out[1].id).to_be("plain")
+      expect(out[1].worktree).to_be_nil()
+      expect(out[2].id).to_be("isolated")
+      expect(out[2].worktree).to_be("/proj/.claude/worktrees/agent-isolated")
     end)
 
     it("draws a subagent whose parent it cannot see from the top", function()

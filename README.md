@@ -302,6 +302,7 @@ there too.
 - `m` **flags the session under the cursor** so you do not forget to come back to it: a `⚑` between its bullet and its title, and a count in the pane's title (`Sessions · ⚑ 2`). Unlike the unread dot, a flag survives being looked at. It comes off when you **answer that conversation** — a prompt you type (also one typed while Claude is still working), a question you answer, a plan you approve, or a call you turn down with a correction — wherever you do it: here, in another tab, or in a plain terminal. Approving a permission prompt does not count, and neither does anything the harness writes on your behalf. `m` again takes it off by hand.
 - `M` flags it **with a note** saying what for — `⚑ Port upstream · check CI` — and that flag **stays until you take it off**: "review before merging" is not done because you sent a follow-up. The note is cut to fit the row; `M` again shows it whole and lets you change it, and the centre pane shows it in full for a session that is not running. An empty note leaves a plain flag. `:ClaudeCodeAgentsFlag` does the same for the selected session, which is what to map if you want it from inside the agent's terminal.
 - A flagged session **stays listed however old it is** (the list otherwise reaches back two weeks), and sorting by status puts flagged ones first. Flags belong to the conversation, not the view: they survive restarting Neovim, are shared between Neovims, and go with the conversation when it is deleted.
+- A session **working in a git worktree** (`claude --worktree`, or one Claude entered on the way) wears `⎇` between its bullet and its title, after the `⚑` if it has one: what it changes is in another checkout, on another branch. Its files are named from the worktree, and their git letters are the worktree's own. For a session that is not running the centre pane says which worktree and branch, and starting it puts it back to work there. Claude Code stores such a conversation under the worktree's directory rather than the project's; they are listed with the project's own all the same, and stay listed after the worktree is deleted. In the Tasks pane the same mark sets off a subagent that was given a worktree of its own.
 - Switching agents leaves the previous one **running**. That is the point: start
   three, come back to whichever finishes first.
 - `<C-n>` and `<C-p>` move through the session list from anywhere in the tab —
@@ -581,6 +582,8 @@ opts = {
     --     flagged = "ClaudeCodeAgentsFlagged",   -- DiagnosticWarn (the ⚑ on a flagged
     --                                            -- session)
     --     flag_note = "ClaudeCodeAgentsFlagNote", -- Comment (the note after its title)
+    --     worktree = "ClaudeCodeAgentsWorktree", -- Directory (the ⎇ on a session or
+    --                                            -- subagent working in a git worktree)
     --     header = "ClaudeCodeAgentsHelpHeader", -- Title
     --     key = "ClaudeCodeAgentsKey",           -- Special
     --   }

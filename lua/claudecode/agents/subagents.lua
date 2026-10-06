@@ -9,7 +9,8 @@
 ---   <session>/subagents/agent-<id>.jsonl
 ---   <session>/subagents/agent-<id>.meta.json   agentType, description,
 ---                                              toolUseId, parentAgentId,
----                                              spawnDepth, requestShape
+---                                              spawnDepth, requestShape,
+---                                              worktreePath
 ---
 --- Nested subagents sit in the same flat directory; `parentAgentId` is what makes
 --- it a tree. How a run *ended* is recorded by whoever launched it:
@@ -90,6 +91,7 @@ end
 ---@field tool_use_id string|nil
 ---@field parent_id string|nil
 ---@field shape string|nil `background` | `foreground`
+---@field worktree string|nil The git worktree it was given to work in (`isolation: "worktree"`).
 ---@field path string Its transcript.
 ---@field started number Epoch seconds the descriptor was written.
 ---@field mtime number Epoch seconds its transcript was last written (0 when it has none yet).
@@ -131,6 +133,10 @@ function M.scan(transcript_path)
           tool_use_id = type(meta.toolUseId) == "string" and meta.toolUseId or nil,
           parent_id = type(meta.parentAgentId) == "string" and meta.parentAgentId or nil,
           shape = type(meta.requestShape) == "string" and meta.requestShape or nil,
+          -- A run spawned with `isolation: "worktree"` says where in its
+          -- descriptor (`worktreePath`, with `spawnedWithWorktree`; measured
+          -- against CLI 2.1.291). Its transcript stays here with its siblings'.
+          worktree = (type(meta.worktreePath) == "string" and meta.worktreePath ~= "") and meta.worktreePath or nil,
           path = path,
           started = st.mtime or 0,
           mtime = log and log.mtime or 0,
@@ -250,6 +256,7 @@ local ENDED = { completed = "done", killed = "stopped", stopped = "stopped", can
 ---@field workflow string|nil A workflow's agent: the task id of the run it belongs to.
 ---@field phase string|nil A workflow's agent: the phase it ran in.
 ---@field path string|nil A workflow's agent: its transcript.
+---@field worktree string|nil A subagent: the git worktree it was given to work in.
 
 ---Where one run stands, from everything that could have recorded its end.
 ---@param agent ClaudeCodeSubagent
@@ -1170,6 +1177,7 @@ function M.rows(transcript_path, opts)
             state = state,
             tokens = tokens,
             runtime_s = runtime,
+            worktree = agent.worktree,
           }
         end
         if children[agent.id] then

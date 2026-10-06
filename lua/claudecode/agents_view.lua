@@ -1130,6 +1130,18 @@ local function show_start_prompt(session_id)
     table.insert(lines, 3, "  " .. render.FLAG_MARK .. " " .. (flag.note or "flagged until you reply"))
     marks[#marks + 1] = { row = 2, col = 0, end_col = -1, hl = render.highlight("flagged") }
   end
+  -- Which worktree, and on which branch: the row has room for the mark alone, and
+  -- starting the conversation here puts it back to work in that checkout.
+  local worktree = model.worktree_of and model.worktree_of(session_id)
+  if worktree then
+    local at = #lines
+    local text = "  " .. render.WORKTREE_MARK .. " worktree " .. worktree.name
+    if worktree.branch then
+      text = text .. " · " .. worktree.branch
+    end
+    table.insert(lines, at, text)
+    marks[#marks + 1] = { row = at - 1, col = 0, end_col = -1, hl = render.highlight("worktree") }
+  end
   local hints
   if foreign_state then
     lines[#lines + 1] = "  This conversation is running in another tab."

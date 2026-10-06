@@ -242,6 +242,9 @@ M.defaults = {
       flagged = "ClaudeCodeAgentsFlagged",
       -- The note after a flagged session's title; defaults to a link to Comment.
       flag_note = "ClaudeCodeAgentsFlagNote",
+      -- The mark on a session or subagent working in a git worktree; defaults to
+      -- a link to Directory.
+      worktree = "ClaudeCodeAgentsWorktree",
       -- Terminal pane background: follows SnacksNormal when snacks is loaded,
       -- else NormalFloat. The sidebars keep the editor's own Normal.
       normal = "ClaudeCodeAgentsNormal",
@@ -767,6 +770,7 @@ function M.validate(config)
         "rewind",
         "flagged",
         "flag_note",
+        "worktree",
       }
       for _, field in ipairs(highlight_fields) do
         checker(ag.highlights, "agents.highlights")(field, function(v)

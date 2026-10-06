@@ -1180,6 +1180,24 @@ describe("agents_view", function()
       expect(text:find("start it here", 1, true) ~= nil).to_be_true()
     end)
 
+    it("names the worktree a stopped session works in, and its branch", function()
+      -- The row has room for the mark alone; this screen is where a session is
+      -- read before it is started again, and starting it goes back to that checkout.
+      package.loaded["claudecode.agents.model"].worktree_of = function(id)
+        return id == "bbb" and { name = "wt1", path = "/proj/.claude/worktrees/wt1", branch = "worktree-wt1" } or nil
+      end
+      open_view()
+      local mark = require("claudecode.agents.render").WORKTREE_MARK
+      expect(center_lines():find(mark, 1, true)).to_be(nil)
+
+      agents_view.cycle_session(1)
+      local text = center_lines()
+      expect(text:find(mark .. " worktree wt1 · worktree-wt1", 1, true) ~= nil).to_be_true()
+      -- Under the title, above what the screen says about the session.
+      expect(text:find("Second", 1, true) < text:find(mark, 1, true)).to_be_true()
+      expect(text:find(mark, 1, true) < text:find("not running", 1, true)).to_be_true()
+    end)
+
     it("starts the offered session when the terminal is focused", function()
       open_view()
       expect(agents_view._state().pending_start).to_be("aaa")

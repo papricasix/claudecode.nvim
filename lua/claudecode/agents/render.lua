@@ -57,6 +57,14 @@ local SELECTED_MARK = "❯"
 local FLAG_MARK = "⚑"
 M.FLAG_MARK = FLAG_MARK
 
+--- What a session working in a git worktree wears, after the flag if it has one:
+--- its changes are in another checkout, on another branch, and nothing else on
+--- the row says so. The same mark sets off a subagent that was given a worktree
+--- of its own in the Tasks pane. U+2387, the branch glyph prompts fall back to
+--- without a patched font: one cell wide and, like the flag, not emoji-capable.
+local WORKTREE_MARK = "⎇"
+M.WORKTREE_MARK = WORKTREE_MARK
+
 --- What sets a flag's note off from the title it follows, and the fewest cells
 --- of note worth drawing — below that it is only an ellipsis.
 local NOTE_SEPARATOR = " · "
@@ -104,6 +112,7 @@ local DEFAULT_HIGHLIGHTS = {
   rewind = "ClaudeCodeAgentsRewind",
   flagged = "ClaudeCodeAgentsFlagged",
   flag_note = "ClaudeCodeAgentsFlagNote",
+  worktree = "ClaudeCodeAgentsWorktree",
 }
 
 local HIGHLIGHT_LINKS = {
@@ -155,6 +164,10 @@ local HIGHLIGHT_LINKS = {
   -- What the flag is for, after the title. Quieter than the title it follows:
   -- the title is what the row is, the note is a remark about it.
   ClaudeCodeAgentsFlagNote = "Comment",
+  -- The mark on a session, or a subagent, working in a git worktree. It says
+  -- where the work is and asks for nothing, so it takes the colour paths are
+  -- drawn in rather than the flag's warning.
+  ClaudeCodeAgentsWorktree = "Directory",
 }
 
 ---Where the panes take their background from.
@@ -589,7 +602,7 @@ end
 
 ---Draw the session list.
 ---@param buf integer
----@param rows table[] `{ session_id, title, last_ts, added, removed, state, icon, hl, selected, live, flag }`
+---@param rows table[] `{ session_id, title, last_ts, added, removed, state, icon, hl, selected, live, flag, worktree }`
 ---@param opts { width: integer?, now: number? }|nil
 function M.sessions(buf, rows, opts)
   opts = opts or {}
@@ -620,7 +633,8 @@ function M.sessions(buf, rows, opts)
     -- multibyte characters whose byte length says nothing about their width.
     local gutter = row.selected and SELECTED_MARK or GUTTER
     local bullet = gutter .. (icon == "" and "" or (icon .. " "))
-    local left_prefix = bullet .. (row.flag and (FLAG_MARK .. " ") or "")
+    local flagged = bullet .. (row.flag and (FLAG_MARK .. " ") or "")
+    local left_prefix = flagged .. (row.worktree and (WORKTREE_MARK .. " ") or "")
     local prefix_width = vim.fn.strdisplaywidth(left_prefix)
     local right_width = vim.fn.strdisplaywidth(right)
     local title, note = M.fit_title(
@@ -645,6 +659,9 @@ function M.sessions(buf, rows, opts)
     end
     if row.flag then
       marks[#marks + 1] = { row = lnum, col = #bullet, end_col = #bullet + #FLAG_MARK, hl = hl("flagged") }
+    end
+    if row.worktree then
+      marks[#marks + 1] = { row = lnum, col = #flagged, end_col = #flagged + #WORKTREE_MARK, hl = hl("worktree") }
     end
     marks[#marks + 1] = { row = lnum, col = #left_prefix, end_col = #left_prefix + #title, hl = hl("title") }
     if note ~= "" then
@@ -1032,7 +1049,13 @@ function M.subagents(buf, rows, opts)
     local is_workflow = row.kind == "workflow"
     local is_shell = row.kind == "shell"
     local is_monitor = is_shell and row.task_type == "monitor"
+    -- A subagent given a worktree of its own (`isolation: "worktree"`): what it
+    -- changes is not in the checkout the session works in.
+    local in_worktree = not is_shell and not is_workflow and row.worktree ~= nil
     local kind_mark = is_workflow and WORKFLOW_MARK or (is_monitor and MONITOR_MARK or SHELL_MARK)
+    if in_worktree then
+      kind_mark = WORKTREE_MARK .. " "
+    end
     -- A monitor's figure is how many events it has delivered; a shell has none.
     local figure = ""
     if is_monitor and row.events then
@@ -1042,7 +1065,7 @@ function M.subagents(buf, rows, opts)
     end
     -- Fixed fields, so every row's numbers line up however deep the tree goes.
     local right = lpad(figure, 5) .. " " .. lpad(subagents.format_runtime(row.runtime_s), 7)
-    local marked = is_shell or is_workflow
+    local marked = is_shell or is_workflow or in_worktree
     local head = GUTTER .. row.prefix .. mark.text .. " " .. (marked and kind_mark or "")
     local room = math.max(1, width - vim.fn.strdisplaywidth(head) - vim.fn.strdisplaywidth(right) - 1)
     local text = row.agent_type or "agent"
@@ -1100,7 +1123,12 @@ function M.subagents(buf, rows, opts)
     end
     if marked then
       local shell_at = mark_at + #mark.text + 1
-      marks[#marks + 1] = { row = lnum, col = shell_at, end_col = shell_at + #kind_mark, hl = hl("time") }
+      marks[#marks + 1] = {
+        row = lnum,
+        col = shell_at,
+        end_col = shell_at + #kind_mark,
+        hl = in_worktree and hl("worktree") or hl("time"),
+      }
     end
     marks[#marks + 1] = {
       row = lnum,

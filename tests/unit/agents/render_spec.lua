@@ -403,6 +403,71 @@ describe("agents.render", function()
       end)
     end)
 
+    describe("a session working in a git worktree", function()
+      local function mark_in(row, group)
+        for _, mark in ipairs(vim._extmarks or {}) do
+          if mark.bufnr == buf and mark.row == row and mark.opts and mark.opts.hl_group == group then
+            return mark
+          end
+        end
+        return nil
+      end
+
+      local WORKTREE = { path = "/proj/.claude/worktrees/wt1", name = "wt1", branch = "worktree-wt1" }
+
+      local function in_worktree(flag)
+        return {
+          {
+            session_id = "aaaa1111",
+            title = "Port upstream",
+            icon = "○",
+            added = 40,
+            removed = 9,
+            worktree = WORKTREE,
+            flag = flag,
+          },
+          { session_id = "bbbb2222", title = "Refactor fade", icon = "○", added = 5, removed = 1 },
+        }
+      end
+
+      it("wears the mark between its bullet and its title, in its own colour", function()
+        render.sessions(buf, in_worktree(nil), { width = 60 })
+        local lines = lines_of(buf)
+        expect(lines[1]:find("○ " .. render.WORKTREE_MARK .. " Port upstream", 1, true) ~= nil).to_be_true()
+        expect(lines[2]:find(render.WORKTREE_MARK, 1, true)).to_be(nil)
+
+        local mark = mark_in(0, "ClaudeCodeAgentsWorktree")
+        expect(mark).not_to_be_nil()
+        expect(lines[1]:sub(mark.col + 1, mark.opts.end_col)).to_be(render.WORKTREE_MARK)
+        expect(mark_in(1, "ClaudeCodeAgentsWorktree")).to_be(nil)
+        -- One cell wide, like the flag: a wider glyph would move the title.
+        expect(vim.fn.strdisplaywidth(render.WORKTREE_MARK)).to_be(1)
+      end)
+
+      it("comes after the flag on a session that has both, each in its own colour", function()
+        render.sessions(buf, in_worktree({ at = 1, note = "check CI" }), { width = 60 })
+        local line = lines_of(buf)[1]
+        local both = "○ " .. render.FLAG_MARK .. " " .. render.WORKTREE_MARK .. " Port upstream · check CI"
+        expect(line:find(both, 1, true) ~= nil).to_be_true()
+
+        local flag = mark_in(0, "ClaudeCodeAgentsFlagged")
+        local worktree = mark_in(0, "ClaudeCodeAgentsWorktree")
+        expect(line:sub(flag.col + 1, flag.opts.end_col)).to_be(render.FLAG_MARK)
+        expect(line:sub(worktree.col + 1, worktree.opts.end_col)).to_be(render.WORKTREE_MARK)
+        -- The title's own span starts after both, so neither mark takes its colour.
+        local title = mark_in(0, "ClaudeCodeAgentsTitle")
+        expect(line:sub(title.col + 1, title.opts.end_col)).to_be("Port upstream")
+      end)
+
+      it("keeps the right-hand columns where every other row has them", function()
+        render.sessions(buf, in_worktree({ at = 1 }), { width = 60 })
+        local lines = lines_of(buf)
+        expect(vim.fn.strdisplaywidth(lines[1])).to_be(60)
+        expect(vim.fn.strdisplaywidth(lines[1])).to_be(vim.fn.strdisplaywidth(lines[2]))
+        expect(lines[1]:sub(1, 1)).to_be(" ")
+      end)
+    end)
+
     describe("fitting a title and a flag's note into one row", function()
       it("draws both whole when there is room", function()
         local title, note = render.fit_title("Port upstream", "check CI", 40)
@@ -870,6 +935,48 @@ describe("agents.render", function()
         expect(vim.fn.strdisplaywidth(line)).to_be(40)
       end
       expect(render.payload_at(pane, 2).agent_id).to_be("b")
+    end)
+
+    it("marks a subagent that was given a worktree of its own", function()
+      -- `isolation: "worktree"`: what it changes is in another checkout than the
+      -- session's, which the session row's own mark would not say.
+      render.subagents(pane, {
+        {
+          kind = "subagent",
+          id = "a",
+          agent_type = "general-purpose",
+          prefix = "",
+          state = "running",
+          tokens = 1200,
+          runtime_s = 5,
+          worktree = "/proj/.claude/worktrees/agent-a",
+        },
+        {
+          kind = "subagent",
+          id = "b",
+          agent_type = "Explore",
+          prefix = "",
+          state = "done",
+          tokens = 100,
+          runtime_s = 5,
+        },
+      }, { width = 40 })
+
+      local lines = lines_of(pane)
+      expect(lines[1]:find("● " .. render.WORKTREE_MARK .. " general-purpose", 1, true) ~= nil).to_be_true()
+      expect(lines[2]:find(render.WORKTREE_MARK, 1, true)).to_be(nil)
+      -- The numbers stay in their columns.
+      expect(vim.fn.strdisplaywidth(lines[1])).to_be(40)
+      expect(vim.fn.strdisplaywidth(lines[2])).to_be(40)
+
+      local found = nil
+      for _, mark in ipairs(vim._extmarks or {}) do
+        if mark.bufnr == pane and mark.row == 0 and mark.opts.hl_group == "ClaudeCodeAgentsWorktree" then
+          found = mark
+        end
+      end
+      expect(found).not_to_be_nil()
+      expect(lines[1]:sub(found.col + 1, found.col + #render.WORKTREE_MARK)).to_be(render.WORKTREE_MARK)
     end)
 
     it("draws a checkpoint as a rule across the tree", function()
