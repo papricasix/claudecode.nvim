@@ -330,6 +330,125 @@ describe("agents.render", function()
       render.sessions(buf, {}, { width = 40 })
       expect(lines_of(buf)[1]:find("no sessions", 1, true) ~= nil).to_be_true()
     end)
+
+    describe("a flagged session", function()
+      local function mark_in(row, group)
+        for _, mark in ipairs(vim._extmarks or {}) do
+          if mark.bufnr == buf and mark.row == row and mark.opts and mark.opts.hl_group == group then
+            return mark
+          end
+        end
+        return nil
+      end
+
+      local function flagged(note)
+        return {
+          {
+            session_id = "aaaa1111",
+            title = "Port upstream",
+            icon = "○",
+            added = 40,
+            removed = 9,
+            flag = { at = 1, note = note },
+          },
+          { session_id = "bbbb2222", title = "Refactor fade", icon = "○", added = 5, removed = 1 },
+        }
+      end
+
+      it("wears the mark between its bullet and its title, in its own colour", function()
+        render.sessions(buf, flagged(nil), { width = 60 })
+        local lines = lines_of(buf)
+        -- Beside the bullet, not instead of it: flagged and busy are both true of
+        -- a row, and the bullet is the only thing saying the second.
+        expect(lines[1]:find("○ " .. render.FLAG_MARK .. " Port upstream", 1, true) ~= nil).to_be_true()
+        expect(lines[2]:find(render.FLAG_MARK, 1, true)).to_be(nil)
+
+        local mark = mark_in(0, "ClaudeCodeAgentsFlagged")
+        expect(mark).not_to_be_nil()
+        expect(lines[1]:sub(mark.col + 1, mark.opts.end_col)).to_be(render.FLAG_MARK)
+        expect(mark_in(1, "ClaudeCodeAgentsFlagged")).to_be(nil)
+      end)
+
+      it("still begins with the blank cell", function()
+        -- The mark must not move into column 1, where word-highlight plugins
+        -- would light up every other flagged row with it.
+        render.sessions(buf, flagged(nil), { width = 60 })
+        expect(lines_of(buf)[1]:sub(1, 1)).to_be(" ")
+      end)
+
+      it("keeps the right-hand columns where every other row has them", function()
+        render.sessions(buf, flagged("check CI"), { width = 60 })
+        local lines = lines_of(buf)
+        expect(vim.fn.strdisplaywidth(lines[1])).to_be(vim.fn.strdisplaywidth(lines[2]))
+        local function column(line, text)
+          return vim.fn.strdisplaywidth(line:sub(1, line:find(text, 1, true) - 1))
+        end
+        expect(column(lines[1], "+40")).to_be(column(lines[2], "+5") - 1)
+      end)
+
+      it("says what the flag is for after the title, more quietly", function()
+        render.sessions(buf, flagged("check CI"), { width = 60 })
+        local line = lines_of(buf)[1]
+        expect(line:find("Port upstream · check CI", 1, true) ~= nil).to_be_true()
+
+        local note = mark_in(0, "ClaudeCodeAgentsFlagNote")
+        expect(note).not_to_be_nil()
+        expect(line:sub(note.col + 1, note.opts.end_col)).to_be(" · check CI")
+      end)
+
+      it("draws no note for a flag that has none", function()
+        render.sessions(buf, flagged(nil), { width = 60 })
+        expect(lines_of(buf)[1]:find("·", 1, true)).to_be(nil)
+        expect(mark_in(0, "ClaudeCodeAgentsFlagNote")).to_be(nil)
+      end)
+    end)
+
+    describe("fitting a title and a flag's note into one row", function()
+      it("draws both whole when there is room", function()
+        local title, note = render.fit_title("Port upstream", "check CI", 40)
+        expect(title).to_be("Port upstream")
+        expect(note).to_be(" · check CI")
+      end)
+
+      it("is just the title without a note", function()
+        local title, note = render.fit_title("Port upstream", nil, 40)
+        expect(title).to_be("Port upstream")
+        expect(note).to_be("")
+        title, note = render.fit_title("Port upstream", "", 40)
+        expect(title).to_be("Port upstream")
+        expect(note).to_be("")
+      end)
+
+      it("does not let a long title squeeze the note out", function()
+        -- Generated titles fill the pane, and "whatever is left over" was nothing:
+        -- the note is what the flag is *for*.
+        local title, note = render.fit_title("Add session todo flags to the agents view", "check CI", 30)
+        expect(note).to_be(" · check CI")
+        expect(vim.fn.strdisplaywidth(title .. note)).to_be(30)
+        expect(title:sub(1, 10)).to_be("Add sessio")
+      end)
+
+      it("hands a short title's spare cells to a long note", function()
+        local title, note = render.fit_title("Fix", "the reviewer asked for three changes before this can merge", 30)
+        expect(title).to_be("Fix")
+        expect(vim.fn.strdisplaywidth(title .. note)).to_be(30)
+      end)
+
+      it("cuts both when neither fits, the title keeping the larger share", function()
+        local title, note = render.fit_title(string.rep("t", 40), string.rep("n", 40), 30)
+        expect(vim.fn.strdisplaywidth(title .. note)).to_be(30)
+        -- 15 cells of title, 12 of note, and the separator between them.
+        expect(vim.fn.strdisplaywidth(title)).to_be(15)
+        expect(vim.fn.strdisplaywidth(note)).to_be(3 + 12)
+      end)
+
+      it("drops the note in a pane too narrow for both", function()
+        -- The mark still says the row is flagged.
+        local title, note = render.fit_title("Port upstream", "check CI", 12)
+        expect(note).to_be("")
+        expect(vim.fn.strdisplaywidth(title)).to_be(12)
+      end)
+    end)
   end)
 
   describe("activity pane", function()

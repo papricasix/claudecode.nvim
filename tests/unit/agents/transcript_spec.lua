@@ -620,6 +620,144 @@ describe("agents.transcript", function()
     end)
   end)
 
+  describe("replies", function()
+    -- What a flag waiting for a reply is settled against. Every line here is
+    -- spelled the way the CLI writes it — key order included, since the fold
+    -- reads these raw — with the shapes copied from real transcripts and the
+    -- contents made up.
+    local T1, T2, T3 = "2026-08-02T10:00:00.000Z", "2026-08-02T11:00:00.000Z", "2026-08-02T12:00:00.000Z"
+
+    local function epoch(ts)
+      return transcript._iso_to_epoch(ts)
+    end
+
+    ---A prompt sent as a turn. `parent` differs per line: two prompts naming
+    ---one parent are a rewind.
+    local function typed(ts, parent, text)
+      return '{"parentUuid":"'
+        .. parent
+        .. '","isSidechain":false,"promptId":"pr","type":"user","message":{"role":"user","content":"'
+        .. (text or "carry on")
+        .. '"},"uuid":"u-'
+        .. parent
+        .. '","timestamp":"'
+        .. ts
+        .. '","permissionMode":"auto","origin":{"kind":"human"},"promptSource":"typed","cwd":"/proj"}'
+    end
+
+    ---A prompt typed while Claude was working: an attachment, never a `user` entry.
+    local function queued(ts)
+      return '{"parentUuid":"q","isSidechain":false,"attachment":{"type":"queued_command","prompt":"also do this",'
+        .. '"source_uuid":"s","commandMode":"prompt","origin":{"kind":"human"},"timestamp":"'
+        .. ts
+        .. '","humanTurn":true},"type":"attachment","uuid":"a","timestamp":"'
+        .. ts
+        .. '","cwd":"/proj"}'
+    end
+
+    ---A tool result whose `toolUseResult` is `result` (raw JSON), failed or not.
+    local function result(ts, raw, is_error)
+      return '{"parentUuid":"r","isSidechain":false,"promptId":"pr","type":"user","message":{"role":"user","content":'
+        .. '[{"type":"tool_result","content":"said to the model",'
+        .. (is_error and '"is_error":true,' or "")
+        .. '"tool_use_id":"toolu_01"}]},"uuid":"u-r","timestamp":"'
+        .. ts
+        .. '","toolUseResult":'
+        .. raw
+        .. ',"sourceToolAssistantUUID":"x","cwd":"/proj"}'
+    end
+
+    local ANSWERED = '{"questions":[{"header":"Kind","multiSelect":false,"options":[{"description":"d","label":"One"}],'
+      .. '"question":"One kind or two?"}],"answers":{"One kind or two?":"Two"},"annotations":{}}'
+    local APPROVED = '{"plan":"# The plan\\n\\nDo it.","isAgent":false,"filePath":"/proj/plan.md"}'
+    local REJECTED = "\"Error: The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a "
+      .. "file edit, the new_string was NOT written to the file)."
+    local WORDED = REJECTED .. ' To tell you how to proceed, the user said:\\nnot like that, keep the old name"'
+    local BARE = REJECTED .. ' STOP what you are doing and wait for the user to tell you how to proceed."'
+
+    it("is nothing until the user has said something", function()
+      -- Everything the harness writes in the user's name, and a tool returning.
+      put("/p/a.jsonl", {
+        edit_line("/proj/x.lua", 1, 0, T1),
+        '{"parentUuid":"n","type":"user","message":{"role":"user","content":"<task-notification>\\n<task-id>b1</task-id>'
+          .. '\\n<status>completed</status>\\n</task-notification>"},"timestamp":"'
+          .. T2
+          .. '","origin":{"kind":"task-notification","producer":"session-task"},"promptSource":"system"}',
+        '{"parentUuid":"m","type":"user","message":{"role":"user","content":[{"type":"text","text":"Base directory for'
+          .. ' this skill: /x"}]},"isMeta":true,"timestamp":"'
+          .. T2
+          .. '"}',
+        '{"parentUuid":"i","type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted'
+          .. ' by user]"}]},"timestamp":"'
+          .. T3
+          .. '"}',
+      })
+      expect(fold("/p/a.jsonl").last_reply_ts).to_be(0)
+    end)
+
+    it("is a prompt the user typed", function()
+      put("/p/a.jsonl", { typed(T1, "p1"), edit_line("/proj/x.lua", 1, 0, T2) })
+      expect(fold("/p/a.jsonl").last_reply_ts).to_be(epoch(T1))
+    end)
+
+    it("is a prompt typed while Claude was working, which is only ever an attachment", function()
+      put("/p/a.jsonl", { typed(T1, "p1"), edit_line("/proj/x.lua", 1, 0, T2), queued(T3) })
+      expect(fold("/p/a.jsonl").last_reply_ts).to_be(epoch(T3))
+    end)
+
+    it("is a question answered, and not one declined", function()
+      put("/p/a.jsonl", { result(T2, ANSWERED) })
+      local sum = fold("/p/a.jsonl")
+      expect(sum.last_reply_ts).to_be(epoch(T2))
+      -- Recognised by how the result begins: nothing is decoded for it.
+      expect(decodes).to_be(0)
+
+      put("/p/b.jsonl", { result(T2, '"User rejected tool use"', true) })
+      expect(fold("/p/b.jsonl").last_reply_ts).to_be(0)
+    end)
+
+    it("is a plan approved", function()
+      put("/p/a.jsonl", { result(T2, APPROVED) })
+      expect(fold("/p/a.jsonl").last_reply_ts).to_be(epoch(T2))
+    end)
+
+    it("is a call turned down with words, and not one merely turned down", function()
+      -- How a plan is answered with a correction. After a bare rejection the
+      -- conversation is still waiting for the user.
+      put("/p/a.jsonl", { result(T2, WORDED, true) })
+      expect(fold("/p/a.jsonl").last_reply_ts).to_be(epoch(T2))
+
+      put("/p/b.jsonl", { result(T2, BARE, true) })
+      expect(fold("/p/b.jsonl").last_reply_ts).to_be(0)
+    end)
+
+    it("is not a result that only quotes one of these", function()
+      -- Reading a transcript — which is what working on this very code does —
+      -- returns all of the above as text.
+      put("/p/a.jsonl", {
+        result(T1, '"Error: Exit code 1\\nTo tell you how to proceed, the user said:\\nno"', true),
+        result(T2, vim.json.encode({ stdout = '"origin":{"kind":"human"} "toolUseResult":{"plan":"x"}', stderr = "" })),
+        vim.json.encode({
+          type = "assistant",
+          timestamp = T3,
+          message = { role = "assistant", content = 'a typed prompt carries "origin":{"kind":"human"}' },
+        }),
+      })
+      expect(fold("/p/a.jsonl").last_reply_ts).to_be(0)
+    end)
+
+    it("keeps the newest, and moves when the conversation is answered again", function()
+      put("/p/a.jsonl", { typed(T2, "p1"), result(T1, ANSWERED) })
+      expect(fold("/p/a.jsonl").last_reply_ts).to_be(epoch(T2))
+
+      append("/p/a.jsonl", { edit_line("/proj/x.lua", 1, 0, T3) })
+      expect(fold("/p/a.jsonl").last_reply_ts).to_be(epoch(T2))
+
+      append("/p/a.jsonl", { typed(T3, "p2", "and now this") })
+      expect(fold("/p/a.jsonl").last_reply_ts).to_be(epoch(T3))
+    end)
+  end)
+
   describe("incremental folding", function()
     it("reads only the appended bytes on a second pass", function()
       put("/p/a.jsonl", { edit_line("/proj/x.lua", 5, 1) })

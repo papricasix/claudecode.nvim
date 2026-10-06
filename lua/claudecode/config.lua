@@ -182,6 +182,14 @@ M.defaults = {
       -- `gf` opens a file in the other two panes, and no pane offers both.
       search = "gf",
       sort = "gs", -- sessions pane: choose what the list is ordered by (it does not re-sort itself)
+      -- Sessions pane: flag the session under the cursor so it is not forgotten,
+      -- or unflag it. A flag survives being looked at (unlike the unread dot);
+      -- your next reply to that session takes it off. `:ClaudeCodeAgentsFlag`
+      -- does the same for the selected session.
+      flag = "m",
+      -- The same with a note saying what for. A flag with a note stays until you
+      -- take it off; a reply does not end it.
+      flag_note = "M",
       close = "q",
       open = "<CR>", -- open the file under the cursor (Activity / Changes panes)
       git_diff = ".", -- diff that file against git HEAD (svn BASE) instead of against the session
@@ -230,6 +238,10 @@ M.defaults = {
       -- The rule a rewind (`/rewind`, Esc Esc) leaves in Activity; defaults to a
       -- link to DiagnosticWarn.
       rewind = "ClaudeCodeAgentsRewind",
+      -- The mark on a flagged session; defaults to a link to DiagnosticWarn.
+      flagged = "ClaudeCodeAgentsFlagged",
+      -- The note after a flagged session's title; defaults to a link to Comment.
+      flag_note = "ClaudeCodeAgentsFlagNote",
       -- Terminal pane background: follows SnacksNormal when snacks is loaded,
       -- else NormalFloat. The sidebars keep the editor's own Normal.
       normal = "ClaudeCodeAgentsNormal",
@@ -708,6 +720,8 @@ function M.validate(config)
         "refresh",
         "search",
         "sort",
+        "flag",
+        "flag_note",
         "close",
         "open",
         "git_diff",
@@ -751,6 +765,8 @@ function M.validate(config)
         "prompt",
         "checkpoint",
         "rewind",
+        "flagged",
+        "flag_note",
       }
       for _, field in ipairs(highlight_fields) do
         checker(ag.highlights, "agents.highlights")(field, function(v)

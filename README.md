@@ -203,6 +203,7 @@ Configure the plugin with the detected path:
 - `:ClaudeCodePlanView [on|off]` - Toggle showing Claude's plan-mode plan in an editor split (see [Plan View](#plan-view))
 - `:ClaudeCodeAgents [on|off]` - Toggle the agents view: several Claudes on one project, side by side (see [Agents Mode](#agents-mode))
 - `:ClaudeCodeAgentsCheckpoint[!]` - Draw a line through the selected agent session's history, so what it does from now on is listed apart from what it did before; with `!`, drop its newest checkpoint
+- `:ClaudeCodeAgentsFlag[!] [note]` - Flag the selected agent session so it is not forgotten, or unflag it; your next reply to it takes the flag off. With a note, the flag stays until removed; with `!`, unflag
 - `:ClaudeCodeAgentNew` - Start a new agent in the agents view
 - `:checkhealth claudecode` - Report the prerequisites (Neovim version, Claude CLI, terminal provider) and every running instance's port, lock file and connection
 
@@ -298,6 +299,9 @@ there too.
   the query, for as long as the view is open.
 - `dd` deletes the session under the cursor after a confirmation dialog (a snacks.nvim float when you have it, `vim.fn.confirm` otherwise). This removes the conversation's transcript from disk, so it is gone for good and can no longer be resumed — from here or from the CLI. A session whose agent is still running is refused; stop it with `x` first.
 - **Several at once**: `dd` takes a count (`3dd` deletes three rows from the cursor down), and `d` over a visual selection deletes every session the selection covers. One dialog for the whole batch, naming the first few and counting the rest. A running agent inside the range is left alone rather than vetoing the gesture — the dialog says how many were skipped and which key stops them.
+- `m` **flags the session under the cursor** so you do not forget to come back to it: a `⚑` between its bullet and its title, and a count in the pane's title (`Sessions · ⚑ 2`). Unlike the unread dot, a flag survives being looked at. It comes off when you **answer that conversation** — a prompt you type (also one typed while Claude is still working), a question you answer, a plan you approve, or a call you turn down with a correction — wherever you do it: here, in another tab, or in a plain terminal. Approving a permission prompt does not count, and neither does anything the harness writes on your behalf. `m` again takes it off by hand.
+- `M` flags it **with a note** saying what for — `⚑ Port upstream · check CI` — and that flag **stays until you take it off**: "review before merging" is not done because you sent a follow-up. The note is cut to fit the row; `M` again shows it whole and lets you change it, and the centre pane shows it in full for a session that is not running. An empty note leaves a plain flag. `:ClaudeCodeAgentsFlag` does the same for the selected session, which is what to map if you want it from inside the agent's terminal.
+- A flagged session **stays listed however old it is** (the list otherwise reaches back two weeks), and sorting by status puts flagged ones first. Flags belong to the conversation, not the view: they survive restarting Neovim, are shared between Neovims, and go with the conversation when it is deleted.
 - Switching agents leaves the previous one **running**. That is the point: start
   three, come back to whichever finishes first.
 - `<C-n>` and `<C-p>` move through the session list from anywhere in the tab —
@@ -532,6 +536,8 @@ opts = {
       select = "<CR>", new = "a", stop = "x", delete = "dd", refresh = "r",
       search = "gf",              -- search the conversations (sessions pane)
       sort = "gs",                -- sessions pane: choose what the list is ordered by
+      flag = "m",                 -- sessions pane: flag / unflag (your next reply unflags)
+      flag_note = "M",            -- flag with a note; stays until you take it off
       close = "q", open = "<CR>", git_diff = ".", goto_file = "gf", help = "?",
       filter = "f",               -- Activity: everything / files / commands
       subagent_label = "g.",      -- Tasks: description / agent type or command
@@ -572,6 +578,9 @@ opts = {
     --     selected = "ClaudeCodeAgentsSelected", -- CursorLine
     --     checkpoint = "ClaudeCodeAgentsCheckpoint", -- Comment (the rule a checkpoint
     --                                            -- draws through a pane)
+    --     flagged = "ClaudeCodeAgentsFlagged",   -- DiagnosticWarn (the ⚑ on a flagged
+    --                                            -- session)
+    --     flag_note = "ClaudeCodeAgentsFlagNote", -- Comment (the note after its title)
     --     header = "ClaudeCodeAgentsHelpHeader", -- Title
     --     key = "ClaudeCodeAgentsKey",           -- Special
     --   }

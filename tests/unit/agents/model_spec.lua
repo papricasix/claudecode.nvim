@@ -4,6 +4,7 @@ require("tests.busted_setup")
 describe("agents.model", function()
   local model
   local checkpoints
+  local flags
   local summaries -- [path] = summary handed back by the stubbed transcript
   local scans -- paths passed to transcript.summary, in order
   local live -- conversations the stubbed registry reports as running
@@ -149,6 +150,25 @@ describe("agents.model", function()
         return nil
       end,
       write = function() end,
+    }
+
+    -- Flags likewise, but theirs has to hold what it is given: the store is read
+    -- back before every change, through the decoder the mock only stubs.
+    vim.json.decode = _G.json_decode
+    local flag_store = nil
+    flags = require("claudecode.agents.flags")
+    flags.reset()
+    flags._io = {
+      read = function()
+        return flag_store
+      end,
+      write = function(_, data)
+        flag_store = data
+        return true
+      end,
+      stat = function()
+        return flag_store
+      end,
     }
 
     -- The vim mock runs defer_fn immediately, which would defeat every assertion
@@ -471,6 +491,169 @@ describe("agents.model", function()
       model.pin("elsewhere", { path = "/other/elsewhere.jsonl", cwd = "/other" })
       expect(ids_now().elsewhere).to_be_true()
       expect(model.row("elsewhere").cwd).to_be("/other")
+    end)
+  end)
+
+  describe("flags", function()
+    local DAY = 24 * 60 * 60
+    local NOW = 1700000000
+
+    local function row_of(id)
+      for _, row in ipairs(model.rows()) do
+        if row.session_id == id then
+          return row
+        end
+      end
+      return nil
+    end
+
+    ---How often a transcript has been handed to the fold.
+    local function scans_of(id)
+      local count = 0
+      for _, path in ipairs(scans) do
+        if path == "/p/" .. id .. ".jsonl" then
+          count = count + 1
+        end
+      end
+      return count
+    end
+
+    before_each(function()
+      model._set_epoch_clock(function()
+        return NOW
+      end)
+      -- `size`/`mtime` as the fold left them, matching what the stubbed listing
+      -- reports: these transcripts have not grown since.
+      summaries.aaa = summary_for("aaa", { size = 1, mtime = NOW - DAY, last_reply_ts = NOW - DAY })
+      summaries.bbb = summary_for("bbb", { size = 1, mtime = NOW - DAY, last_reply_ts = NOW - DAY })
+      model.attach(1, "/proj")
+    end)
+
+    it("puts a flag on a row and takes it off again", function()
+      expect(row_of("aaa").flag).to_be(nil)
+      expect(model.flag_count()).to_be(0)
+
+      local flag = model.toggle_flag("aaa")
+      expect(flag.at).to_be(NOW)
+      expect(row_of("aaa").flag.at).to_be(NOW)
+      expect(row_of("bbb").flag).to_be(nil)
+      expect(model.flag_count()).to_be(1)
+
+      expect(model.toggle_flag("aaa")).to_be(nil)
+      expect(row_of("aaa").flag).to_be(nil)
+      expect(model.flag_count()).to_be(0)
+    end)
+
+    it("carries the note of a flag that has one", function()
+      model.set_flag("aaa", "review before merging")
+      expect(row_of("aaa").flag.note).to_be("review before merging")
+      expect(model.flag_of("aaa").note).to_be("review before merging")
+    end)
+
+    it("survives the row being selected and read", function()
+      -- The whole difference from the unread dot, which selecting clears.
+      model.toggle_flag("aaa")
+      model.select("aaa")
+      model.poll()
+      tick()
+      expect(row_of("aaa").flag.at).to_be(NOW)
+    end)
+
+    it("ends a bare flag when the user answers the conversation", function()
+      model.toggle_flag("aaa")
+      model.select("aaa")
+
+      summaries.aaa.last_reply_ts = NOW + 60
+      model.poll()
+      tick()
+
+      expect(row_of("aaa").flag).to_be(nil)
+      expect(flags.get("aaa")).to_be(nil)
+    end)
+
+    it("keeps a flag with a note through any number of replies", function()
+      model.set_flag("aaa", "review before merging")
+      model.select("aaa")
+
+      summaries.aaa.last_reply_ts = NOW + 60
+      model.poll()
+      tick()
+
+      expect(row_of("aaa").flag.note).to_be("review before merging")
+    end)
+
+    it("notices a reply given somewhere else, to a conversation that is neither selected nor running", function()
+      -- Answered from a bare terminal or another editor. Nothing else re-reads
+      -- such a row, so without this its flag would outlive the reply until the
+      -- row was next selected.
+      model.toggle_flag("bbb")
+      model.refresh_list()
+      expect(scans_of("bbb")).to_be(0) -- the transcript has not moved
+
+      summaries.bbb.last_reply_ts = NOW + 60
+      summaries.bbb.size = 0 -- as last folded; the listing now reports more
+      model.refresh_list()
+
+      expect(scans_of("bbb")).to_be(1)
+      expect(row_of("bbb").flag).to_be(nil)
+    end)
+
+    it("re-reads no transcript for a flag's sake unless a reply could end it", function()
+      model.set_flag("aaa", "stays whatever is said")
+      summaries.aaa.size = 0
+      summaries.bbb.size = 0 -- grown, but not flagged
+      model.refresh_list()
+      expect(scans_of("aaa")).to_be(0)
+      expect(scans_of("bbb")).to_be(0)
+    end)
+
+    it("keeps a flagged conversation listed however old it is, and lets it go with the flag", function()
+      -- A flag that aged out of the list would be a reminder nobody is reminded by.
+      summaries.old = summary_for("old", { size = 1, mtime = NOW - 60 * DAY })
+      model.refresh_list()
+      expect(row_of("old")).to_be(nil)
+
+      flags.set("old", "do not lose this", NOW)
+      model.refresh_list()
+      expect(row_of("old").flag.note).to_be("do not lose this")
+
+      model.clear_flag("old")
+      expect(row_of("old")).to_be(nil)
+      expect(model.hidden_count()).to_be(1)
+    end)
+
+    it("takes in a flag another Neovim set, on the list's own refresh", function()
+      expect(row_of("aaa").flag).to_be(nil)
+      flags._io.write(nil, _G.json_encode({ version = 1, sessions = { aaa = { at = NOW, note = "from over there" } } }))
+      model.refresh_list()
+      expect(row_of("aaa").flag.note).to_be("from over there")
+    end)
+
+    it("sorts flagged conversations first by status, without moving them otherwise", function()
+      local function ids()
+        local out = {}
+        for _, row in ipairs(model.rows()) do
+          out[#out + 1] = row.session_id
+        end
+        return table.concat(out, ",")
+      end
+      live.aaa = true -- idle and running outranks stopped
+      model.set_sort("status")
+      expect(ids()).to_be("aaa,bbb")
+
+      -- The order is frozen: a flag does not make a row jump.
+      model.toggle_flag("bbb")
+      expect(ids()).to_be("aaa,bbb")
+
+      -- Until the list is sorted again, where the flag outranks any status.
+      model.resort()
+      expect(ids()).to_be("bbb,aaa")
+    end)
+
+    it("drops the flag of a conversation that is deleted", function()
+      model.set_flag("aaa", "review")
+      expect(model.delete_session("aaa")).to_be_true()
+      expect(flags.get("aaa")).to_be(nil)
     end)
   end)
 

@@ -419,6 +419,16 @@ local function subagents_title()
   return subagent_label() == "type" and "Tasks · type/command" or "Tasks"
 end
 
+---The Sessions pane's winbar: how many of the listed conversations are flagged,
+---when any are. A flag is a reminder, and the row carrying it may be a screenful
+---down the list — the title is the one line of the pane that is always in view.
+---@param flagged integer|nil Counted from the model when the caller has no rows in hand.
+---@return string
+local function sessions_title(flagged)
+  flagged = flagged or (model.flag_count and model.flag_count()) or 0
+  return flagged > 0 and string.format("Sessions · %s %d", render.FLAG_MARK, flagged) or "Sessions"
+end
+
 ---The pane sizes the config asks for, in cells.
 ---
 ---One place, because a fresh build and a `VimResized` must agree: the defaults
@@ -502,7 +512,8 @@ local function build_layout()
       tag_window(win, pane)
     end
   end
-  apply_marker(state.wins.sessions, "Sessions")
+  state.sessions_title = sessions_title()
+  apply_marker(state.wins.sessions, state.sessions_title)
   apply_marker(state.wins.feed, "Activity")
   apply_marker(state.wins.changes, "Changes")
   apply_marker(state.wins.subagents, subagents_title())
@@ -701,6 +712,27 @@ local KEY_SPECS = {
     desc = "Choose how the session list is ordered",
     run = function()
       M.show_sort_menu()
+    end,
+  },
+  {
+    field = "flag",
+    -- The sessions pane alone, and the row under the cursor like `x` and `dd`
+    -- rather than the selection: flagging is done while reading down the list,
+    -- to rows that are not the one on screen.
+    panes = { "sessions" },
+    group = "Sessions",
+    desc = "Flag this session so it is not forgotten, or unflag it (your next reply to it takes the flag off)",
+    run = function()
+      M.flag_under_cursor()
+    end,
+  },
+  {
+    field = "flag_note",
+    panes = { "sessions" },
+    group = "Sessions",
+    desc = "Flag it with a note saying what for — that flag stays until you take it off",
+    run = function()
+      M.note_flag_under_cursor()
     end,
   },
   {
@@ -1090,6 +1122,14 @@ local function show_start_prompt(session_id)
   local marks = {
     { row = 1, col = 0, end_col = -1, hl = (opts().highlights and opts().highlights.title) or "ClaudeCodeAgentsTitle" },
   }
+  -- Why the conversation is flagged, in full: the row has room for a few words
+  -- of the note at best, and this screen is where a stopped session is read
+  -- before deciding to reopen it.
+  local flag = model.flag_of and model.flag_of(session_id)
+  if flag then
+    table.insert(lines, 3, "  " .. render.FLAG_MARK .. " " .. (flag.note or "flagged until you reply"))
+    marks[#marks + 1] = { row = 2, col = 0, end_col = -1, hl = render.highlight("flagged") }
+  end
   local hints
   if foreign_state then
     lines[#lines + 1] = "  This conversation is running in another tab."
@@ -2181,6 +2221,19 @@ function M.redraw()
       width = vim.api.nvim_win_get_width(sessions_win),
       now = os.time(),
     })
+    -- The title counts the flags among the rows just drawn. Set only when it
+    -- changes: this is the frame tick, and a winbar write is a window redraw.
+    local flagged = 0
+    for _, row in ipairs(rows) do
+      if row.flag then
+        flagged = flagged + 1
+      end
+    end
+    local title = sessions_title(flagged)
+    if title ~= state.sessions_title then
+      state.sessions_title = title
+      apply_marker(sessions_win, title)
+    end
 
     -- The cursor follows the selection whenever the selection has moved since it
     -- was last placed — including the case where it could not be placed at the
@@ -3332,6 +3385,79 @@ function M.cycle_feed_filter()
   local filter = model.cycle_feed_filter()
   M.redraw()
   vim.notify("ClaudeCode: activity — " .. filter.desc, vim.log.levels.INFO)
+end
+
+---Flag the session under the cursor so it is not forgotten, or take its flag
+---off (see `agents/flags.lua`).
+---
+---No message either way: the mark appearing on the row, or leaving it, is the
+---answer, and it is on the line the cursor is on.
+---@return boolean acted false when the cursor is not on a session.
+function M.flag_under_cursor()
+  local payload = payload_under_cursor()
+  if not payload or not payload.session_id then
+    return false
+  end
+  model.toggle_flag(payload.session_id)
+  M.redraw()
+  return true
+end
+
+---Ask what a session is flagged for, and flag it with the answer.
+---
+---The prompt opens on the note the flag already has, which also makes this the
+---way to read one the row had no room for. An empty answer is still an answer:
+---it leaves a bare flag, the kind the next reply takes off.
+---@param session_id string
+---@return boolean asked
+local function ask_flag_note(session_id)
+  local flag = model.flag_of(session_id)
+  return require("claudecode.agents.input").ask({
+    title = "Flag — what for? (empty: until you reply)",
+    default = flag and flag.note or "",
+    width = 60,
+  }, function(text)
+    if text == nil then
+      return
+    end
+    model.set_flag(session_id, text)
+    M.redraw()
+  end)
+end
+
+---Flag the session under the cursor with a note.
+---@return boolean asked false when the cursor is not on a session.
+function M.note_flag_under_cursor()
+  local payload = payload_under_cursor()
+  if not payload or not payload.session_id then
+    return false
+  end
+  return ask_flag_note(payload.session_id)
+end
+
+---Flag the selected session — what `:ClaudeCodeAgentsFlag` does.
+---
+---The selected session rather than the row under the cursor, unlike the pane's
+---keys: a command is typed (or mapped) from the agent's terminal, where the
+---session on screen is the only one "this" can mean.
+---@param flag_opts { note: string|nil, clear: boolean|nil }|nil A note flags it with that note; `clear` takes the flag off; neither toggles.
+---@return boolean acted false when no session is selected.
+function M.flag(flag_opts)
+  flag_opts = flag_opts or {}
+  local session_id = model.selected()
+  if not session_id then
+    vim.notify("ClaudeCode: no session selected to flag", vim.log.levels.WARN)
+    return false
+  end
+  if flag_opts.clear then
+    model.clear_flag(session_id)
+  elseif type(flag_opts.note) == "string" and flag_opts.note:find("%S") then
+    model.set_flag(session_id, flag_opts.note)
+  else
+    model.toggle_flag(session_id)
+  end
+  M.redraw()
+  return true
 end
 
 ---Checkpoint the selected session: draw a line through its history, so what it

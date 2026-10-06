@@ -987,6 +987,14 @@ function M._create_commands()
     desc = "Draw a line through the selected agent session's history: what it does from now on is listed apart from what it did before (with !: drop its newest checkpoint)",
   })
 
+  vim.api.nvim_create_user_command("ClaudeCodeAgentsFlag", function(opts)
+    require("claudecode.agents_view").flag({ note = opts.args, clear = opts.bang })
+  end, {
+    bang = true,
+    nargs = "*",
+    desc = "Flag the selected agent session so it is not forgotten, or unflag it; your next reply takes the flag off. With text: flag it with that note, which stays until removed (with !: unflag)",
+  })
+
   vim.api.nvim_create_user_command("ClaudeCodeAgentNew", function()
     local agents = require("claudecode.agents_view")
     if not agents.is_open() then

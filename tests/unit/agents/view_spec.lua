@@ -110,6 +110,17 @@ describe("agents_view", function()
       expect((pcall(config.validate, base_config({ highlights = { checkpoint = 1 } })))).to_be(false)
     end)
 
+    it("takes keymaps and highlights for flags", function()
+      expect(config.defaults.agents.keymaps.flag).to_be("m")
+      expect(config.defaults.agents.keymaps.flag_note).to_be("M")
+      expect((pcall(config.validate, base_config({ keymaps = { flag = "!", flag_note = false } })))).to_be_true()
+      expect((pcall(config.validate, base_config({ keymaps = { flag = 42 } })))).to_be(false)
+      expect((pcall(config.validate, base_config({ keymaps = { flag_note = {} } })))).to_be(false)
+      expect((pcall(config.validate, base_config({ highlights = { flagged = "Todo", flag_note = "NonText" } })))).to_be_true()
+      expect((pcall(config.validate, base_config({ highlights = { flagged = 1 } })))).to_be(false)
+      expect((pcall(config.validate, base_config({ highlights = { flag_note = true } })))).to_be(false)
+    end)
+
     it("rejects a non-table block", function()
       expect((pcall(config.validate, base_config("yes please")))).to_be(false)
     end)
@@ -1791,6 +1802,17 @@ describe("agents_view", function()
       expect(keys_for("sessions")["a"]).to_be("Start a new agent")
     end)
 
+    it("offers the flag keys from the sessions pane alone", function()
+      -- They act on the row under the cursor, and only this pane has session rows.
+      setup_with({ enabled = true })
+      expect(keys_for("sessions")["m"]:find("Flag this session", 1, true) ~= nil).to_be_true()
+      expect(keys_for("sessions")["M"]:find("note", 1, true) ~= nil).to_be_true()
+      for _, pane in ipairs({ "feed", "changes", "subagents", "center" }) do
+        expect(keys_for(pane)["m"]).to_be(nil)
+        expect(keys_for(pane)["M"]).to_be(nil)
+      end
+    end)
+
     it("groups them under headings, this pane's first", function()
       setup_with({ enabled = true })
       local groups = agents_view.help_entries("sessions")
@@ -1946,6 +1968,144 @@ describe("agents_view", function()
       expect(agents_view._visual_lhs("dd")).to_be("d")
       expect(agents_view._visual_lhs("X")).to_be("X")
       expect(agents_view._visual_lhs("<C-d>")).to_be("<C-d>")
+    end)
+  end)
+
+  describe("flagging a session", function()
+    local calls, rows, selected, existing, asked, notified
+    local notify
+
+    before_each(function()
+      notify = vim.notify
+      calls, asked, notified = {}, {}, {}
+      rows = { "aaa", "bbb" }
+      selected, existing = "bbb", nil
+
+      package.loaded["claudecode.agents.render"] = {
+        setup = function() end,
+        payload_at = function(_, lnum)
+          local id = rows[lnum]
+          return id and { session_id = id } or nil
+        end,
+      }
+      package.loaded["claudecode.agents.model"] = {
+        setup = function() end,
+        on_change = function() end,
+        rows = function()
+          return {}
+        end,
+        selected = function()
+          return selected
+        end,
+        flag_of = function()
+          return existing
+        end,
+        toggle_flag = function(id)
+          calls[#calls + 1] = "toggle " .. id
+        end,
+        set_flag = function(id, note)
+          calls[#calls + 1] = "set " .. id .. " " .. tostring(note)
+        end,
+        clear_flag = function(id)
+          calls[#calls + 1] = "clear " .. id
+        end,
+      }
+      -- Answers at once with whatever the test left in `asked.answer`.
+      package.loaded["claudecode.agents.input"] = {
+        ask = function(opts, cb)
+          asked[#asked + 1] = opts
+          cb(asked.answer)
+          return true
+        end,
+      }
+      vim.notify = function(message)
+        notified[#notified + 1] = message
+      end
+
+      package.loaded["claudecode.agents_view"] = nil
+      agents_view = require("claudecode.agents_view")
+      agents_view.setup(base_config({ enabled = true }))
+    end)
+
+    after_each(function()
+      vim.notify = notify
+      for _, name in ipairs({ "render", "model", "input" }) do
+        package.loaded["claudecode.agents." .. name] = nil
+      end
+      package.loaded["claudecode.agents_view"] = nil
+    end)
+
+    it("flags the row under the cursor, not the selection", function()
+      -- Flagging is done while reading down the list, to rows that are not the
+      -- one on screen — the way `x` and `dd` work.
+      expect(agents_view.flag_under_cursor()).to_be_true()
+      assert.same({ "toggle aaa" }, calls)
+    end)
+
+    it("does nothing on a line with no session", function()
+      rows = {}
+      expect(agents_view.flag_under_cursor()).to_be(false)
+      expect(agents_view.note_flag_under_cursor()).to_be(false)
+      assert.same({}, calls)
+      expect(#asked).to_be(0)
+    end)
+
+    it("asks what for, and flags with the answer", function()
+      asked.answer = "review before merging"
+      expect(agents_view.note_flag_under_cursor()).to_be_true()
+      expect(asked[1].default).to_be("")
+      assert.same({ "set aaa review before merging" }, calls)
+    end)
+
+    it("opens the prompt on the note the flag already has", function()
+      -- Also how a note the row had no room for is read.
+      existing = { at = 1, note = "check CI" }
+      asked.answer = "check CI, then merge"
+      agents_view.note_flag_under_cursor()
+      expect(asked[1].default).to_be("check CI")
+      assert.same({ "set aaa check CI, then merge" }, calls)
+    end)
+
+    it("takes an empty answer as a flag without a note, and a cancelled prompt as nothing", function()
+      asked.answer = ""
+      agents_view.note_flag_under_cursor()
+      assert.same({ "set aaa " }, calls)
+
+      calls = {}
+      asked.answer = nil
+      agents_view.note_flag_under_cursor()
+      assert.same({}, calls)
+    end)
+
+    describe("from the command", function()
+      it("toggles the selected session's flag", function()
+        -- Typed from the agent's terminal, where the session on screen is the
+        -- only one "this" can mean.
+        expect(agents_view.flag()).to_be_true()
+        assert.same({ "toggle bbb" }, calls)
+      end)
+
+      it("flags it with the text it was given", function()
+        agents_view.flag({ note = "check CI", clear = false })
+        assert.same({ "set bbb check CI" }, calls)
+      end)
+
+      it("toggles when the text is empty, as a command with no arguments passes it", function()
+        agents_view.flag({ note = "", clear = false })
+        assert.same({ "toggle bbb" }, calls)
+      end)
+
+      it("takes the flag off with a bang, whatever else was typed", function()
+        agents_view.flag({ note = "ignored", clear = true })
+        assert.same({ "clear bbb" }, calls)
+      end)
+
+      it("says so when no session is selected", function()
+        selected = nil
+        expect(agents_view.flag()).to_be(false)
+        assert.same({}, calls)
+        expect(notified[1]:find("no session selected", 1, true) ~= nil).to_be_true()
+      end)
     end)
   end)
 

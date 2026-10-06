@@ -49,6 +49,27 @@ local GUTTER = " "
 --- alike. A glyph in column 0 says it without depending on colour at all.
 local SELECTED_MARK = "❯"
 
+--- What a flagged session wears between its bullet and its title
+--- (`agents/flags.lua`). Beside the bullet rather than instead of it: flagged and
+--- busy are both true of a row, and the bullet is the only thing saying the
+--- second. U+2691 is not an emoji-capable code point, so it stays one cell wide
+--- and takes the highlight's colour everywhere, Windows Terminal included.
+local FLAG_MARK = "⚑"
+M.FLAG_MARK = FLAG_MARK
+
+--- What sets a flag's note off from the title it follows, and the fewest cells
+--- of note worth drawing — below that it is only an ellipsis.
+local NOTE_SEPARATOR = " · "
+local NOTE_MIN = 4
+--- The fewest cells a title is cut to for a note's sake — the same floor a row
+--- gives its title in a pane too narrow for everything.
+local TITLE_MIN = 8
+--- How much of a row's title room a note may claim when both cannot fit whole.
+--- The title names the conversation and keeps the larger share; the note is
+--- what the flag is *for* and must not be squeezed out by a long title, which is
+--- what "whatever is left over" amounted to — generated titles fill the pane.
+local NOTE_SHARE = 0.4
+
 --- Agents config subtable.
 ---@type table|nil
 local config = nil
@@ -81,6 +102,8 @@ local DEFAULT_HIGHLIGHTS = {
   prompt = "ClaudeCodeAgentsPrompt",
   checkpoint = "ClaudeCodeAgentsCheckpoint",
   rewind = "ClaudeCodeAgentsRewind",
+  flagged = "ClaudeCodeAgentsFlagged",
+  flag_note = "ClaudeCodeAgentsFlagNote",
 }
 
 local HIGHLIGHT_LINKS = {
@@ -126,6 +149,12 @@ local HIGHLIGHT_LINKS = {
   -- one row that records the user undoing work rather than the agent doing it,
   -- so it borrows the editor's warning colour instead of the checkpoint's grey.
   ClaudeCodeAgentsRewind = "DiagnosticWarn",
+  -- The mark on a session the user flagged to come back to. It asks for
+  -- attention without being an error, which is what the warning colour is for.
+  ClaudeCodeAgentsFlagged = "DiagnosticWarn",
+  -- What the flag is for, after the title. Quieter than the title it follows:
+  -- the title is what the row is, the note is a remark about it.
+  ClaudeCodeAgentsFlagNote = "Comment",
 }
 
 ---Where the panes take their background from.
@@ -530,9 +559,37 @@ end
 -- Panes
 --------------------------------------------------------------------------------
 
+---Fit a session's title and its flag's note into the room a row has for both.
+---
+---Both whole when they fit. Otherwise the note is given what the title leaves
+---free or `NOTE_SHARE` of the room, whichever is more, and the title the rest —
+---so a short title hands its spare cells over and a long one cannot take them
+---all. A pane too narrow to draw `NOTE_MIN` cells of note without cutting the
+---title below `TITLE_MIN` draws the title alone: the mark still says the row is
+---flagged, and the note is one key away.
+---@param title string
+---@param note string|nil
+---@param room integer Display cells available.
+---@return string title
+---@return string note_text Separator included; empty when no note is drawn.
+function M.fit_title(title, note, room)
+  if type(note) ~= "string" or note == "" then
+    return M.truncate(title, room), ""
+  end
+  local width = vim.fn.strdisplaywidth
+  local separator = width(NOTE_SEPARATOR)
+  local spare = room - separator - width(title)
+  local note_room = math.min(width(note), math.max(spare, math.floor(room * NOTE_SHARE)))
+  local title_room = room - separator - note_room
+  if note_room < NOTE_MIN or title_room < math.min(width(title), TITLE_MIN) then
+    return M.truncate(title, room), ""
+  end
+  return M.truncate(title, title_room), NOTE_SEPARATOR .. M.truncate(note, note_room)
+end
+
 ---Draw the session list.
 ---@param buf integer
----@param rows table[] `{ session_id, title, last_ts, added, removed, state, icon, hl, selected, live }`
+---@param rows table[] `{ session_id, title, last_ts, added, removed, state, icon, hl, selected, live, flag }`
 ---@param opts { width: integer?, now: number? }|nil
 function M.sessions(buf, rows, opts)
   opts = opts or {}
@@ -562,12 +619,17 @@ function M.sessions(buf, rows, opts)
     -- Padding is measured in display cells on both sides: the title may hold
     -- multibyte characters whose byte length says nothing about their width.
     local gutter = row.selected and SELECTED_MARK or GUTTER
-    local left_prefix = gutter .. (icon == "" and "" or (icon .. " "))
+    local bullet = gutter .. (icon == "" and "" or (icon .. " "))
+    local left_prefix = bullet .. (row.flag and (FLAG_MARK .. " ") or "")
     local prefix_width = vim.fn.strdisplaywidth(left_prefix)
     local right_width = vim.fn.strdisplaywidth(right)
-    local title = M.truncate(row.title or row.session_id or "?", math.max(8, width - prefix_width - right_width - 1))
+    local title, note = M.fit_title(
+      row.title or row.session_id or "?",
+      row.flag and row.flag.note or nil,
+      math.max(8, width - prefix_width - right_width - 1)
+    )
 
-    local line, age_at = right_align(left_prefix .. title, width, right)
+    local line, age_at = right_align(left_prefix .. title .. note, width, right)
 
     local lnum = index - 1
     lines[#lines + 1] = line
@@ -581,7 +643,14 @@ function M.sessions(buf, rows, opts)
     if icon ~= "" and row.hl then
       marks[#marks + 1] = { row = lnum, col = #gutter, end_col = #gutter + #icon, hl = row.hl }
     end
+    if row.flag then
+      marks[#marks + 1] = { row = lnum, col = #bullet, end_col = #bullet + #FLAG_MARK, hl = hl("flagged") }
+    end
     marks[#marks + 1] = { row = lnum, col = #left_prefix, end_col = #left_prefix + #title, hl = hl("title") }
+    if note ~= "" then
+      local note_at = #left_prefix + #title
+      marks[#marks + 1] = { row = lnum, col = note_at, end_col = note_at + #note, hl = hl("flag_note") }
+    end
     marks[#marks + 1] = { row = lnum, col = age_at, end_col = age_at + #age_field, hl = hl("time") }
     local counts_at = #line - #counts
     push_spans(marks, lnum, counts_at, spans)

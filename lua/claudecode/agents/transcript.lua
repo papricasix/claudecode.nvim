@@ -172,6 +172,7 @@ local config = nil
 ---@field pending table<string, ClaudeCodeAgentsEvent> Tool events whose result has not been folded yet, by tool_use id.
 ---@field last_ts number Epoch seconds of the last entry carrying a timestamp.
 ---@field first_ts number Epoch seconds of the first entry carrying a timestamp (0 until one is seen).
+---@field last_reply_ts number Epoch seconds the user last said something to the conversation (0 until they have); see `note_reply`.
 ---@field tokens integer|nil Context size of the newest assistant turn: input, both cache reads/writes and output.
 ---@field agent_calls table<string, ClaudeCodeAgentsEvent> `Agent`/`Task` tool events, by tool_use id.
 ---@field agent_results table<string, ClaudeCodeAgentsTaskResult> Foreground subagent results, by tool_use id.
@@ -1349,6 +1350,71 @@ local function note_prompt(sum, lnum, parent, ts)
   return false
 end
 
+--- How the CLI marks what a person typed. Checked against every transcript in a
+--- store written by CLI 2.1.25x–2.1.29x: the 1115 lines carrying it are the 967
+--- prompts sent as a turn (a `user` entry; slash commands and image-led prompts
+--- included) and the 148 typed **while Claude was working**, which are written
+--- only as a `queued_command` attachment and never as a `user` entry at all.
+--- Nothing the harness writes in the user's name carries it — not a task
+--- notification (`"kind":"task-notification"`), not an interrupt marker, a
+--- skill's instructions, a local command's echo or a subagent's hand-back.
+local HUMAN_ORIGIN = '"origin":{"kind":"human"}'
+
+--- A tool result that is the user answering rather than a tool returning, by how
+--- its `toolUseResult` begins — the value straight after the key, so recognising
+--- one costs a comparison at a known offset and no scan of the output. Checked
+--- against the same store, with each result traced to the call it answers:
+---
+---   * `{"questions":[` with `"answers":` — an answered `AskUserQuestion`
+---     (309 of 309; one declined instead is the string `User rejected tool use`).
+---   * `{"plan":"` — an approved `ExitPlanMode` (6 of 6).
+---   * the rejection text followed by `the user said:` — a call turned down
+---     **with words**, which is how a plan is answered with a correction (3,
+---     against 12 bare rejections, after which the conversation is still
+---     waiting). The whole opening is compared, not the phrase alone: one result
+---     in the store merely quotes it.
+---
+--- Approving a permission prompt is not here because it is not in the record:
+--- the tool simply runs.
+---@type { head: string, also: string|nil }[]
+local REPLY_RESULTS = {
+  { head = '{"questions":[', also = '"answers":' },
+  { head = '{"plan":"' },
+  {
+    head = "\"Error: The user doesn't want to proceed with this tool use.",
+    also = "To tell you how to proceed, the user said:",
+  },
+}
+
+--- `"toolUseResult":`, whose value is what `REPLY_RESULTS` describes.
+local RESULT_KEY_LEN = #'"toolUseResult":'
+
+---Whether a tool result line is the user's answer to the conversation.
+---@param line string
+---@param at integer Where the line's `"toolUseResult"` key starts.
+---@return boolean
+local function is_reply_result(line, at)
+  local from = at + RESULT_KEY_LEN
+  for _, shape in ipairs(REPLY_RESULTS) do
+    if line:sub(from, from + #shape.head - 1) == shape.head then
+      return shape.also == nil or line:find(shape.also, from, true) ~= nil
+    end
+  end
+  return false
+end
+
+---Note that the user said something to the conversation at `ts`.
+---
+---What a flag waiting for a reply is settled against (`agents/flags.lua`): the
+---newest moment the user typed to this conversation or answered what it asked.
+---@param sum ClaudeCodeAgentsSummary
+---@param ts number
+local function note_reply(sum, ts)
+  if ts > (sum.last_reply_ts or 0) then
+    sum.last_reply_ts = ts
+  end
+end
+
 ---Fold one raw line. Prefilters on substrings so most lines are never decoded.
 ---@param sum ClaudeCodeAgentsSummary
 ---@param line string
@@ -1388,6 +1454,23 @@ function M._fold_line(sum, line)
     end
   end
 
+  -- Whether this is a tool result, asked once: four of the tests below turn on
+  -- it, and a result is where a transcript's bytes are (the output is in the
+  -- line twice), so each of them asking for itself scanned the bulk of the file
+  -- again. Inside a string a quote is escaped, so the first unescaped match is
+  -- the entry's own key.
+  local result_at = line:find('"toolUseResult"', 1, true)
+
+  -- The user speaking to the conversation, in either of the two entries the CLI
+  -- writes that as (see `HUMAN_ORIGIN`). One scan for both, ahead of the branches
+  -- below because neither of them sees a prompt queued mid-turn. An unescaped
+  -- match is a field of the entry and not a message quoting one; a tool result
+  -- is ruled out for the case nothing in the store has yet — a structured result
+  -- that happens to carry the same field — and is not scanned for it at all.
+  if ts > 0 and not result_at and line:find(HUMAN_ORIGIN, 1, true) then
+    note_reply(sum, ts)
+  end
+
   -- What the user typed, and what it followed. A rewind (`/rewind`, Esc Esc) is
   -- recorded nowhere: measured against CLI 2.1.276 by driving one through a pty,
   -- the transcript did not grow by a byte when the conversation and the file were
@@ -1399,7 +1482,7 @@ function M._fold_line(sum, line)
   -- lines and 8 seconds apart). Tool results are user entries too and are left
   -- out — they carry `toolUseResult`. Matched raw: the CLI writes the field first,
   -- and a message quoting it has its quotes escaped.
-  if line:find('"type":"user"', 1, true) and not line:find('"toolUseResult"', 1, true) then
+  if not result_at and line:find('"type":"user"', 1, true) then
     local parent = line:match('"parentUuid":"([^"]+)"')
     if parent and note_prompt(sum, lnum, parent, ts) then
       return
@@ -1410,7 +1493,7 @@ function M._fold_line(sum, line)
   -- Matched raw like the timestamp: an assistant line also carries the whole
   -- reply, and inside a JSON string a quote is escaped, so an unescaped
   -- `"usage":{` is the message's own field.
-  if line:find('"type":"assistant"', 1, true) and not line:find('"toolUseResult"', 1, true) then
+  if not result_at and line:find('"type":"assistant"', 1, true) then
     local tokens = M._usage_tokens(line)
     if tokens then
       sum.tokens = tokens
@@ -1450,7 +1533,7 @@ function M._fold_line(sum, line)
 
   -- A tool result quoting a notification is never one, and is the kind of line
   -- that is too big to decode for nothing.
-  if line:find("<task-notification>", 1, true) and not line:find('"toolUseResult"', 1, true) then
+  if not result_at and line:find("<task-notification>", 1, true) then
     local note = M._task_notification(line)
     if note and note.event then
       -- A monitor's event. Counted from the queued copy only: each is written
@@ -1524,11 +1607,16 @@ function M._fold_line(sum, line)
 
   -- Bash results carry neither a patch nor a `file` object, which is what keeps
   -- their (often huge) stdout out of the decoder.
-  if line:find('"toolUseResult"', 1, true) then
+  if result_at then
     -- Which call this answers, and how it went: three substring tests on a line
     -- that is never decoded (see `resolve_tool`).
     if tools_wanted() then
       resolve_tool(sum, line)
+    end
+    -- An answered question, an approved plan, a call turned down with words:
+    -- the user replying through a prompt rather than by typing one.
+    if ts > 0 and is_reply_result(line, result_at) then
+      note_reply(sum, ts)
     end
     if next(sum.task_calls) ~= nil then
       settle_shell(sum, line)
@@ -1607,6 +1695,7 @@ local function new_summary(path)
     task_events = {},
     last_ts = 0,
     first_ts = 0,
+    last_reply_ts = 0,
     lines = 0,
     prompts = {},
     rewinds = {},

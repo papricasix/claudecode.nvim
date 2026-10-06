@@ -20,6 +20,7 @@
 ---@module 'claudecode.agents.model'
 
 local checkpoints = require("claudecode.agents.checkpoints")
+local flags = require("claudecode.agents.flags")
 local transcript = require("claudecode.agents.transcript")
 
 local M = {}
@@ -431,6 +432,12 @@ local function apply_summary(row, summary)
     row.last_ts = summary.last_ts
   end
   note_transcript_interrupt(row.session_id, summary)
+  -- A flag waiting for a reply ends at the reply, and this is where every fresh
+  -- fold passes through. The redraw is asked for rather than assumed: a
+  -- background agent's fold lands after the pass that requested it has painted.
+  if flags.settle(row.session_id, summary.last_reply_ts) then
+    M.request_refresh()
+  end
   row.folded = true
 end
 
@@ -635,6 +642,63 @@ function M.pinned()
   return state.pinned
 end
 
+--------------------------------------------------------------------------------
+-- Flags
+--------------------------------------------------------------------------------
+
+---The flag on a conversation, if it has one (`agents/flags.lua`).
+---@param session_id string|nil
+---@return ClaudeCodeAgentsFlag|nil
+function M.flag_of(session_id)
+  return flags.get(session_id)
+end
+
+---Flag a conversation that has none, unflag one that has.
+---
+---The list is re-enumerated either way, because a flag is one of the things that
+---holds a row in it: a conversation older than the window stays for as long as
+---it is flagged and goes with the flag.
+---@param session_id string
+---@return ClaudeCodeAgentsFlag|nil flag The new flag, nil when one was taken off.
+function M.toggle_flag(session_id)
+  local flag = flags.toggle(session_id, M._now_s())
+  M.refresh_list()
+  return flag
+end
+
+---Flag a conversation with a note, or change the note on its flag. An empty note
+---leaves a bare flag, which the next reply takes off.
+---@param session_id string
+---@param note string|nil
+---@return ClaudeCodeAgentsFlag|nil
+function M.set_flag(session_id, note)
+  local flag = flags.set(session_id, note, M._now_s())
+  M.refresh_list()
+  return flag
+end
+
+---@param session_id string
+---@return boolean cleared
+function M.clear_flag(session_id)
+  local cleared = flags.clear(session_id)
+  if cleared then
+    M.refresh_list()
+  end
+  return cleared
+end
+
+---How many of the listed conversations are flagged — what the pane's title says.
+---@return integer
+function M.flag_count()
+  local count = 0
+  for _, row in ipairs(state.rows) do
+    if flags.get(row.session_id) then
+      count = count + 1
+    end
+  end
+  return count
+end
+
 ---Re-enumerate the project's transcripts and rebuild the rows.
 ---
 ---Stat-only, so it is cheap enough to run on a timer; the folding that fills in
@@ -647,12 +711,13 @@ end
 ---so "everything" costs a bounded number of rows and folds.
 ---
 ---Neither is allowed to take a conversation the user is holding on to: a running
----agent, the selected row, and anything pinned by a search stay listed whatever
----their age. Age is read from the file's mtime rather than from the transcript's
----own newest timestamp, because the enumeration is stat-only — asking for
----`last_ts` would mean folding every transcript in the project to decide which
----ones to show, and a row that vanished once it folded would be worse than one
----that is a bookkeeping write too young.
+---agent, the selected row, anything pinned by a search and anything flagged stay
+---listed whatever their age — a flag that aged out of the list would be a
+---reminder nobody is reminded by. Age is read from the file's mtime rather than
+---from the transcript's own newest timestamp, because the enumeration is
+---stat-only — asking for `last_ts` would mean folding every transcript in the
+---project to decide which ones to show, and a row that vanished once it folded
+---would be worse than one that is a bookkeeping write too young.
 function M.refresh_list()
   if not state.cwd then
     return
@@ -677,9 +742,21 @@ function M.refresh_list()
   if state.selected then
     keep[state.selected] = true
   end
+  -- Another Neovim may have flagged or answered something since the last pass.
+  flags.refresh()
+  for session_id in pairs(flags.all()) do
+    keep[session_id] = true
+  end
 
   local hidden = 0
   local rows, by_id = {}, {}
+  -- Rows whose flag is waiting for a reply and whose transcript has grown since
+  -- it was folded. Nothing else re-reads a conversation that is neither selected
+  -- nor running here, and one answered from a bare terminal or another editor is
+  -- exactly that: without this its flag would outlive the reply until the row
+  -- was next selected. The enumeration has already stat'ed the file, so finding
+  -- them costs a comparison.
+  local replied = {}
   for _, entry in ipairs(listed) do
     local wanted = keep[entry.id] == true
     local too_old = cutoff ~= nil and (entry.mtime or 0) < cutoff
@@ -706,6 +783,10 @@ function M.refresh_list()
       }
       rows[#rows + 1] = row
       by_id[row.session_id] = row
+      local grown = summary and not summary.partial and (summary.size ~= entry.size or summary.mtime ~= entry.mtime)
+      if grown and flags.pending(entry.id) then
+        replied[#replied + 1] = row
+      end
     end
   end
 
@@ -771,6 +852,9 @@ function M.refresh_list()
 
   if state.selected and not by_id[state.selected] then
     state.selected = nil
+  end
+  for _, row in ipairs(replied) do
+    M.fold_row(row)
   end
   M.fold_pending()
   notify_change()
@@ -861,7 +945,7 @@ M.SORTS = {
   { key = "recent", accel = "r", label = "Recent activity", desc = true, down = "newest first", up = "oldest first" },
   { key = "name", accel = "n", label = "Name", desc = false, down = "Z → A", up = "A → Z" },
   { key = "changes", accel = "c", label = "Changes", desc = true, down = "most first", up = "fewest first" },
-  { key = "status", accel = "s", label = "Status", desc = true, down = "busy first", up = "idle first" },
+  { key = "status", accel = "s", label = "Status", desc = true, down = "flagged, then busy first", up = "idle first" },
 }
 
 --- `agents.sessions.sort` predates the menu and named two of these differently.
@@ -870,6 +954,11 @@ local SORT_ALIASES = { added = "changes", title = "name" }
 --- Descending status order: what is asking you something outranks what is
 --- working, which outranks what has finished and not been read.
 local STATUS_RANK = { busy = 5, waiting = 4, done = 3, idle = 2, none = 1 }
+
+--- What a flag adds to a row's status rank: more than the whole scale, so every
+--- flagged conversation sorts above every unflagged one and they keep the status
+--- order among themselves. A flag is the user saying this one comes first.
+local FLAG_RANK = 10
 
 ---@param key string|nil
 ---@return table spec Falls back to the first criterion rather than to nothing.
@@ -903,7 +992,7 @@ local function sort_value(row, key)
   elseif key == "changes" then
     return (row.added or 0) + (row.removed or 0)
   elseif key == "status" then
-    return STATUS_RANK[row.state] or 0
+    return (STATUS_RANK[row.state] or 0) + (row.flag and FLAG_RANK or 0)
   end
   return row.last_ts or 0
 end
@@ -1099,6 +1188,8 @@ function M.rows()
         icon = icon or (live and "●" or "○"),
         hl = group,
         selected = state.selected == row.session_id,
+        -- `{ at, note }` when the user flagged it (`agents/flags.lua`).
+        flag = flags.get(row.session_id),
       }
     end
   end
@@ -1178,6 +1269,7 @@ function M.delete_sessions(session_ids)
     else
       deleted[#deleted + 1] = session_id
       checkpoints.forget(session_id)
+      flags.clear(session_id)
       if state.selected == session_id then
         state.selected = nil
         state.dirty.transcript = true
