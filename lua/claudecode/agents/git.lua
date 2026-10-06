@@ -111,6 +111,26 @@ end
 ---@field unversioned boolean|nil No working copy holds the file.
 ---@field failed boolean|nil The command could not be started (not installed, say).
 
+---The directory holding `path`, as `fnamemodify(path, ":h")` answers it — either
+---separator, and a root keeps its own (`/a` is in `/`, `D:\a` in `D:\`).
+---
+---Spelled out rather than asked of `vim.fn`: the walk below is reached from
+---`model.refresh_git`, which the transcript fold calls from its read callback —
+---a fast context, where a `vim.fn` call is not something to depend on.
+---@param path string
+---@return string dir
+local function parent_dir(path)
+  local head = path:match("^(.*)[/\\][^/\\]*$")
+  if head == nil then
+    return "."
+  end
+  if head == "" or head:match("^%a:$") then
+    return path:sub(1, #head + 1)
+  end
+  return head
+end
+M._parent_dir = parent_dir
+
 ---The working copy a file belongs to: the nearest directory above it holding a
 ---`.git` (a directory, or the file a worktree or submodule has) or a `.svn`.
 ---
@@ -120,14 +140,14 @@ end
 ---@return "git"|"svn"|nil kind
 ---@return string|nil root The directory holding the marker.
 function M._working_copy(path)
-  local dir = vim.fn.fnamemodify(path, ":h")
+  local dir = parent_dir(path)
   while uv and type(dir) == "string" and dir ~= "" do
     for _, kind in ipairs({ "git", "svn" }) do
       if uv.fs_stat(dir .. "/." .. kind) then
         return kind, dir
       end
     end
-    local parent = vim.fn.fnamemodify(dir, ":h")
+    local parent = parent_dir(dir)
     if parent == dir then
       break
     end
@@ -338,9 +358,78 @@ function M.status(root, paths, cb)
   end)
 end
 
+--- `[directory] = root`, or `false` when no git working copy holds it. A
+--- directory does not change repository, so the walk up from it is made once.
+---@type table<string, string|false>
+local roots = {}
+
+---The git working copy a file belongs to, remembered per directory.
+---@param path string Absolute path of the file.
+---@return string|nil root
+function M.root_of(path)
+  local dir = parent_dir(path)
+  local known = roots[dir]
+  if known == nil then
+    local kind, root = M._working_copy(path)
+    known = (kind == "git" and root) or false
+    roots[dir] = known
+  end
+  return known or nil
+end
+
+---Forget which working copy each directory is in. What a manual refresh does:
+---a `git init` is the one thing that changes the answer.
+function M.forget_roots()
+  roots = {}
+end
+
+---Status letters for paths that need not share a working copy.
+---
+---`status` asks one repository, and a path outside it is answered with silence:
+---measured, `git -C <project> status -- <project>/.claude/worktrees/x/a.txt`
+---prints nothing for a file that `git -C <the worktree>` reports ` M`. A
+---conversation in a worktree has every one of its files there (and so does one
+---that touched a submodule or a nested repository), so each path is asked of the
+---working copy it belongs to and the answers are merged. One query per working
+---copy, which for an ordinary conversation is still one.
+---@param paths string[] Absolute paths to ask about.
+---@param fallback string|nil Where to ask about a path no working copy claims — git may still answer there (a `GIT_DIR` repository has no marker).
+---@param cb fun(status: table<string, string>)
+function M.status_all(paths, fallback, cb)
+  local groups, order = {}, {}
+  for _, path in ipairs(type(paths) == "table" and paths or {}) do
+    local root = M.root_of(path) or fallback
+    if type(root) == "string" and root ~= "" then
+      if not groups[root] then
+        groups[root] = {}
+        order[#order + 1] = root
+      end
+      groups[root][#groups[root] + 1] = path
+    end
+  end
+  if #order == 0 then
+    cb({})
+    return
+  end
+
+  local merged, waiting = {}, #order
+  for _, root in ipairs(order) do
+    M.status(root, groups[root], function(result)
+      for key, letter in pairs(result or {}) do
+        merged[key] = letter
+      end
+      waiting = waiting - 1
+      if waiting == 0 then
+        cb(merged)
+      end
+    end)
+  end
+end
+
 ---Test/reload helper.
 function M.reset()
   inflight = {}
+  roots = {}
   M._runner = M.run
 end
 

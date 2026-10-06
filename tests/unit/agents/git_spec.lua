@@ -259,4 +259,128 @@ describe("agents.git", function()
       end
     end)
   end)
+
+  describe("paths spread over several working copies", function()
+    -- A repository answers only for its own files. Measured: asked from the
+    -- project, git prints nothing for a file inside one of its worktrees, which
+    -- that worktree reports as modified.
+    local WORKTREE = "/proj/.claude/worktrees/wt1"
+    local walks
+
+    before_each(function()
+      walks = 0
+      git._working_copy = function(path)
+        walks = walks + 1
+        if path:sub(1, #WORKTREE + 1) == WORKTREE .. "/" then
+          return "git", WORKTREE
+        elseif path:sub(1, 6) == "/proj/" then
+          return "git", "/proj"
+        elseif path:sub(1, 5) == "/svn/" then
+          return "svn", "/svn"
+        end
+        return nil, nil
+      end
+    end)
+
+    local function ask(paths, fallback)
+      local answer, answers = nil, 0
+      git.status_all(paths, fallback, function(status)
+        answer = status
+        answers = answers + 1
+      end)
+      expect(answers).to_be(1)
+      return answer
+    end
+
+    it("asks each file's own working copy and merges the answers", function()
+      respond_with(function(argv)
+        -- `-C <root>` is where the question was put.
+        return { argv[3] == WORKTREE and " M a.lua" or "A  b.lua" }
+      end)
+
+      local status = ask({ "/proj/b.lua", WORKTREE .. "/a.lua", "/proj/c.lua" }, "/proj")
+
+      expect(#runs).to_be(2) -- one query per working copy, not per file
+      assert.same({ "/proj/b.lua", "/proj/c.lua" }, { runs[1].argv[#runs[1].argv - 1], runs[1].argv[#runs[1].argv] })
+      expect(runs[2].argv[3]).to_be(WORKTREE)
+      expect(runs[2].argv[#runs[2].argv]).to_be(WORKTREE .. "/a.lua")
+      expect(status[WORKTREE .. "/a.lua"]).to_be("M")
+      expect(status["/proj/b.lua"]).to_be("A")
+    end)
+
+    it("asks the fallback about a file no git working copy claims", function()
+      -- A `GIT_DIR` repository has no marker to find, and svn is not git's to
+      -- answer for: both are asked where they always were.
+      respond_with({})
+      ask({ "/elsewhere/x.lua", "/svn/y.lua" }, "/proj")
+
+      expect(#runs).to_be(1)
+      expect(runs[1].argv[3]).to_be("/proj")
+    end)
+
+    it("answers with nothing when there is nowhere to ask", function()
+      respond_with({})
+      assert.same({}, ask({ "/elsewhere/x.lua" }, nil))
+      assert.same({}, ask({}, "/proj"))
+      expect(#runs).to_be(0)
+    end)
+
+    it("walks up from a directory once", function()
+      expect(git.root_of("/proj/lua/a.lua")).to_be("/proj")
+      expect(git.root_of("/proj/lua/b.lua")).to_be("/proj")
+      expect(git.root_of("/elsewhere/x.lua")).to_be_nil()
+      expect(git.root_of("/elsewhere/y.lua")).to_be_nil()
+      expect(walks).to_be(2)
+
+      git.forget_roots()
+      git.root_of("/proj/lua/a.lua")
+      expect(walks).to_be(3)
+    end)
+
+    it("names the directory above a path the way fnamemodify does", function()
+      expect(git._parent_dir("/proj/lua/a.lua")).to_be("/proj/lua")
+      expect(git._parent_dir("/a")).to_be("/")
+      expect(git._parent_dir("/")).to_be("/")
+      expect(git._parent_dir("D:\\Git\\proj\\a.lua")).to_be("D:\\Git\\proj")
+      expect(git._parent_dir("D:\\a")).to_be("D:\\")
+      expect(git._parent_dir("D:\\")).to_be("D:\\")
+      expect(git._parent_dir("a.lua")).to_be(".")
+    end)
+
+    it("finds a file's working copy from a fast context, where vim.fn raises", function()
+      -- `model.refresh_git` is called from the transcript fold's read callback.
+      -- The specs' fake filesystem has no fast context to fail in, so this one
+      -- makes every `vim.fn` call raise the way Neovim does there.
+      local loop = vim.uv or vim.loop
+      local real_stat, real_fn = loop.fs_stat, vim.fn
+      local marks = { ["/proj/.git"] = true, [WORKTREE .. "/.git"] = true }
+      loop.fs_stat = function(path)
+        return marks[path] and {} or nil
+      end
+      package.loaded["claudecode.agents.git"] = nil
+      git = require("claudecode.agents.git")
+      vim.fn = setmetatable({}, {
+        __index = function(_, name)
+          return function()
+            error("E5560: vim.fn." .. name .. " must not be called in a fast event context")
+          end
+        end,
+      })
+
+      local ok, kind, root = pcall(git._working_copy, WORKTREE .. "/lua/deep/a.lua")
+      local ok_root, project = pcall(git.root_of, "/proj/lua/b.lua")
+      local ok_none, none = pcall(git.root_of, "/elsewhere/c.lua")
+      vim.fn = real_fn
+      loop.fs_stat = real_stat
+
+      expect(ok).to_be_true()
+      expect(kind).to_be("git")
+      -- The nearest one: a worktree is inside the repository it belongs to.
+      expect(root).to_be(WORKTREE)
+      expect(ok_root).to_be_true()
+      expect(project).to_be("/proj")
+      expect(ok_none).to_be_true()
+      expect(none).to_be_nil()
+    end)
+  end)
 end)
