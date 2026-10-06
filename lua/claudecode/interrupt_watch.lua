@@ -157,6 +157,14 @@ local function scan(session_id, tab)
   end
   local st = t._io.stat(path)
   if not st then
+    -- Moved, more often than gone: the CLI keeps a transcript under the directory
+    -- its session is in and relocates it when that changes — entering or leaving
+    -- a git worktree, `/cd` (measured against CLI 2.1.291). The path found once
+    -- then named nothing for the rest of the conversation, and every interrupt
+    -- after the move went unseen. Forgetting it makes the next tick look the
+    -- conversation up again; the file was moved whole, so the offset still holds.
+    -- One that really is gone comes back as a miss, retried on the slow schedule.
+    paths[session_id] = nil
     return
   end
   if st.size < state.offset then

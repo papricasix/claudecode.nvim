@@ -8,6 +8,10 @@ describe("interrupt_watch", function()
   --- so no libuv and no filesystem are involved.
   local files
 
+  --- The module's own lookup, which `before_each` replaces: the one spec that is
+  --- about what it remembers puts it back.
+  local real_resolve
+
   local function base_config(st)
     return {
       port_range = { min = 10000, max = 65535 },
@@ -80,6 +84,7 @@ describe("interrupt_watch", function()
     end
 
     -- Resolution is a glob in production; here the id *is* the path.
+    real_resolve = watch._resolve
     watch._resolve = function(session_id)
       local path = "/store/" .. session_id .. ".jsonl"
       return files[path] and path or nil
@@ -249,6 +254,45 @@ describe("interrupt_watch", function()
       go_busy(2, "s1")
       expect((pcall(watch._tick))).to_be_true()
       expect(status.get_state(2)).to_be("busy")
+    end)
+
+    it("follows a transcript the CLI moved to another directory of the store", function()
+      -- The CLI keeps a transcript under the directory its session is in, and
+      -- moves it when the session enters or leaves a git worktree (measured
+      -- against 2.1.291). The lookup remembered the first place for good, so
+      -- every interrupt after the move went unseen and the tab stayed busy.
+      watch._resolve = real_resolve
+      local projects = require("claudecode.utils").claude_config_dir() .. "/projects"
+      vim._mock.add_dir(projects)
+      local lookups = 0
+      vim.fn.glob = function(pattern)
+        lookups = lookups + 1
+        local id = pattern:match("/%*/(.-)%.jsonl$")
+        local hits = {}
+        for path in pairs(files) do
+          if path:sub(1, #projects + 1) == projects .. "/" and path:match("/([^/]+)%.jsonl$") == id then
+            hits[#hits + 1] = path
+          end
+        end
+        return hits
+      end
+
+      local before = projects .. "/-proj/s1.jsonl"
+      local after = projects .. "/-proj--claude-worktrees-wt1/s1.jsonl"
+      files[before] = string.rep("x", 500) .. "\n"
+      go_busy(2, "s1")
+      expect(lookups).to_be(1)
+
+      -- Moved whole, and then the turn was cancelled.
+      files[after] = files[before] .. marker_line() .. "\n"
+      files[before] = nil
+
+      -- The tick that finds the old place empty forgets it; the next looks again.
+      watch._tick()
+      expect(status.get_state(2)).to_be("busy")
+      watch._tick()
+      expect(lookups).to_be(2)
+      expect(status.get_state(2)).to_be("idle")
     end)
   end)
 end)
