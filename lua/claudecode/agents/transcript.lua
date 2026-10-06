@@ -164,6 +164,7 @@ local config = nil
 ---@field first_prompt string|nil Fallback title: the first user message.
 ---@field cwd string|nil Directory the session ran in.
 ---@field git_branch string|nil
+---@field worktree ClaudeCodeAgentsWorktree|false|nil The worktree the CLI has the session in: `false` once it said none, nil while it never said; see `M.worktree_of`.
 ---@field added integer
 ---@field removed integer
 ---@field files table<string, ClaudeCodeAgentsFile>
@@ -193,6 +194,12 @@ local config = nil
 ---@field offset integer Bytes consumed, always a line boundary.
 ---@field skipped integer Lines that decoded but matched no known shape.
 ---@field partial boolean|nil Counts came from the warm cache; no fold state yet.
+
+---@class ClaudeCodeAgentsWorktree A git worktree a conversation works in.
+---@field path string The worktree's own directory.
+---@field name string What the CLI calls it (`<repo>/.claude/worktrees/<name>`).
+---@field branch string|nil The branch checked out there.
+---@field original_cwd string|nil Where the session was before it entered — the directory it is resumed from.
 
 ---@class ClaudeCodeAgentsTaskResult How a background task ended, as its launcher was told.
 ---@field id string Task id (notifications) or tool_use id (foreground results).
@@ -575,6 +582,133 @@ function M.session_path(cwd, session_id)
     dir = M.config_dir() .. "/projects/" .. M.slugify(target)
   end
   return dir .. "/" .. session_id .. ".jsonl"
+end
+
+---The repository a directory is in: the nearest directory at or above it holding
+---a `.git` (a directory, or the file a worktree or submodule has), and the
+---directory itself when none does. One stat per level, and the first usually
+---answers: an editor is opened at the root of what it works on.
+---@param cwd string
+---@return string root
+function M._repo_root(cwd)
+  local dir = cwd
+  while type(dir) == "string" and dir ~= "" do
+    if M._io.stat(dir .. "/.git") then
+      return dir
+    end
+    local parent = dir:match("^(.*)[/\\][^/\\]+$")
+    if not parent or parent == dir then
+      break
+    end
+    dir = parent
+  end
+  return cwd
+end
+
+--- Where the CLI creates its worktrees, below the repository root. The trailing
+--- separator is what makes the slug of this a prefix of every worktree's slug.
+local WORKTREES_SUBDIR = "/.claude/worktrees/"
+
+---The store directories of the worktrees the CLI made for `cwd`'s repository.
+---
+---A conversation's transcript lives under the slug of the directory the session
+---is *in*, and that stops being the project the moment the session is in a
+---worktree: started with `--worktree` it is written under the worktree's slug
+---from its first line, and one that enters a worktree later has its transcript
+---**moved** there, sidecar directory and all (measured against CLI 2.1.291; the
+---same relocation runs on leaving, and on `/cd`). Enumerating only the project's
+---own directory therefore loses every one of them — a running agent became a
+---"New session" row with nothing in any pane, and a stopped one left the list.
+---
+---The worktree is always `<repository root>/.claude/worktrees/<name>`, also for a
+---session started in a subdirectory (measured), so its slug begins with the slug
+---of that prefix, and one `scandir` of the store finds them all — including the
+---store of a worktree that has since been deleted, whose conversations are still
+---resumable from the project. A slug is cut at `SLUG_MAX` and given a hash of the
+---whole path, though, so past that length a prefix names nothing; worktrees
+---still on disk are therefore looked up by their exact slug as well.
+---
+---By directory, not by reading who started what: every conversation in a
+---worktree of this repository is listed, which keeps the enumeration stat-only.
+---@param cwd string
+---@return string[] dirs
+function M.worktree_dirs(cwd)
+  local root = M.config_dir() .. "/projects"
+  if vim.fn.isdirectory(root) ~= 1 then
+    return {}
+  end
+  local names = M._io.scandir(root)
+  if not names or #names == 0 then
+    return {}
+  end
+  local stored = {}
+  for _, name in ipairs(names) do
+    stored[name] = true
+  end
+
+  local repo = M._repo_root(M._trim_separator(vim.fn.fnamemodify(cwd, ":p")))
+  local repos = { repo }
+  local real = uv and uv.fs_realpath and uv.fs_realpath(repo)
+  if type(real) == "string" then
+    real = M._trim_separator(real)
+    if real ~= repo then
+      repos[#repos + 1] = real
+    end
+  end
+
+  local dirs, seen = {}, {}
+  local function add(name)
+    if stored[name] and not seen[name] then
+      seen[name] = true
+      dirs[#dirs + 1] = root .. "/" .. name
+    end
+  end
+
+  for _, candidate in ipairs(repos) do
+    local prefix = M.slugify(candidate .. WORKTREES_SUBDIR)
+    if #prefix <= SLUG_MAX then
+      for _, name in ipairs(names) do
+        if #name > #prefix and name:sub(1, #prefix) == prefix then
+          add(name)
+        end
+      end
+    end
+    for _, worktree in ipairs(M._io.scandir(candidate .. WORKTREES_SUBDIR:sub(1, -2)) or {}) do
+      add(M.slugify(candidate .. WORKTREES_SUBDIR .. worktree))
+    end
+  end
+  return dirs
+end
+
+---Find a conversation's transcript wherever in the store the CLI has it.
+---
+---Session ids are unique across the store, so this needs no rule about which
+---directory a conversation belongs in — which is the point: the CLI moves a
+---transcript when its session changes directory (`/cd`, a worktree made by a
+---hook somewhere `worktree_dirs` does not look), and a conversation we are
+---running has to be followed there. One `scandir` and a `stat` per project
+---directory; the caller decides how often that is worth asking.
+---@param session_id string
+---@param hint string|nil Where it was last found; one `stat` answers while it is still there.
+---@return string|nil path
+function M.locate(session_id, hint)
+  if type(session_id) ~= "string" or session_id == "" then
+    return nil
+  end
+  if type(hint) == "string" and M._io.stat(hint) then
+    return hint
+  end
+  local root = M.config_dir() .. "/projects"
+  if vim.fn.isdirectory(root) ~= 1 then
+    return nil
+  end
+  for _, name in ipairs(M._io.scandir(root) or {}) do
+    local path = root .. "/" .. name .. "/" .. session_id .. ".jsonl"
+    if M._io.stat(path) then
+      return path
+    end
+  end
+  return nil
 end
 
 ---Whether any transcript in `dir` reports `target` as its cwd. Reads only the
@@ -1415,6 +1549,83 @@ local function note_reply(sum, ts)
   end
 end
 
+--- How the CLI records which git worktree a session is in — an entry of its own,
+--- stamped when the session enters or leaves one and again at the end of every
+--- turn, so the last one in the file is current (measured against CLI 2.1.291):
+---
+---   {"type":"worktree-state","worktreeSession":{"originalCwd":…,"worktreePath":…,
+---     "worktreeName":…,"worktreeBranch":…},"sessionId":…}
+---
+--- with `"worktreeSession":null` once it has left — also what a resume writes when
+--- the worktree was deleted underneath it. A session started with `--worktree`
+--- carries one as its very first line.
+local WORKTREE_STATE = '"type":"worktree-state"'
+
+--- The longest line worth searching for `WORKTREE_STATE`. The entry is three
+--- paths and a few names; bounding the search is what keeps this test off the
+--- megabyte tool results, where it would be one more scan of the bulk of the file.
+local WORKTREE_LINE_MAX = 16 * 1024
+
+---Note which worktree the session is in, from a `worktree-state` entry.
+---@param sum ClaudeCodeAgentsSummary
+---@param line string
+---@return boolean noted false when the line turned out to be some other entry.
+local function note_worktree(sum, line)
+  local ok, entry = pcall(vim.json.decode, line)
+  if not ok or type(entry) ~= "table" or entry.type ~= "worktree-state" then
+    return false
+  end
+  local session = entry.worktreeSession
+  if type(session) ~= "table" or type(session.worktreePath) ~= "string" or session.worktreePath == "" then
+    -- `false`, not nil: "the CLI said it is in none" is an answer, and it is what
+    -- stops `M.worktree_of` reading one back out of the directory it started in.
+    sum.worktree = false
+    return true
+  end
+  local name = session.worktreeName
+  if type(name) ~= "string" or name == "" then
+    name = session.worktreePath:match("([^/\\]+)[/\\]*$") or session.worktreePath
+  end
+  sum.worktree = {
+    path = session.worktreePath,
+    name = name,
+    branch = type(session.worktreeBranch) == "string" and session.worktreeBranch or nil,
+    original_cwd = type(session.originalCwd) == "string" and session.originalCwd or nil,
+  }
+  return true
+end
+
+--- The CLI's own place for the worktrees it creates, under the repository root.
+--- Matched with either separator; the capture after it is the worktree's name.
+local WORKTREE_DIR_PATTERN = "^(.*[/\\]%.claude[/\\]worktrees[/\\]([^/\\]+))"
+
+---The worktree a conversation works in, if it works in one.
+---
+---What the CLI stamped wins (`note_worktree`). A conversation it never stamped
+---was not *taken* into a worktree, but it may have been *started* in one — a
+---plain `claude` run by hand inside `<repo>/.claude/worktrees/<name>` writes no
+---`worktree-state` at all (measured) — and then the directory it started in is
+---the answer. Only for the never-stamped: a session launched with `--worktree`
+---starts in one too, and after it leaves the stamp says so while its first
+---message still names the worktree.
+---@param sum ClaudeCodeAgentsSummary|nil
+---@return ClaudeCodeAgentsWorktree|nil
+function M.worktree_of(sum)
+  if type(sum) ~= "table" then
+    return nil
+  end
+  if sum.worktree ~= nil then
+    return sum.worktree or nil
+  end
+  if type(sum.cwd) == "string" then
+    local path, name = sum.cwd:match(WORKTREE_DIR_PATTERN)
+    if path then
+      return { path = path, name = name }
+    end
+  end
+  return nil
+end
+
 ---Fold one raw line. Prefilters on substrings so most lines are never decoded.
 ---@param sum ClaudeCodeAgentsSummary
 ---@param line string
@@ -1424,6 +1635,13 @@ function M._fold_line(sum, line)
   sum.lines = sum.lines + 1
   local lnum = sum.lines
   if #line == 0 then
+    return
+  end
+
+  -- Which worktree the session is in. Ahead of the rewind test: where the process
+  -- works is not something a rewind takes back, and the entry is no part of the
+  -- conversation that one retracts.
+  if #line <= WORKTREE_LINE_MAX and line:find(WORKTREE_STATE, 1, true) and note_worktree(sum, line) then
     return
   end
 
@@ -1933,33 +2151,57 @@ end
 ---Stat-only and therefore synchronous: no file is opened, so this is a handful of
 ---syscalls even for a project with a hundred sessions. Rows carry whatever the
 ---cache already knows, so a caller can paint real numbers before any fold runs.
+---
+---The project's own directory, and the directories of its worktrees
+---(`worktree_dirs`): a conversation that works in one is stored there, not here.
 ---@param cwd string
 ---@return { id: string, path: string, size: integer, mtime: integer, summary: ClaudeCodeAgentsSummary|nil }[]
 function M.list(cwd)
-  local dir = M.project_dir(cwd)
-  if not dir then
-    return {}
+  local dirs = {}
+  local own = M.project_dir(cwd)
+  if own then
+    dirs[1] = own
   end
-  local names = M._io.scandir(dir) or {}
-  local rows = {}
-  for _, name in ipairs(names) do
-    if name:sub(-6) == ".jsonl" then
-      local path = dir .. "/" .. name
-      local st = M._io.stat(path)
-      if st then
-        rows[#rows + 1] = {
-          id = name:sub(1, -7),
-          path = path,
-          size = st.size,
-          mtime = st.mtime,
-          summary = cache[path],
-        }
+  for _, dir in ipairs(M.worktree_dirs(cwd)) do
+    if dir ~= own then
+      dirs[#dirs + 1] = dir
+    end
+  end
+
+  local found = {}
+  for _, dir in ipairs(dirs) do
+    for _, name in ipairs(M._io.scandir(dir) or {}) do
+      if name:sub(-6) == ".jsonl" then
+        local path = dir .. "/" .. name
+        local st = M._io.stat(path)
+        if st then
+          found[#found + 1] = {
+            id = name:sub(1, -7),
+            path = path,
+            size = st.size,
+            mtime = st.mtime,
+            summary = cache[path],
+          }
+        end
       end
     end
   end
-  table.sort(rows, function(a, b)
+  table.sort(found, function(a, b)
     return a.mtime > b.mtime
   end)
+  if #dirs < 2 then
+    return found
+  end
+  -- One row per conversation. A move is a rename, so two copies should not
+  -- happen — but the CLI sets a file already at the destination aside rather than
+  -- overwrite it, and the one being written to is the one to show.
+  local rows, seen = {}, {}
+  for _, entry in ipairs(found) do
+    if not seen[entry.id] then
+      seen[entry.id] = true
+      rows[#rows + 1] = entry
+    end
+  end
   return rows
 end
 
@@ -2879,6 +3121,45 @@ function M.invalidate(path)
   end
 end
 
+---Carry a fold over to where the CLI moved its transcript.
+---
+---The CLI moves a transcript by renaming it (entering or leaving a worktree,
+---`/cd`), so the file at the new path is the one that was folded: the same
+---inode, the same bytes up to the old offset, and whatever was appended since.
+---Taking the summary along means the next fold reads only those appended lines,
+---and — since the events are the very tables the panes are already showing —
+---that nothing on screen blanks and refills while a whole transcript is read
+---again. Refused whenever "the same file" cannot be shown: no inode to compare
+---(the fold then starts over, which is merely slower), a file still at the old
+---path, or a fold in flight on either.
+---@param from string Where it was folded.
+---@param to string Where it is now.
+---@return ClaudeCodeAgentsSummary|nil summary The carried fold, nil when it was not carried.
+function M.rehome(from, to)
+  local sum = cache[from]
+  if not sum or sum.partial or cache[to] or inflight[from] or inflight[to] then
+    return nil
+  end
+  local st = M._io.stat(to)
+  if not st or not sum.ino or not st.ino or sum.ino ~= st.ino or st.size < sum.size then
+    return nil
+  end
+  if M._io.stat(from) then
+    return nil
+  end
+  cache[from] = nil
+  sum.path = to
+  cache[to] = sum
+  -- A file's history is keyed by the transcript it was read from, and is read
+  -- again on demand.
+  for key in pairs(history_cache) do
+    if key:sub(1, #from + 1) == from .. "\0" then
+      history_cache[key] = nil
+    end
+  end
+  return sum
+end
+
 ---Delete a conversation from the CLI's store. Irreversible: the transcript *is*
 ---the conversation, and `--resume` has nothing to read once it is gone.
 ---
@@ -2960,6 +3241,18 @@ function M.cache_load()
       sum.title = rec.title
       sum.first_prompt = rec.first_prompt
       sum.cwd = rec.cwd
+      -- Absent from an entry written before this was kept, which reads as "never
+      -- said" — what it means for most conversations, and the first fold corrects.
+      if rec.worktree == false then
+        sum.worktree = false
+      elseif type(rec.worktree) == "table" and type(rec.worktree.path) == "string" then
+        sum.worktree = {
+          path = rec.worktree.path,
+          name = type(rec.worktree.name) == "string" and rec.worktree.name or rec.worktree.path,
+          branch = type(rec.worktree.branch) == "string" and rec.worktree.branch or nil,
+          original_cwd = type(rec.worktree.original_cwd) == "string" and rec.worktree.original_cwd or nil,
+        }
+      end
       sum.added = tonumber(rec.added) or 0
       sum.removed = tonumber(rec.removed) or 0
       sum.last_ts = tonumber(rec.last_ts) or 0
@@ -2987,6 +3280,7 @@ function M.cache_save()
         title = sum.title,
         first_prompt = sum.first_prompt,
         cwd = sum.cwd,
+        worktree = sum.worktree,
         added = sum.added,
         removed = sum.removed,
         last_ts = sum.last_ts,

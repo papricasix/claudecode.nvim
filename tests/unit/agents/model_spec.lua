@@ -13,6 +13,11 @@ describe("agents.model", function()
   local scheduled -- pending scheduler callbacks
   local deleted -- transcripts the stubbed store was asked to remove
   local stale -- transcripts the stubbed store says have grown since their fold
+  local elsewhere -- [id] = where the stubbed store finds a transcript the listing does not hold
+  local locates -- every search of the store for one, in order
+  local invalidated -- paths whose fold the model dropped
+  local rehomed -- [old path] = the fold the stubbed store carries over to a moved transcript
+  local git_roots -- [path] = the working copy the stubbed git says a file is in
 
   local function summary_for(id, fields)
     return vim.tbl_extend("force", {
@@ -32,6 +37,7 @@ describe("agents.model", function()
   local function stub_modules()
     summaries, scans, live, git_calls, scheduled, deleted, stale = {}, {}, {}, 0, {}, {}, {}
     git_result = {}
+    elsewhere, locates, invalidated, git_roots, rehomed = {}, {}, {}, {}, {}
 
     package.loaded["claudecode.agents.transcript"] = {
       setup = function() end,
@@ -100,6 +106,29 @@ describe("agents.model", function()
       is_scratchpad = function(path)
         return path:find("/scratchpad/", 1, true) ~= nil
       end,
+      -- Reading one back out of the directory a conversation started in is the
+      -- transcript spec's too: a summary here says outright which it is in.
+      worktree_of = function(sum)
+        return sum and sum.worktree or nil
+      end,
+      -- A conversation the project's own listing does not hold, wherever else in
+      -- the store a spec says the CLI has it.
+      locate = function(id, hint)
+        locates[#locates + 1] = { id = id, hint = hint }
+        return elsewhere[id]
+      end,
+      invalidate = function(path)
+        invalidated[#invalidated + 1] = path
+      end,
+      -- Whether a moved file is the one that was folded is the transcript spec's
+      -- to decide; here a spec says so by naming the summary that comes along.
+      rehome = function(from, to)
+        local sum = rehomed[from]
+        if sum then
+          sum.path = to
+        end
+        return sum
+      end,
     }
 
     package.loaded["claudecode.agents.registry"] = {
@@ -121,12 +150,40 @@ describe("agents.model", function()
       end,
     }
 
-    package.loaded["claudecode.agents.git"] = {
+    local git = {
       status = function(_, _, cb)
         git_calls = git_calls + 1
         cb(git_result)
       end,
+      forget_roots = function() end,
     }
+    -- The grouping is the git spec's to pin down. Here every file is in the
+    -- project unless a spec says otherwise, and `status` is looked up per call
+    -- because specs replace it.
+    git.status_all = function(paths, fallback, cb)
+      local groups, order = {}, {}
+      for _, path in ipairs(paths) do
+        local root = git_roots[path] or fallback
+        if not groups[root] then
+          groups[root] = {}
+          order[#order + 1] = root
+        end
+        groups[root][#groups[root] + 1] = path
+      end
+      local merged, waiting = {}, #order
+      for _, root in ipairs(order) do
+        git.status(root, groups[root], function(result)
+          for key, letter in pairs(result or {}) do
+            merged[key] = letter
+          end
+          waiting = waiting - 1
+          if waiting == 0 then
+            cb(merged)
+          end
+        end)
+      end
+    end
+    package.loaded["claudecode.agents.git"] = git
   end
 
   before_each(function()
@@ -369,6 +426,248 @@ describe("agents.model", function()
       model.attach(1, "/proj")
       expect(model.sort_mode().key).to_be("name")
       expect(model.sort_mode().desc).to_be(false)
+    end)
+  end)
+
+  describe("a conversation that works somewhere else", function()
+    -- The CLI keeps a transcript under the directory its session is in, so one
+    -- that works in a git worktree — or was taken elsewhere with `/cd` — is not
+    -- in the project's own directory of the store.
+    local WORKTREE =
+      { path = "/proj/.claude/worktrees/wt1", name = "wt1", branch = "worktree-wt1", original_cwd = "/proj" }
+
+    local function row_of(id)
+      for _, row in ipairs(model.rows()) do
+        if row.session_id == id then
+          return row
+        end
+      end
+    end
+
+    ---The project's own enumeration lists nothing: whatever is found is found
+    ---some other way.
+    local function list_nothing()
+      package.loaded["claudecode.agents.transcript"].list = function()
+        return {}
+      end
+    end
+
+    it("marks a session that works in a worktree, and no other", function()
+      summaries.aaa = summary_for("aaa", { worktree = WORKTREE })
+      summaries.bbb = summary_for("bbb")
+      model.attach(1, "/proj")
+
+      expect(row_of("aaa").worktree.name).to_be("wt1")
+      expect(row_of("bbb").worktree).to_be_nil()
+      expect(model.worktree_of("aaa").branch).to_be("worktree-wt1")
+      expect(model.worktree_of("bbb")).to_be_nil()
+    end)
+
+    it("does not mark the conversations of the worktree the view is itself in", function()
+      -- The mark says "not here", and here every row would wear it.
+      summaries.aaa = summary_for("aaa", { cwd = WORKTREE.path, worktree = WORKTREE })
+      model.attach(1, WORKTREE.path)
+
+      expect(row_of("aaa").worktree).to_be_nil()
+      expect(model.worktree_of("aaa")).to_be_nil()
+    end)
+
+    it("resumes it from where it was before it entered, and names its files from the worktree", function()
+      -- Started with `--worktree`, so even its first message names the worktree.
+      summaries.aaa = summary_for("aaa", { cwd = WORKTREE.path, worktree = WORKTREE })
+      model.attach(1, "/proj")
+      model.select("aaa")
+
+      expect(model.row("aaa").cwd).to_be("/proj")
+      expect(model.selected_cwd()).to_be(WORKTREE.path)
+    end)
+
+    it("resumes one started by hand inside a worktree where it ran", function()
+      -- The CLI never took it anywhere, so there is no "before" to go back to.
+      summaries.aaa = summary_for("aaa", { cwd = WORKTREE.path, worktree = { path = WORKTREE.path, name = "wt1" } })
+      model.attach(1, "/proj")
+
+      expect(model.row("aaa").cwd).to_be(WORKTREE.path)
+      expect(row_of("aaa").worktree.name).to_be("wt1")
+    end)
+
+    it("takes the mark off once the conversation has left the worktree", function()
+      summaries.aaa = summary_for("aaa", { worktree = WORKTREE })
+      model.attach(1, "/proj")
+      model.select("aaa")
+      expect(row_of("aaa").worktree).not_to_be_nil()
+
+      summaries.aaa.worktree = nil
+      model.refresh_list()
+      expect(row_of("aaa").worktree).to_be_nil()
+      expect(model.selected_cwd()).to_be("/proj")
+    end)
+
+    it("keeps the mark and the title while a moved transcript is still unread", function()
+      summaries.aaa = summary_for("aaa", { worktree = WORKTREE })
+      model.attach(1, "/proj")
+
+      -- Listed where the CLI moved it, and nothing has folded it there yet.
+      package.loaded["claudecode.agents.transcript"].list = function()
+        return { { id = "aaa", path = "/w/aaa.jsonl", size = 1, mtime = os.time(), summary = nil } }
+      end
+      model.refresh_list()
+
+      expect(row_of("aaa").worktree.name).to_be("wt1")
+      expect(row_of("aaa").title).to_be("Title aaa")
+    end)
+
+    it("takes the fold along when the moved file is the one it read", function()
+      -- Nothing on screen blanks and refills: the row is the row it was, and
+      -- only what the CLI has appended since is left to read.
+      summaries.aaa = summary_for("aaa", { added = 7 })
+      model.attach(1, "/proj")
+      model.select("aaa")
+      rehomed["/p/aaa.jsonl"] = summaries.aaa
+      -- Listed at its new place, where nothing has been folded.
+      package.loaded["claudecode.agents.transcript"].list = function()
+        return { { id = "aaa", path = "/w/aaa.jsonl", size = 2, mtime = os.time(), summary = nil } }
+      end
+      scans = {}
+      model.refresh_list()
+
+      local row = row_of("aaa")
+      expect(row.added).to_be(7)
+      expect(row.title).to_be("Title aaa")
+      expect(model.transcript_path("aaa")).to_be("/w/aaa.jsonl")
+      -- Read on from where the file now is, and never again from where it was.
+      expect(#scans > 0).to_be(true)
+      for _, path in ipairs(scans) do
+        expect(path).to_be("/w/aaa.jsonl")
+      end
+    end)
+
+    it("drops the fold of a transcript the CLI moved from under a conversation", function()
+      summaries.aaa = summary_for("aaa")
+      summaries.bbb = summary_for("bbb")
+      model.attach(1, "/proj")
+      model.select("aaa")
+      assert.same({}, invalidated)
+
+      -- Entered a worktree: the same conversation, in another directory.
+      summaries.aaa.path = "/w/aaa.jsonl"
+      model.refresh_list()
+
+      assert.same({ "/p/aaa.jsonl" }, invalidated)
+      expect(model.transcript_path("aaa")).to_be("/w/aaa.jsonl")
+      expect(model.selected()).to_be("aaa")
+    end)
+
+    it("follows a running conversation whose transcript left the project", function()
+      -- `/cd`, or a worktree a hook made somewhere else: no rule about this
+      -- project names the directory, only the conversation's id does. This was a
+      -- "New session" row with nothing in any pane.
+      list_nothing()
+      live.ccc = true
+      summaries.ccc = summary_for("ccc", { path = "/elsewhere/ccc.jsonl", title = "Moved away", added = 4 })
+      elsewhere.ccc = "/elsewhere/ccc.jsonl"
+      model.attach(1, "/proj")
+
+      local row = row_of("ccc")
+      expect(row.title).to_be("Moved away")
+      expect(row.added).to_be(4)
+      expect(row.live).to_be_true()
+      expect(model.transcript_path("ccc")).to_be("/elsewhere/ccc.jsonl")
+    end)
+
+    it("fills such a row in once its transcript has been read", function()
+      list_nothing()
+      live.ccc = true
+      elsewhere.ccc = "/elsewhere/ccc.jsonl"
+      local moved = summary_for("ccc", { path = "/elsewhere/ccc.jsonl", title = "Moved away", added = 4 })
+      -- Found, but not folded: the store hands the summary to a fold only.
+      package.loaded["claudecode.agents.transcript"].get = function()
+        return nil
+      end
+      package.loaded["claudecode.agents.transcript"].summary = function(path, cb)
+        cb(path == moved.path and moved or nil)
+      end
+      model.attach(1, "/proj")
+
+      expect(row_of("ccc").title).to_be("Moved away")
+      expect(row_of("ccc").added).to_be(4)
+    end)
+
+    it("does not search the store on every pass for an agent nobody has typed into", function()
+      local now = 1000
+      model._set_epoch_clock(function()
+        return now
+      end)
+      list_nothing()
+      live.ccc = true
+      model.attach(1, "/proj")
+      model.refresh_list()
+      model.refresh_list()
+      expect(#locates).to_be(1)
+      expect(row_of("ccc").title).to_be("New session")
+
+      now = now + 11
+      model.refresh_list()
+      expect(#locates).to_be(2)
+    end)
+
+    it("checks where it found one before searching again, and follows it when it moves on", function()
+      list_nothing()
+      live.ccc = true
+      elsewhere.ccc = "/one/ccc.jsonl"
+      model.attach(1, "/proj")
+      expect(model.transcript_path("ccc")).to_be("/one/ccc.jsonl")
+
+      elsewhere.ccc = "/two/ccc.jsonl"
+      model.refresh_list()
+      expect(locates[2].hint).to_be("/one/ccc.jsonl")
+      expect(model.transcript_path("ccc")).to_be("/two/ccc.jsonl")
+    end)
+
+    it("forgets where a conversation was once its agent has stopped", function()
+      list_nothing()
+      live.ccc = true
+      elsewhere.ccc = "/one/ccc.jsonl"
+      model.attach(1, "/proj")
+      live.ccc = nil
+      model.refresh_list()
+
+      expect(row_of("ccc")).to_be_nil()
+      expect(next(model._state().located)).to_be_nil()
+    end)
+
+    it("asks git about each file in the working copy it is in", function()
+      -- The project's repository says nothing at all about a file in a worktree.
+      local inside = WORKTREE.path .. "/a.lua"
+      summaries.aaa = summary_for("aaa", {
+        worktree = WORKTREE,
+        files = {
+          ["/proj/b.lua"] = { added = 1, removed = 0, kind = "edit", last_ts = 1 },
+          [inside] = { added = 2, removed = 0, kind = "edit", last_ts = 2 },
+        },
+        order = { "/proj/b.lua", inside },
+      })
+      git_roots[inside] = WORKTREE.path
+      local asked = {}
+      package.loaded["claudecode.agents.git"].status = function(root, paths, cb)
+        asked[root] = paths
+        cb({ [paths[1]] = root == "/proj" and "M" or "A" })
+      end
+      model._is_gone = function()
+        return false
+      end
+      model.attach(1, "/proj")
+      model.select("aaa")
+      model.refresh_git(true)
+
+      assert.same({ "/proj/b.lua" }, asked["/proj"])
+      assert.same({ inside }, asked[WORKTREE.path])
+      local letters = {}
+      for _, entry in ipairs(model.changes()) do
+        letters[entry.path] = entry.status
+      end
+      expect(letters["/proj/b.lua"]).to_be("M")
+      expect(letters[inside]).to_be("A")
     end)
   end)
 

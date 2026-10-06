@@ -90,6 +90,11 @@ local function new_state()
     -- asked for them by name: a search hit older than the window has no row to
     -- select, and the panes all follow a row. `[session_id] = { path, cwd, title }`.
     pinned = {},
+    -- Where the transcript of a conversation we are running was last looked for,
+    -- when the project's own enumeration did not list it: `[session_id] =
+    -- { path, at }`, `path` nil for "searched the store, not there". See
+    -- `locate_live`.
+    located = {},
     -- Transcripts the window and the cap left out at the last enumeration, so the
     -- centre can say "there are older ones" rather than "there are none".
     hidden = 0,
@@ -415,6 +420,22 @@ local function display_title(summary)
   return summary.name or summary.title or summary.first_prompt
 end
 
+---Where a conversation is resumed from, and the worktree it works in.
+---
+---Two directories, because for a conversation in a worktree they are not the
+---same one. It is *resumed* from where it was before it entered: measured
+---against CLI 2.1.291, `--resume` from there finds the transcript in the
+---worktree's store and puts the session back in the worktree by itself — and
+---when the worktree has been deleted it says so and carries on where it was
+---started. Its files are *shown* relative to the worktree (`M.selected_cwd`).
+---@param summary ClaudeCodeAgentsSummary|nil
+---@return string|nil cwd nil while the transcript has not said.
+---@return ClaudeCodeAgentsWorktree|nil worktree
+local function place_of(summary)
+  local worktree = transcript.worktree_of(summary)
+  return (worktree and worktree.original_cwd) or (summary and summary.cwd) or nil, worktree
+end
+
 ---Take a freshly folded summary onto a row.
 ---
 ---One place, because three hand-written copies disagreed about what a fold
@@ -425,7 +446,9 @@ end
 ---@param summary ClaudeCodeAgentsSummary
 local function apply_summary(row, summary)
   row.title = display_title(summary) or row.title
-  row.cwd = summary.cwd or row.cwd
+  local cwd, worktree = place_of(summary)
+  row.cwd = cwd or row.cwd
+  row.worktree = worktree
   row.added = summary.added
   row.removed = summary.removed
   if summary.last_ts and summary.last_ts > 0 then
@@ -699,6 +722,77 @@ function M.flag_count()
   return count
 end
 
+---The fold of a transcript the CLI has moved since the last pass, taken along to
+---where the file is now.
+---
+---A row whose transcript is at another path than a pass ago, with nothing
+---folded there, is the same conversation in another directory of the store —
+---the CLI renames the file when its session enters or leaves a worktree, or is
+---taken elsewhere with `/cd`. Starting its fold over would blank every pane that
+---shows it until the whole transcript had been read again.
+---@param previous table|nil The conversation's row a pass ago.
+---@param path string Where its transcript is now.
+---@return ClaudeCodeAgentsSummary|nil summary nil when there was nothing to carry, or it could not be shown to be the same file.
+local function carried_fold(previous, path)
+  if not previous or not previous.path or previous.path == path then
+    return nil
+  end
+  return transcript.rehome(previous.path, path)
+end
+
+---A row for a conversation the project's enumeration did not list, built from
+---where its transcript is: a search hit pinned from another project, or one of
+---our own agents whose transcript the CLI moved. It folds from there like any
+---other row, so it fills in its own title and counts.
+---@param session_id string
+---@param path string Its transcript.
+---@param known { title: string|nil, cwd: string|nil } What the caller knows before anything is read.
+---@return table row
+local function row_at(session_id, path, known)
+  local previous = state.by_id[session_id]
+  local summary = transcript.get(path) or carried_fold(previous, path)
+  local cwd, worktree = place_of(summary)
+  return {
+    session_id = session_id,
+    path = path,
+    title = display_title(summary) or (previous and previous.title) or known.title or nil,
+    cwd = cwd or known.cwd or state.cwd,
+    worktree = worktree or (not summary and previous and previous.worktree) or nil,
+    added = summary and summary.added or nil,
+    removed = summary and summary.removed or nil,
+    last_ts = (summary and summary.last_ts and summary.last_ts > 0) and summary.last_ts or 0,
+    folded = summary ~= nil and not summary.partial,
+  }
+end
+
+--- How long a running conversation may stay unfound before the store is searched
+--- for it again. The search is a `stat` per project directory, and the usual
+--- reason to come up empty is an agent nobody has typed into yet — which is
+--- listed by the project's own enumeration the moment it is written, not by this.
+local LOCATE_RETRY_S = 10
+
+---Where the transcript of a conversation we are running is, when the project's
+---enumeration did not list it.
+---
+---The CLI keeps a transcript under the directory its session is *in* and moves
+---it when that changes. Worktrees of this repository are enumerated
+---(`transcript.worktree_dirs`); what is left is `/cd` to somewhere else entirely
+---and a worktree a hook made outside the repository, and for those the only rule
+---is the conversation's id. Remembered per conversation, the answer checked with
+---one `stat` a pass and a miss not asked again for `LOCATE_RETRY_S`.
+---@param session_id string
+---@return string|nil path
+local function locate_live(session_id)
+  local known = state.located[session_id]
+  local now = M._now_s()
+  if known and not known.path and (now - known.at) < LOCATE_RETRY_S then
+    return nil
+  end
+  local path = transcript.locate(session_id, known and known.path or nil)
+  state.located[session_id] = { path = path, at = now }
+  return path
+end
+
 ---Re-enumerate the project's transcripts and rebuild the rows.
 ---
 ---Stat-only, so it is cheap enough to run on a timer; the folding that fills in
@@ -763,17 +857,22 @@ function M.refresh_list()
     if not wanted and (too_old or #rows >= cap) then
       hidden = hidden + 1
     else
-      local summary = entry.summary
       -- Kept across the rebuild so a title never goes backwards: a transcript that
       -- has just appeared is listed before it is folded, and dropping to the id
       -- prefix in between is a visible flicker on the row the user is watching —
       -- the one they just started. `apply_summary` keeps it the same way.
       local previous = state.by_id[entry.id]
+      local summary = entry.summary or carried_fold(previous, entry.path)
+      local cwd, worktree = place_of(summary)
       local row = {
         session_id = entry.id,
         path = entry.path,
         title = display_title(summary) or (previous and previous.title) or nil,
-        cwd = summary and summary.cwd or state.cwd,
+        cwd = cwd or state.cwd,
+        -- Carried like the title while nothing has been read: a transcript the CLI
+        -- has just moved is a path with no fold yet, and its row is still the
+        -- conversation that was in a worktree a moment ago.
+        worktree = worktree or (not summary and previous and previous.worktree) or nil,
         -- Kept even for a partial summary: `rows()` gates on `folded`, so a count
         -- from a half-read transcript is carried but not shown.
         added = summary and summary.added or nil,
@@ -796,62 +895,91 @@ function M.refresh_list()
   -- like any other row, so it fills in its own title and counts.
   for session_id, pin in pairs(state.pinned) do
     if not by_id[session_id] and pin.path then
-      local previous = state.by_id[session_id]
-      local summary = transcript.get(pin.path)
-      local row = {
-        session_id = session_id,
-        path = pin.path,
-        title = display_title(summary) or (previous and previous.title) or pin.title or nil,
-        cwd = (summary and summary.cwd) or pin.cwd or state.cwd,
-        added = summary and summary.added or nil,
-        removed = summary and summary.removed or nil,
-        last_ts = (summary and summary.last_ts and summary.last_ts > 0) and summary.last_ts or 0,
-        folded = summary ~= nil and not summary.partial,
-        pinned = true,
-      }
+      local row = row_at(session_id, pin.path, pin)
+      row.pinned = true
       rows[#rows + 1] = row
       by_id[session_id] = row
     end
   end
 
-  -- A conversation we are running that the enumeration cannot see yet.
+  -- A conversation we are running that the enumeration cannot see.
   --
-  -- The CLI writes the transcript on the first message, so a brand new agent is
-  -- in no listing for as long as the user takes to type into it — and a list is
-  -- the only way back to a conversation, so moving the selection off it once lost
-  -- it entirely: still running, still holding a port and a terminal buffer, and
-  -- unreachable. The registry knows everything a row needs about it (its id, the
-  -- directory it runs in, and that it is running), so it is listed from there
-  -- until the enumeration takes over.
+  -- Usually because it does not exist yet: the CLI writes the transcript on the
+  -- first message, so a brand new agent is in no listing for as long as the user
+  -- takes to type into it — and a list is the only way back to a conversation, so
+  -- moving the selection off it once lost it entirely: still running, still
+  -- holding a port and a terminal buffer, and unreachable. The registry knows
+  -- everything a row needs about it (its id, the directory it runs in, and that
+  -- it is running), so it is listed from there until the enumeration takes over.
+  --
+  -- Or because the CLI took its transcript somewhere this project's enumeration
+  -- does not reach (`locate_live`). Then it is no new session at all, and it is
+  -- listed from where its transcript is — calling it "New session" with nothing
+  -- in any pane is what a moved conversation looked like before.
+  local located = {}
   for _, session_id in ipairs(registry.live_ids()) do
     if not by_id[session_id] then
       local term = registry.get(session_id)
-      local row = {
-        session_id = session_id,
-        -- Where the CLI is about to write it. Nothing depends on the file being
-        -- there — a fold simply finds nothing — but naming it now is what lets
-        -- the panes fill in the moment it appears, rather than on the next scan.
-        path = transcript.session_path((term and term.cwd) or state.cwd, session_id),
-        title = NEW_SESSION_TITLE,
-        cwd = (term and term.cwd) or state.cwd,
-        -- It has changed nothing yet, and that is a fact rather than a gap: the
-        -- unknown-count placeholder would claim its counts are still being read.
-        added = 0,
-        removed = 0,
-        last_ts = os.time(),
-        folded = true,
-      }
+      local launch_cwd = (term and term.cwd) or state.cwd
+      local path = locate_live(session_id)
+      located[session_id] = state.located[session_id]
+      local row
+      if path then
+        row = row_at(session_id, path, { cwd = launch_cwd })
+      else
+        row = {
+          session_id = session_id,
+          -- Where the CLI is about to write it. Nothing depends on the file being
+          -- there — a fold simply finds nothing — but naming it now is what lets
+          -- the panes fill in the moment it appears, rather than on the next scan.
+          path = transcript.session_path(launch_cwd, session_id),
+          title = NEW_SESSION_TITLE,
+          cwd = launch_cwd,
+          -- It has changed nothing yet, and that is a fact rather than a gap: the
+          -- unknown-count placeholder would claim its counts are still being read.
+          added = 0,
+          removed = 0,
+          last_ts = os.time(),
+          folded = true,
+        }
+      end
       rows[#rows + 1] = row
       by_id[session_id] = row
     end
   end
+  -- Rebuilt from what is running, so a stopped agent's entry goes with it.
+  state.located = located
 
+  local before = state.by_id
   state.rows = rows
   state.by_id = by_id
   state.hidden = hidden
 
   if state.selected and not by_id[state.selected] then
     state.selected = nil
+  end
+
+  -- A transcript that is somewhere else than it was a pass ago was moved by the
+  -- CLI under a running conversation: entering or leaving a worktree, or `/cd`.
+  -- Whatever is still kept for the old path describes a file that is gone.
+  for session_id, row in pairs(by_id) do
+    local previous = before[session_id]
+    if previous and previous.path and previous.path ~= row.path then
+      transcript.invalidate(previous.path)
+      if transcript.get(row.path) then
+        -- Its fold came along (`carried_fold`), so the row reads as it did; what
+        -- the CLI has appended since is still to be read, and nothing else would
+        -- read it for a conversation that is neither selected nor running here.
+        M.fold_row(row)
+      elseif session_id == state.selected then
+        -- Read again from the start: the same history arriving, not activity.
+        reset_seen()
+      end
+      if session_id == state.selected then
+        -- Its subagents' transcripts moved with it.
+        M.refresh_subagents()
+      end
+    end
   end
   for _, row in ipairs(replied) do
     M.fold_row(row)
@@ -1124,6 +1252,26 @@ function M.set_sort(key, desc)
   return M.sort_mode()
 end
 
+---The worktree a row's conversation works in, when that is somewhere other than
+---the directory this view is attached to.
+---
+---The mark it becomes says "not here". A view opened inside a worktree lists
+---that worktree's own conversations, and marking every one of them would say
+---nothing about any.
+---@param row table
+---@return ClaudeCodeAgentsWorktree|nil
+local function worktree_elsewhere(row)
+  local worktree = row.worktree
+  if not worktree then
+    return nil
+  end
+  local utils = require("claudecode.utils")
+  if utils.path_key(worktree.path) == utils.path_key(state.cwd) then
+    return nil
+  end
+  return worktree
+end
+
 ---@return table[]
 function M.rows()
   local ok_status, status = pcall(require, "claudecode.status")
@@ -1190,6 +1338,8 @@ function M.rows()
         selected = state.selected == row.session_id,
         -- `{ at, note }` when the user flagged it (`agents/flags.lua`).
         flag = flags.get(row.session_id),
+        -- `{ name, path, branch }` when it works in a worktree rather than here.
+        worktree = worktree_elsewhere(row),
       }
     end
   end
@@ -1664,10 +1814,30 @@ function M.refresh_subagents()
   end
 end
 
----@return string|nil cwd The directory the selected session ran in.
+---The directory the selected session's files are named from: the worktree it
+---works in, else the directory it ran in.
+---
+---Not where it is resumed (`row.cwd`, see `place_of`). In a worktree every file
+---the conversation touches is under `<repo>/.claude/worktrees/<name>/`, and named
+---from the repository that prefix is most of a pane's width on every row. A file
+---it touched outside the worktree — before it entered, say — keeps its whole
+---path, which is right: it is a different checkout's file of the same name.
+---@return string|nil cwd
 function M.selected_cwd()
   local row = state.selected and state.by_id[state.selected]
+  if row and row.worktree then
+    return row.worktree.path
+  end
   return (row and row.cwd) or state.cwd
+end
+
+---The worktree a session works in, when it is not the directory this view is
+---attached to — what its row's mark stands for, for a screen with room to name it.
+---@param session_id string|nil Defaults to the selected session.
+---@return ClaudeCodeAgentsWorktree|nil
+function M.worktree_of(session_id)
+  local row = state.by_id[session_id or state.selected or ""]
+  return row and worktree_elsewhere(row) or nil
 end
 
 --------------------------------------------------------------------------------
@@ -2007,7 +2177,13 @@ function M.refresh_git(force)
   if not ok then
     return
   end
-  git.status(state.cwd, paths, function(result)
+  if force then
+    git.forget_roots()
+  end
+  -- Each file is asked of the working copy it is in, not of the project: a
+  -- conversation in a worktree has all of its files there, and the project's
+  -- repository says nothing at all about them.
+  git.status_all(paths, state.cwd, function(result)
     state.git = result or {}
     notify_change()
   end)

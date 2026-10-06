@@ -620,6 +620,128 @@ describe("agents.transcript", function()
     end)
   end)
 
+  describe("worktrees", function()
+    -- Which git worktree a session is in. The entry is spelled the way CLI
+    -- 2.1.291 writes it, copied from transcripts made by running each case: a
+    -- session started with `--worktree`, one that entered a worktree mid-way,
+    -- one that left again, and one resumed after its worktree was deleted.
+    local function worktree_line(name, from)
+      if not name then
+        return '{"type":"worktree-state","worktreeSession":null,"sessionId":"s"}'
+      end
+      from = from or "/proj"
+      return (
+        '{"type":"worktree-state","worktreeSession":{"originalCwd":"%s","preEnterOriginalCwd":"%s",'
+        .. '"worktreePath":"/proj/.claude/worktrees/%s","worktreeName":"%s","worktreeBranch":"worktree-%s",'
+        .. '"originalBranch":"main","originalHeadCommit":"cb2a1b6","sessionId":"s"},"sessionId":"s"}'
+      ):format(from, from, name, name, name)
+    end
+
+    local function prompt_in(cwd, text)
+      return vim.json.encode({
+        type = "user",
+        cwd = cwd,
+        timestamp = "2026-08-02T20:00:00.000Z",
+        message = { role = "user", content = text or "do the thing" },
+      })
+    end
+
+    it("notes the worktree a session entered", function()
+      put(
+        "/p/a.jsonl",
+        { prompt_in("/proj"), worktree_line("wt1"), edit_line("/proj/.claude/worktrees/wt1/x.lua", 1, 0) }
+      )
+      local sum = fold("/p/a.jsonl")
+
+      expect(sum.worktree.path).to_be("/proj/.claude/worktrees/wt1")
+      expect(sum.worktree.name).to_be("wt1")
+      expect(sum.worktree.branch).to_be("worktree-wt1")
+      -- Where it is resumed from, which is not where it works.
+      expect(sum.worktree.original_cwd).to_be("/proj")
+      expect(sum.cwd).to_be("/proj")
+      expect(transcript.worktree_of(sum).name).to_be("wt1")
+      -- The entry is no part of the conversation: the edit after it still counts.
+      expect(sum.added).to_be(1)
+    end)
+
+    it("takes the last one, and notes that the session left", function()
+      -- Stamped again at the end of every turn, so the last entry is current.
+      put("/p/a.jsonl", { prompt_in("/proj"), worktree_line("wt1"), worktree_line("wt1"), worktree_line("wt2") })
+      expect(fold("/p/a.jsonl").worktree.name).to_be("wt2")
+
+      append("/p/a.jsonl", { worktree_line(nil) })
+      local sum = fold("/p/a.jsonl")
+      expect(sum.worktree).to_be(false)
+      expect(transcript.worktree_of(sum)).to_be_nil()
+    end)
+
+    it("reads one out of the directory a session started in when the CLI never said", function()
+      -- A plain `claude` run by hand inside a worktree writes no entry at all.
+      put("/p/a.jsonl", { prompt_in("/proj/.claude/worktrees/wt1") })
+      local sum = fold("/p/a.jsonl")
+      expect(sum.worktree).to_be_nil()
+      local worktree = transcript.worktree_of(sum)
+      expect(worktree.name).to_be("wt1")
+      expect(worktree.path).to_be("/proj/.claude/worktrees/wt1")
+
+      -- A subdirectory of one is still that worktree, with either separator.
+      put("/p/b.jsonl", { prompt_in("D:\\proj\\.claude\\worktrees\\wt2\\lua") })
+      worktree = transcript.worktree_of(fold("/p/b.jsonl"))
+      expect(worktree.name).to_be("wt2")
+      expect(worktree.path).to_be("D:\\proj\\.claude\\worktrees\\wt2")
+
+      put("/p/c.jsonl", { prompt_in("/proj") })
+      expect(transcript.worktree_of(fold("/p/c.jsonl"))).to_be_nil()
+      expect(transcript.worktree_of(nil)).to_be_nil()
+    end)
+
+    it("believes the CLI over the directory a session started in", function()
+      -- Started with `--worktree`, then left: its first message still names the
+      -- worktree, and the entry is the only thing saying it is no longer there.
+      put("/p/a.jsonl", { worktree_line("wt1"), prompt_in("/proj/.claude/worktrees/wt1"), worktree_line(nil) })
+      expect(transcript.worktree_of(fold("/p/a.jsonl"))).to_be_nil()
+    end)
+
+    it("is not taken in by a message quoting the entry", function()
+      -- Inside a JSON string the quotes are escaped, so the raw match misses.
+      put("/p/a.jsonl", { prompt_in("/proj", "what does " .. worktree_line("wt1") .. " mean?") })
+      local sum = fold("/p/a.jsonl")
+      expect(sum.worktree).to_be_nil()
+      expect(sum.first_prompt:sub(1, 9)).to_be("what does")
+    end)
+
+    it("does not look for it in a line too long to be one", function()
+      -- The bound is what keeps this test off megabyte tool results.
+      local padded = worktree_line("wt1"):sub(1, -2) .. ',"pad":"' .. string.rep("x", 20000) .. '"}'
+      put("/p/a.jsonl", { prompt_in("/proj"), padded })
+      expect(fold("/p/a.jsonl").worktree).to_be_nil()
+    end)
+
+    it("keeps one stamped inside a stretch the user rewound away", function()
+      -- A rewind takes back conversation, not where the process works.
+      local function turn(uuid, parent, ts)
+        return vim.json.encode({
+          type = "user",
+          uuid = uuid,
+          parentUuid = parent,
+          cwd = "/proj",
+          timestamp = ts,
+          message = { role = "user", content = "turn " .. uuid },
+        })
+      end
+      put("/p/a.jsonl", {
+        turn("u1", "root", "2026-08-02T20:00:00.000Z"),
+        turn("u2", "u1", "2026-08-02T20:01:00.000Z"),
+        worktree_line("wt1"),
+        -- Names the entry the retracted prompt had named: `u2` was rewound.
+        turn("u3", "u1", "2026-08-02T20:02:00.000Z"),
+      })
+      local sum = fold("/p/a.jsonl")
+      expect(#sum.rewinds).to_be(1)
+      expect(sum.worktree.name).to_be("wt1")
+    end)
+  end)
+
   describe("replies", function()
     -- What a flag waiting for a reply is settled against. Every line here is
     -- spelled the way the CLI writes it — key order included, since the fold
@@ -1548,6 +1670,166 @@ describe("agents.transcript", function()
       -- nothing to look up — and that is exactly the project where the first
       -- agent needs a row before it has written anything.
       expect(transcript.session_path("/proj", "abc")).to_be("/home/user/.claude/projects/-proj/abc.jsonl")
+    end)
+  end)
+
+  describe("conversations stored outside the project's directory", function()
+    -- The CLI keeps a transcript under the slug of the directory its session is
+    -- *in*. In a worktree that is `<repo>/.claude/worktrees/<name>`, so the
+    -- conversation is in another directory of the store than its project's.
+    local ROOT = "/home/user/.claude/projects"
+
+    ---A store holding one transcript per directory name given, named after it.
+    local function store(names)
+      vim._mock.add_dir(ROOT)
+      dirs[ROOT] = {}
+      for index, name in ipairs(names) do
+        vim._mock.add_dir(ROOT .. "/" .. name)
+        dirs[ROOT][index] = name
+        dirs[ROOT .. "/" .. name] = { "id" .. index .. ".jsonl" }
+        put(ROOT .. "/" .. name .. "/id" .. index .. ".jsonl", { prompt_line("hello") }, { mtime = index })
+      end
+    end
+
+    local function ids(rows)
+      local out = {}
+      for _, row in ipairs(rows) do
+        out[#out + 1] = row.id
+      end
+      table.sort(out)
+      return out
+    end
+
+    it("lists the conversations in a project's worktrees with its own", function()
+      store({
+        "-proj",
+        "-proj--claude-worktrees-wt1",
+        -- A worktree deleted since: nothing is on disk but its conversations.
+        "-proj--claude-worktrees-gone",
+        -- Neighbours that only share a prefix, and another project's worktree.
+        "-proj-x",
+        "-proj--claude",
+        "-other--claude-worktrees-wt1",
+      })
+
+      assert.same({ "id1", "id2", "id3" }, ids(transcript.list("/proj")))
+    end)
+
+    it("lists them for a project the CLI has only ever run in a worktree of", function()
+      store({ "-proj--claude-worktrees-wt1" })
+      assert.same({ "id1" }, ids(transcript.list("/proj")))
+    end)
+
+    it("finds them from a subdirectory of the repository", function()
+      -- The worktree is made under the repository root wherever in it the session
+      -- was started (measured), so that is the root the slug is taken from.
+      fs["/repo/.git"] = { data = "", mtime = 1, ino = 1 }
+      store({ "-repo-sub", "-repo--claude-worktrees-wt1", "-repo-sub--claude-worktrees-nope" })
+
+      expect(transcript._repo_root("/repo/sub")).to_be("/repo")
+      assert.same({ "id1", "id2" }, ids(transcript.list("/repo/sub")))
+    end)
+
+    it("looks a worktree on disk up by its exact slug, since a cut slug has no prefix", function()
+      -- Past 200 characters the slug ends in a hash of the whole path, so the
+      -- project's slug is no prefix of its worktrees'.
+      local long = "/" .. string.rep("verylongdirectoryname/", 10) .. "proj"
+      local worktree = long .. "/.claude/worktrees/wt1"
+      expect(#transcript.slugify(worktree) > 200).to_be(true)
+      dirs[long .. "/.claude/worktrees"] = { "wt1" }
+      store({ transcript.slugify(worktree), transcript.slugify(long .. "/.claude/worktrees/elsewhere") })
+
+      -- The second is a worktree that is not on disk: not findable, not guessed at.
+      assert.same({ "id1" }, ids(transcript.list(long)))
+    end)
+
+    it("lists a conversation once when two directories hold it, as it was last written", function()
+      store({ "-proj", "-proj--claude-worktrees-wt1" })
+      dirs[ROOT .. "/-proj"] = { "same.jsonl" }
+      dirs[ROOT .. "/-proj--claude-worktrees-wt1"] = { "same.jsonl" }
+      put(ROOT .. "/-proj/same.jsonl", { prompt_line("old") }, { mtime = 10 })
+      put(ROOT .. "/-proj--claude-worktrees-wt1/same.jsonl", { prompt_line("new") }, { mtime = 20 })
+
+      local rows = transcript.list("/proj")
+      expect(#rows).to_be(1)
+      expect(rows[1].path).to_be(ROOT .. "/-proj--claude-worktrees-wt1/same.jsonl")
+    end)
+
+    it("carries a fold over to where the file was moved, and reads only what was appended", function()
+      put("/a/s.jsonl", { prompt_line("hello"), edit_line("/proj/x.lua", 2, 0) })
+      local sum = fold("/a/s.jsonl")
+      local events = sum.events
+
+      -- Renamed by the CLI, then written on.
+      fs["/b/s.jsonl"] = fs["/a/s.jsonl"]
+      fs["/a/s.jsonl"] = nil
+      append("/b/s.jsonl", { edit_line("/proj/y.lua", 3, 0) })
+
+      local carried = transcript.rehome("/a/s.jsonl", "/b/s.jsonl")
+      assert.is_true(carried == sum)
+      expect(carried.path).to_be("/b/s.jsonl")
+      expect(transcript.get("/a/s.jsonl")).to_be_nil()
+      assert.is_true(transcript.get("/b/s.jsonl") == sum)
+
+      reads = {}
+      local after = fold("/b/s.jsonl")
+      -- The same table the panes were already drawing from, grown in place.
+      assert.is_true(after == sum)
+      assert.is_true(after.events == events)
+      expect(after.added).to_be(5)
+      expect(#reads).to_be(1)
+      expect(reads[1].offset > 0).to_be(true)
+    end)
+
+    it("starts over rather than carry a fold to a file it cannot show to be the same", function()
+      put("/a/s.jsonl", { prompt_line("hello") })
+      local sum = fold("/a/s.jsonl")
+
+      -- Still where it was: nothing moved.
+      fs["/b/s.jsonl"] = fs["/a/s.jsonl"]
+      expect(transcript.rehome("/a/s.jsonl", "/b/s.jsonl")).to_be_nil()
+
+      -- Another file under the same name: copied across devices, or replaced.
+      fs["/a/s.jsonl"] = nil
+      put("/b/s.jsonl", { prompt_line("hello") }, { ino = 2 })
+      expect(transcript.rehome("/a/s.jsonl", "/b/s.jsonl")).to_be_nil()
+
+      -- Shorter than what was folded: not the same bytes, whatever its inode says.
+      put("/b/s.jsonl", {}, { ino = 1 })
+      expect(transcript.rehome("/a/s.jsonl", "/b/s.jsonl")).to_be_nil()
+
+      -- Nothing folded, nowhere to go.
+      expect(transcript.rehome("/nope.jsonl", "/b/s.jsonl")).to_be_nil()
+      expect(transcript.rehome("/a/s.jsonl", "/nope.jsonl")).to_be_nil()
+      assert.is_true(transcript.get("/a/s.jsonl") == sum)
+    end)
+
+    it("finds a conversation by its id wherever in the store it is", function()
+      -- `/cd` moves a transcript to a directory no rule about the project names.
+      store({ "-proj", "-somewhere-else" })
+      expect(transcript.locate("id2")).to_be(ROOT .. "/-somewhere-else/id2.jsonl")
+      expect(transcript.locate("nope")).to_be_nil()
+      expect(transcript.locate("")).to_be_nil()
+    end)
+
+    it("answers from where it was last found without searching the store again", function()
+      store({ "-proj", "-somewhere-else" })
+      local path = ROOT .. "/-somewhere-else/id2.jsonl"
+      local scans = 0
+      local scandir = transcript._io.scandir
+      transcript._io.scandir = function(dir)
+        scans = scans + 1
+        return scandir(dir)
+      end
+
+      expect(transcript.locate("id2", path)).to_be(path)
+      expect(scans).to_be(0)
+
+      -- Moved again: the hint names nothing, and the store is searched.
+      fs[ROOT .. "/-proj/id2.jsonl"] = fs[path]
+      fs[path] = nil
+      expect(transcript.locate("id2", path)).to_be(ROOT .. "/-proj/id2.jsonl")
+      expect(scans).to_be(1)
     end)
   end)
 
