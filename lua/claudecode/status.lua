@@ -31,7 +31,9 @@
 --- background ones included — and they all report under the conversation's
 --- `session_id`. So "the next event ends the wait" read a background subagent's
 --- tool call as the answer to the question on screen, and the conversation spun
---- as busy for as long as the question stayed up.
+--- as busy for as long as the question stayed up. Nor is a thread one call at a
+--- time: the calls of one message run together, so a question also names its
+--- call, and another call's result does not answer it.
 ---
 --- `done` versus `idle` is the "you have not read this yet" distinction: a turn
 --- that ends while you are on some other tab (or with Neovim in the background)
@@ -98,15 +100,29 @@ local MAIN = "main"
 --- followed before questions had owners.
 local ANYONE = "*"
 
---- How late a question's own `PreToolUse` may arrive and still be recognised as
---- that call rather than a new one. Each hook is its own process, so the call's
---- `PreToolUse` and the `PermissionRequest` spawned a few milliseconds after it
---- race to Neovim, and the first can lose. Read as news, it would end the question
---- it belongs to, and nothing would raise it again until the `Notification` six
---- seconds later — owned by `ANYONE`, so the next subagent event would end that
---- too. A genuine retry of the same tool follows a declined prompt, which takes a
---- human reaction and a new model turn.
+--- How late a `PreToolUse` may arrive after a question and still be a call that
+--- started alongside it rather than the thread moving on. Each hook is its own
+--- process, so a call's `PreToolUse` and the `PermissionRequest` spawned a few
+--- milliseconds after it race to Neovim, and the first can lose — the question's
+--- own call, or one issued in the same message (measured against CLI 2.1.295: the
+--- two `PreToolUse` of such a message fire in the same millisecond). Read as
+--- news, it would end the question, and nothing would raise it again until the
+--- `Notification` six seconds later — owned by `ANYONE`, so the next subagent
+--- event would end that too. A call that really is the thread moving on follows
+--- a declined prompt, which takes a human reaction and a new model turn.
 local LATE_CALL_MS = 2000
+
+--- Tool calls a `PreToolUse` announced and no `PostToolUse` has closed, by
+--- `tool_use_id`: `{ session, thread, tool, input, seq }`. What `M.identify`
+--- pairs a `PermissionRequest` with, since that event names no call.
+local calls = {}
+local call_count = 0
+local call_seq = 0
+
+--- A call that fails, is declined or is cancelled never gets its `PostToolUse`,
+--- and each entry holds the call's whole input (a `Write`'s content), so the
+--- table is emptied per thread when that thread ends its turn and capped besides.
+local MAX_CALLS = 256
 
 ---Whether this terminal draws emoji-capable codepoints with the colour emoji
 ---font instead of the text font. `✳` (U+2733) is the one frame Unicode lists as
@@ -266,6 +282,7 @@ end
 ---Test/reload helper: forget every tab's state and stop animating.
 function M.reset()
   entries = {}
+  calls, call_count, call_seq = {}, 0, 0
   if spinner_timer then
     pcall(function()
       spinner_timer:stop()
@@ -318,14 +335,43 @@ local function tabnr_of(tab)
   return (ok and type(nr) == "number") and nr or nil
 end
 
----@param questions table<string, { tool: string?, at: number }>|nil
----@return table<string, { tool: string?, at: number }>
-local function copy_questions(questions)
+---@param questions table<string, { tool: string?, at: number, id: string?, input: any }>|nil
+---@param public boolean|nil For a consumer: without `input`, which is the asked
+---       about call's whole payload and only there to recognise that call.
+---@return table<string, { tool: string?, at: number, id: string?, input: any }>
+local function copy_questions(questions, public)
   local out = {}
   for thread, question in pairs(questions or {}) do
-    out[thread] = { tool = question.tool, at = question.at }
+    out[thread] = { tool = question.tool, at = question.at, id = question.id }
+    if not public then
+      out[thread].input = question.input
+    end
   end
   return out
+end
+
+---Whether two decoded JSON values are the same value.
+---@param a any
+---@param b any
+---@return boolean
+local function same_value(a, b)
+  if a == b then
+    return true
+  end
+  if type(a) ~= "table" or type(b) ~= "table" then
+    return false
+  end
+  for k, v in pairs(a) do
+    if not same_value(v, b[k]) then
+      return false
+    end
+  end
+  for k in pairs(b) do
+    if a[k] == nil then
+      return false
+    end
+  end
+  return true
 end
 
 ---@param entry table
@@ -336,7 +382,7 @@ local function copy(entry)
     out[k] = v
   end
   if entry.questions then
-    out.questions = copy_questions(entry.questions)
+    out.questions = copy_questions(entry.questions, true)
   end
   out.tabnr = tabnr_of(entry.tab)
   return out
@@ -673,6 +719,124 @@ function M.classify(event, opts)
   return nil, info
 end
 
+---@param event table Decoded hook payload.
+---@return string|nil id The tool call the event is about, when it names one.
+local function call_id(event)
+  local id = event.tool_use_id
+  return (type(id) == "string" and id ~= "") and id or nil
+end
+
+---@param session string
+---@param thread string|nil Every thread of the conversation when nil.
+local function forget_calls(session, thread)
+  for id, call in pairs(calls) do
+    if call.session == session and (thread == nil or call.thread == thread) then
+      calls[id] = nil
+      call_count = call_count - 1
+    end
+  end
+end
+
+---Name the call a `PermissionRequest` is about.
+---
+---`PreToolUse` and `PostToolUse` carry `tool_use_id`; `PermissionRequest` does
+---not (read out of the 2.1.294 binary and measured against 2.1.295) — it has only
+---the tool's name and input, the same input the call's `PreToolUse` carried. So
+---the calls in flight are remembered per thread and a prompt is paired with the
+---newest one of its thread, tool and input, which `M.advance` then knows the
+---question by. A prompt whose `PreToolUse` has not arrived yet stays unnamed and
+---is paired there, when it does.
+---
+---Called once per event by whoever owns the hook transport, before the event is
+---folded into any record: the tab status and the agents view both fold it, and
+---the pairing is a fact about the event, not about either record.
+---@param event table Decoded hook payload; a `PermissionRequest` gains `tool_use_id`.
+function M.identify(event)
+  if type(event) ~= "table" or type(event.session_id) ~= "string" then
+    return
+  end
+  local session, ehn = event.session_id, event.hook_event_name
+  local thread = (type(event.agent_id) == "string" and event.agent_id ~= "") and event.agent_id or MAIN
+  local id = call_id(event)
+
+  if ehn == "PreToolUse" then
+    if not id then
+      return
+    end
+    if not calls[id] then
+      call_count = call_count + 1
+    end
+    call_seq = call_seq + 1
+    calls[id] = { session = session, thread = thread, tool = event.tool_name, input = event.tool_input, seq = call_seq }
+    if call_count > MAX_CALLS then
+      local oldest
+      for other, call in pairs(calls) do
+        if not oldest or call.seq < calls[oldest].seq then
+          oldest = other
+        end
+      end
+      calls[oldest] = nil
+      call_count = call_count - 1
+    end
+  elseif ehn == "PostToolUse" then
+    if id and calls[id] then
+      calls[id] = nil
+      call_count = call_count - 1
+    end
+  elseif ehn == "PermissionRequest" then
+    if id then
+      return
+    end
+    local newest
+    for other, call in pairs(calls) do
+      if
+        call.session == session
+        and call.thread == thread
+        and call.tool == event.tool_name
+        and same_value(call.input, event.tool_input)
+        and (not newest or call.seq > calls[newest].seq)
+      then
+        newest = other
+      end
+    end
+    event.tool_use_id = newest
+  elseif ehn == "Stop" or ehn == "UserPromptSubmit" or ehn == "SubagentStop" then
+    forget_calls(session, thread)
+  elseif ehn == "SessionStart" or ehn == "SessionEnd" then
+    forget_calls(session, nil)
+  end
+end
+
+---Whether a `PostToolUse` is the result of the call a question is about. The
+---input is no help here: the answer is written into it (`answers` on an
+---`AskUserQuestion`, an edited plan or diff).
+---@param question { tool: string?, id: string? }
+---@param event table Decoded hook payload.
+---@return boolean
+local function answers(question, event)
+  local id = call_id(event)
+  if question.id and id then
+    return question.id == id
+  end
+  return question.tool == event.tool_name
+end
+
+---Whether a `PreToolUse` announces the call a question is about: the same tool
+---with the input the prompt showed. Without both inputs the name decides, and
+---only for a question that knows no call yet.
+---@param question { tool: string?, id: string?, input: any }
+---@param event table Decoded hook payload.
+---@return boolean
+local function announces(question, event)
+  if question.tool ~= event.tool_name then
+    return false
+  end
+  if question.input ~= nil and event.tool_input ~= nil then
+    return same_value(question.input, event.tool_input)
+  end
+  return question.id == nil
+end
+
 ---Fold one hook event into a conversation's current state.
 ---
 ---`classify` reads an event on its own; this is the part that needs to know what
@@ -691,14 +855,37 @@ end
 ---subagent's id; `ANYONE` when only a `Notification` said so), and:
 ---
 ---* an event from a thread with no question up changes nothing;
----* one from the thread that asked ends its question — except that call's own
----  `PreToolUse` arriving after its `PermissionRequest` (`LATE_CALL_MS`);
+---* one from the thread that asked ends its question — unless it is about
+---  another call of the same message (below);
 ---* `SubagentStop` from the thread that asked ends its question too: it will not
 ---  report again, and what it found goes back to the conversation, which carries
 ---  on (`busy`);
 ---* another question adds to the set, and the state leaves `waiting` only once
 ---  the set is empty;
 ---* a session starting or ending takes every question with it.
+---
+---**A thread is not one call at a time.** The calls of one assistant message
+---that may run together do (measured against CLI 2.1.295: `Agent` and
+---`AskUserQuestion` issued in one message fired both `PreToolUse` in the same
+---millisecond, and `PostToolUse(Agent)` in the same millisecond as
+---`PermissionRequest(AskUserQuestion)`). So the asking thread reports about its
+---other calls while its question is up, and "the thread that asked moved on" read
+---a background agent's launch returning as the answer: the question was dropped
+---the instant it went up, the `Notification` six seconds later re-raised it for
+---`ANYONE`, and the subagent's next tool call ended that. A question therefore
+---names its call (`id`, from `M.identify`) and:
+---
+---* a `PostToolUse` ends it only when it is that call's — a `WebFetch` issued
+---  beside the question returned 1.4s into it, and anything slower returns later
+---  still. No other `PostToolUse` is needed as an answer: a call made after the
+---  prompt was declined is seen starting first;
+---* a `PreToolUse` within `LATE_CALL_MS` of the question is a call that started
+---  with it, whichever it is. Past that it is the thread carrying on after a
+---  declined prompt, which no hook reports — except the question's own call
+---  arriving late, recognised by its id or by carrying the input the prompt
+---  showed.
+---
+---Without ids (an event that carries none) a call is told apart by tool name.
 ---
 ---Pure, like `classify`: the tab status and the agents view each keep their own
 ---records and pass them in.
@@ -726,7 +913,7 @@ function M.advance(prev, event, opts)
   if state == "waiting" then
     local questions = copy_questions(pending)
     if ehn ~= "Notification" then
-      questions[thread] = { tool = info.tool, at = now }
+      questions[thread] = { tool = info.tool, at = now, id = call_id(event), input = event.tool_input }
     elseif not pending then
       questions[ANYONE] = { at = now }
     end
@@ -753,8 +940,31 @@ function M.advance(prev, event, opts)
   if not own and (state == nil or not pending[ANYONE]) then
     return nil, info
   end
-  if own and ehn == "PreToolUse" and own.tool == info.tool and now - (own.at or 0) < LATE_CALL_MS then
+  if own and ehn == "PostToolUse" and not answers(own, event) then
     return nil, info
+  end
+  if own and ehn == "PreToolUse" then
+    local id = call_id(event)
+    if id and own.id == id then
+      return nil, info
+    end
+    if now - (own.at or 0) < LATE_CALL_MS then
+      if not id or not announces(own, event) then
+        return nil, info
+      end
+      -- The question's call, named only now: its `PreToolUse` lost the race, so
+      -- it was not in flight yet for `M.identify` to pair the prompt with.
+      local questions = copy_questions(pending)
+      questions[thread].id = id
+      return "waiting",
+        {
+          tool = prev_tool,
+          message = prev_message,
+          session_id = info.session_id,
+          agent_id = info.agent_id,
+          questions = questions,
+        }
+    end
   end
 
   local questions = copy_questions(pending)

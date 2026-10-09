@@ -1697,6 +1697,28 @@ describe("agents.model", function()
       expect(model.status_of("aaa").state).to_be("busy")
     end)
 
+    it("keeps a question up when the agent it launched in the same message returns", function()
+      -- The second report: a background Agent and AskUserQuestion issued in one
+      -- message. The launch returning is a PostToolUse from the thread that
+      -- asked, and it took the question down the instant it went up.
+      local status = require("claudecode.status")
+      local function hook(event)
+        event.session_id = "aaa"
+        status.identify(event)
+        model.note(event)
+      end
+      hook({ hook_event_name = "PreToolUse", tool_name = "Agent", tool_use_id = "toolu_agent" })
+      hook({ hook_event_name = "PreToolUse", tool_name = "AskUserQuestion", tool_use_id = "toolu_ask" })
+      hook({ hook_event_name = "PermissionRequest", tool_name = "AskUserQuestion" })
+      hook({ hook_event_name = "PostToolUse", tool_name = "Agent", tool_use_id = "toolu_agent" })
+      hook({ hook_event_name = "Notification", message = "Claude needs your permission" })
+      hook({ hook_event_name = "PreToolUse", tool_name = "Bash", tool_use_id = "toolu_b", agent_id = "a1" })
+      expect(model.status_of("aaa").state).to_be("waiting")
+
+      hook({ hook_event_name = "PostToolUse", tool_name = "AskUserQuestion", tool_use_id = "toolu_ask" })
+      expect(model.status_of("aaa").state).to_be("busy")
+    end)
+
     it("never clears waiting by reading it", function()
       -- Looking at a question is not answering it.
       model.note({ hook_event_name = "Notification", message = "needs permission", session_id = "bbb" })

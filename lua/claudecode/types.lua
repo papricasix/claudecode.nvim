@@ -31,7 +31,7 @@
 ---@field state ClaudeCodeStatusState
 ---@field tool string|nil Tool Claude is running (busy) or asking about (waiting)
 ---@field message string|nil Notification text, for a "waiting" state
----@field questions table<string, { tool: string?, at: number }>|nil For a "waiting" state: the questions up, keyed by the thread that asked ("main", a subagent id, or "*" when only a Notification said so)
+---@field questions table<string, { tool: string?, at: number, id: string? }>|nil For a "waiting" state: the questions up, keyed by the thread that asked ("main", a subagent id, or "*" when only a Notification said so); `id` is the tool call asked about, when known
 ---@field session_id string|nil Claude conversation id reported by the CLI
 ---@field since number Monotonic ms (vim.loop.now) when this state was entered
 ---@field updated_at number|nil Monotonic ms of the last event for this tab

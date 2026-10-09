@@ -443,7 +443,16 @@ function M.dispatch(event, source_tab, agent_id)
 
   -- Per-tab activity status. Fed first and from every event kind (including the
   -- ones below that return early), since it is the only consumer that cares about
-  -- Stop/Notification/UserPromptSubmit.
+  -- Stop/Notification/UserPromptSubmit. `identify` comes before either consumer
+  -- of the status rules: it names the call a permission prompt is about, which
+  -- the event itself does not. Only under the hooks those rules are fed by —
+  -- it remembers each call until its PostToolUse, and the live cursor's own
+  -- file-tool matcher sends none.
+  pcall(function()
+    if status_enabled() or agents_enabled() then
+      require("claudecode.status").identify(event)
+    end
+  end)
   pcall(function()
     require("claudecode.status").note(event, source_tab)
   end)

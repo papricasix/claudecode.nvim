@@ -102,15 +102,36 @@ describe("agents seams", function()
       return record
     end
 
-    it("recognises the asked-about call's own PreToolUse only while it can still be late", function()
+    it("takes a PreToolUse for a call that started with the question only while it can still be late", function()
       local asked = { hook_event_name = "PermissionRequest", tool_name = "Bash" }
       local late = { hook_event_name = "PreToolUse", tool_name = "Bash" }
       expect(run({ { event = asked, now = 1000 }, { event = late, now = 1400 } }).state).to_be("waiting")
       -- A retry after a declined prompt takes a person and a new model turn.
       expect(run({ { event = asked, now = 1000 }, { event = late, now = 9000 } }).state).to_be("busy")
-      -- Another tool from the same thread is news however soon it comes.
+      -- Another tool that soon is a call of the same message whose hook lost the
+      -- race (2.1.295 fires both PreToolUse in one millisecond), not the thread
+      -- moving on; later, it is the thread carrying on after a declined prompt.
       local other = { hook_event_name = "PreToolUse", tool_name = "Read" }
-      expect(run({ { event = asked, now = 1000 }, { event = other, now = 1001 } }).state).to_be("busy")
+      expect(run({ { event = asked, now = 1000 }, { event = other, now = 1001 } }).state).to_be("waiting")
+      expect(run({ { event = asked, now = 1000 }, { event = other, now = 9000 } }).state).to_be("busy")
+    end)
+
+    it("keeps a question up through the result of another call, however late it comes", function()
+      -- A slow call issued in the same message as the question returns on the
+      -- thread that asked, long after the prompt went up.
+      local asked = { hook_event_name = "PermissionRequest", tool_name = "AskUserQuestion", tool_use_id = "q" }
+      local sibling = { hook_event_name = "PostToolUse", tool_name = "Agent", tool_use_id = "a" }
+      local answer = { hook_event_name = "PostToolUse", tool_name = "AskUserQuestion", tool_use_id = "q" }
+      expect(run({ { event = asked, now = 1000 }, { event = sibling, now = 600000 } }).state).to_be("waiting")
+      expect(
+        run({ { event = asked, now = 1000 }, { event = sibling, now = 600000 }, { event = answer, now = 600500 } }).state
+      ).to_be("busy")
+    end)
+
+    it("knows the question's own call by its id however late its PreToolUse arrives", function()
+      local asked = { hook_event_name = "PermissionRequest", tool_name = "Bash", tool_use_id = "q" }
+      local own = { hook_event_name = "PreToolUse", tool_name = "Bash", tool_use_id = "q" }
+      expect(run({ { event = asked, now = 1000 }, { event = own, now = 9000 } }).state).to_be("waiting")
     end)
 
     it("says nothing about events it does not change", function()

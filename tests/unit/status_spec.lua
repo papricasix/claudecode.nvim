@@ -354,6 +354,150 @@ describe("status", function()
     end)
   end)
 
+  describe("a question is about one call", function()
+    local ASKED = { questions = { { question = "Pick a colour", header = "Colour" } } }
+
+    --- Feed one hook event the way `live_cursor.dispatch` does: named, then folded.
+    local function hook(hook_event_name, extra)
+      local event = { hook_event_name = hook_event_name, session_id = "sess-1" }
+      for k, v in pairs(extra or {}) do
+        event[k] = v
+      end
+      status.identify(event)
+      status.note(event, 1)
+      return event
+    end
+
+    before_each(function()
+      enable()
+    end)
+
+    it("stays up when a call issued beside it returns", function()
+      -- The reported sequence, measured against CLI 2.1.295 through a pty: one
+      -- assistant message issued a background Agent and AskUserQuestion. Both
+      -- PreToolUse fired in the same millisecond, and PostToolUse(Agent) — the
+      -- launch returning — in the same millisecond as the PermissionRequest. It
+      -- comes from the thread that asked, so it read as that thread moving on:
+      -- the question was dropped, the Notification re-raised it for anyone, and
+      -- the subagent's next call ended that. The row spun for 21 minutes.
+      hook("PreToolUse", { tool_name = "Agent", tool_use_id = "toolu_agent", tool_input = { prompt = "tick" } })
+      hook("PreToolUse", { tool_name = "AskUserQuestion", tool_use_id = "toolu_ask", tool_input = ASKED })
+      -- A PermissionRequest names no call: only the tool and its input.
+      hook("PermissionRequest", { tool_name = "AskUserQuestion", tool_input = ASKED })
+      hook("PostToolUse", { tool_name = "Agent", tool_use_id = "toolu_agent", tool_input = { prompt = "tick" } })
+      expect(status.get_state(1)).to_be("waiting")
+
+      hook("PreToolUse", { tool_name = "Read", tool_use_id = "toolu_r", agent_id = "a1" })
+      hook("PostToolUse", { tool_name = "Read", tool_use_id = "toolu_r", agent_id = "a1" })
+      hook("Notification", { message = "Claude needs your permission" })
+      hook("PreToolUse", { tool_name = "Bash", tool_use_id = "toolu_b", agent_id = "a1" })
+      hook("PostToolUse", { tool_name = "Bash", tool_use_id = "toolu_b", agent_id = "a1" })
+      local entry = status.get(1)
+      expect(entry.state).to_be("waiting")
+      expect(entry.tool).to_be("AskUserQuestion")
+      expect(entry.questions.main.id).to_be("toolu_ask")
+      expect(entry.questions["*"]).to_be_nil()
+
+      -- The answer is written into the call's input, so only the id says whose
+      -- result this is.
+      hook("PostToolUse", {
+        tool_name = "AskUserQuestion",
+        tool_use_id = "toolu_ask",
+        tool_input = { questions = ASKED.questions, answers = { ["Pick a colour"] = "Red" } },
+      })
+      expect(status.get_state(1)).to_be("busy")
+    end)
+
+    it("stays up whichever of the two reaches Neovim first", function()
+      -- Each hook is its own process, and these two are spawned together.
+      hook("PreToolUse", { tool_name = "Agent", tool_use_id = "toolu_agent" })
+      hook("PreToolUse", { tool_name = "AskUserQuestion", tool_use_id = "toolu_ask", tool_input = ASKED })
+      hook("PostToolUse", { tool_name = "Agent", tool_use_id = "toolu_agent" })
+      hook("PermissionRequest", { tool_name = "AskUserQuestion", tool_input = ASKED })
+      expect(status.get_state(1)).to_be("waiting")
+    end)
+
+    it("tells the asked-about call from another of the same tool by its input", function()
+      hook(
+        "PreToolUse",
+        { tool_name = "WebFetch", tool_use_id = "toolu_a", tool_input = { url = "https://a.example" } }
+      )
+      hook(
+        "PreToolUse",
+        { tool_name = "WebFetch", tool_use_id = "toolu_b", tool_input = { url = "https://b.example" } }
+      )
+      hook("PermissionRequest", { tool_name = "WebFetch", tool_input = { url = "https://a.example" } })
+      expect(status.get(1).questions.main.id).to_be("toolu_a")
+
+      hook("PostToolUse", { tool_name = "WebFetch", tool_use_id = "toolu_b" })
+      expect(status.get_state(1)).to_be("waiting")
+      hook("PostToolUse", { tool_name = "WebFetch", tool_use_id = "toolu_a" })
+      expect(status.get_state(1)).to_be("busy")
+    end)
+
+    it("names the call once its PreToolUse arrives, when the prompt got there first", function()
+      hook("PermissionRequest", { tool_name = "AskUserQuestion", tool_input = ASKED })
+      expect(status.get(1).questions.main.id).to_be_nil()
+      -- A call of the same message, late too: not the one asked about.
+      hook("PreToolUse", { tool_name = "Agent", tool_use_id = "toolu_agent", tool_input = { prompt = "tick" } })
+      expect(status.get(1).questions.main.id).to_be_nil()
+      hook("PreToolUse", { tool_name = "AskUserQuestion", tool_use_id = "toolu_ask", tool_input = ASKED })
+      expect(status.get_state(1)).to_be("waiting")
+      expect(status.get(1).questions.main.id).to_be("toolu_ask")
+
+      hook("PostToolUse", { tool_name = "Agent", tool_use_id = "toolu_agent" })
+      expect(status.get_state(1)).to_be("waiting")
+    end)
+
+    it("pairs a prompt with the newest of two identical calls", function()
+      -- Declined and tried again: the first call never got a PostToolUse.
+      hook("PreToolUse", { tool_name = "Bash", tool_use_id = "toolu_1", tool_input = { command = "make" } })
+      hook("PreToolUse", { tool_name = "Bash", tool_use_id = "toolu_2", tool_input = { command = "make" } })
+      hook("PermissionRequest", { tool_name = "Bash", tool_input = { command = "make" } })
+      expect(status.get(1).questions.main.id).to_be("toolu_2")
+    end)
+
+    it("pairs nothing with a call of another thread, or of a turn that is over", function()
+      hook(
+        "PreToolUse",
+        { tool_name = "Bash", tool_use_id = "toolu_s", tool_input = { command = "make" }, agent_id = "a1" }
+      )
+      hook("PermissionRequest", { tool_name = "Bash", tool_input = { command = "make" } })
+      expect(status.get(1).questions.main.id).to_be_nil()
+
+      hook("PreToolUse", { tool_name = "Bash", tool_use_id = "toolu_m", tool_input = { command = "ls" } })
+      hook("Stop")
+      hook("PermissionRequest", { tool_name = "Bash", tool_input = { command = "ls" } })
+      expect(status.get(1).questions.main.id).to_be_nil()
+    end)
+
+    it("tells calls apart by tool when the events carry no ids", function()
+      note("PermissionRequest", { tool_name = "AskUserQuestion" })
+      note("PostToolUse", { tool_name = "Agent" })
+      expect(status.get_state(1)).to_be("waiting")
+      note("PostToolUse", { tool_name = "AskUserQuestion" })
+      expect(status.get_state(1)).to_be("busy")
+    end)
+
+    it("keeps the asked-about input to itself", function()
+      -- It is the call's whole payload, held only to recognise that call.
+      hook("PermissionRequest", { tool_name = "Write", tool_input = { file_path = "/x", content = "long" } })
+      local question = status.get(1).questions.main
+      expect(question.tool).to_be("Write")
+      expect(question.input).to_be_nil()
+    end)
+
+    it("holds the same for a subagent's question", function()
+      hook("PreToolUse", { tool_name = "Read", tool_use_id = "toolu_r", agent_id = "a1" })
+      hook("PreToolUse", { tool_name = "WebFetch", tool_use_id = "toolu_w", agent_id = "a1" })
+      hook("PermissionRequest", { tool_name = "WebFetch", agent_id = "a1" })
+      hook("PostToolUse", { tool_name = "Read", tool_use_id = "toolu_r", agent_id = "a1" })
+      expect(status.get_state(1)).to_be("waiting")
+      hook("PostToolUse", { tool_name = "WebFetch", tool_use_id = "toolu_w", agent_id = "a1" })
+      expect(status.get_state(1)).to_be("busy")
+    end)
+  end)
+
   describe("read and unread answers", function()
     before_each(function()
       enable()
@@ -645,6 +789,33 @@ describe("status", function()
     it("injects nothing when every feature is off", function()
       status.setup(base_config({ enabled = false }))
       expect(live_cursor.build_launch_injection()).to_be_nil()
+    end)
+  end)
+
+  describe("hook transport", function()
+    local live_cursor
+
+    before_each(function()
+      package.loaded["claudecode.live_cursor"] = nil
+      live_cursor = require("claudecode.live_cursor")
+      live_cursor.setup(base_config({ enabled = true }))
+      enable()
+    end)
+
+    it("names a prompt's call before the event is folded", function()
+      -- A PermissionRequest carries no tool_use_id, and the rule that keeps a
+      -- question up through another call's result needs one.
+      local function send(event)
+        event.session_id = "sess-1"
+        live_cursor.dispatch(event, 1)
+      end
+      send({ hook_event_name = "PreToolUse", tool_name = "Agent", tool_use_id = "toolu_agent" })
+      send({ hook_event_name = "PreToolUse", tool_name = "AskUserQuestion", tool_use_id = "toolu_ask" })
+      send({ hook_event_name = "PermissionRequest", tool_name = "AskUserQuestion" })
+      send({ hook_event_name = "PostToolUse", tool_name = "Agent", tool_use_id = "toolu_agent" })
+
+      expect(status.get_state(1)).to_be("waiting")
+      expect(status.get(1).questions.main.id).to_be("toolu_ask")
     end)
   end)
 end)
