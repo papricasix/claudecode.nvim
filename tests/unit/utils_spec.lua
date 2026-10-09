@@ -47,6 +47,34 @@ describe("claudecode.utils.shell_split", function()
   end)
 end)
 
+describe("claudecode.utils.shell_quote", function()
+  local utils = require("claudecode.utils")
+
+  it("comes back from shell_split as the one word it was", function()
+    for _, word in ipairs({
+      "plain",
+      "two words",
+      "it's",
+      "''",
+      'say "hi"',
+      "back\\slash",
+      "$HOME `id` *.lua",
+      "-leading-dash",
+      "tab\there",
+      "",
+    }) do
+      assert.are.same({ word }, utils.shell_split(utils.shell_quote(word)))
+    end
+  end)
+
+  it("joins onto an option as part of the same word", function()
+    assert.are.same(
+      { "claude", "--name=it's a plan-2" },
+      utils.shell_split("claude --name=" .. utils.shell_quote("it's a plan-2"))
+    )
+  end)
+end)
+
 describe("claudecode.utils.expand_tilde", function()
   local utils = require("claudecode.utils")
   local home = os.getenv("HOME")

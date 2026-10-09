@@ -103,6 +103,13 @@ describe("agents_view", function()
       expect((pcall(config.validate, base_config({ keymaps = { new = 42 } })))).to_be(false)
     end)
 
+    it("takes a keymap for a new agent named after a session", function()
+      expect(config.defaults.agents.keymaps.follow_up).to_be("A")
+      expect((pcall(config.validate, base_config({ keymaps = { follow_up = "gA" } })))).to_be_true()
+      expect((pcall(config.validate, base_config({ keymaps = { follow_up = false } })))).to_be_true()
+      expect((pcall(config.validate, base_config({ keymaps = { follow_up = 42 } })))).to_be(false)
+    end)
+
     it("takes keymaps and a highlight for checkpoints", function()
       expect((pcall(config.validate, base_config({ keymaps = { checkpoint = "C", checkpoint_drop = false } })))).to_be_true()
       expect((pcall(config.validate, base_config({ keymaps = { checkpoint = 42 } })))).to_be(false)
@@ -1040,6 +1047,132 @@ describe("agents_view", function()
       expect(#launched).to_be(1)
     end)
 
+    describe("starting a new agent named after a session", function()
+      local launches, next_names
+
+      before_each(function()
+        launches, next_names = {}, { aaa = "First-2", bbb = "Second-2" }
+        package.loaded["claudecode.agents.registry"].launch = function(id, launch_opts)
+          launches[#launches + 1] = { id = id, opts = launch_opts }
+          live[id] = true
+          return { bufnr = vim.api.nvim_create_buf(false, true) }
+        end
+        package.loaded["claudecode.agents.model"].follow_up_name = function(id)
+          return next_names[id]
+        end
+        -- The key as an applied config carries it; the bare table the other
+        -- specs hand over has no keys at all.
+        agents_view.setup(base_config({ enabled = true, keymaps = { follow_up = "A" } }))
+      end)
+
+      it("starts a new conversation under the selected session's name, numbered on", function()
+        open_view()
+        expect(selected).to_be("aaa")
+        expect(agents_view.new_follow_up()).to_be("First-2")
+
+        expect(#launches).to_be(1)
+        expect(launches[1].opts.name).to_be("First-2")
+        -- A conversation of its own, not the old one resumed.
+        expect(launches[1].id ~= "aaa").to_be_true()
+        expect(launches[1].opts.resume).to_be(false)
+      end)
+
+      it("selects the new one and puts the user in it", function()
+        open_view()
+        agents_view.new_follow_up()
+        expect(selected).to_be(launches[1].id)
+        expect(launches[1].opts.focus).to_be_true()
+        expect(agents_view._state().pending_start).to_be(nil)
+      end)
+
+      it("follows the session it is told to, rather than the selected one", function()
+        open_view()
+        expect(agents_view.new_follow_up("bbb")).to_be("Second-2")
+        expect(launches[1].opts.name).to_be("Second-2")
+      end)
+
+      it("means the row under the cursor in the sessions pane", function()
+        -- Like `x` and `dd`: the list is read down, to rows that are not the one
+        -- on screen.
+        open_view()
+        local win = agents_view._state().wins.sessions
+        vim.api.nvim_set_current_win(win)
+        vim.api.nvim_win_set_cursor(win, { 2, 0 })
+        expect(agents_view.follow_up_under_cursor()).to_be("Second-2")
+      end)
+
+      it("means the selected session in every other pane", function()
+        open_view()
+        local win = agents_view._state().wins.feed
+        vim.api.nvim_set_current_win(win)
+        expect(agents_view.follow_up_under_cursor()).to_be("First-2")
+      end)
+
+      it("starts it where the session it follows is resumed from", function()
+        vim._mock.add_dir("/elsewhere")
+        package.loaded["claudecode.agents.model"].row = function(id)
+          return { session_id = id, title = "First", cwd = "/elsewhere" }
+        end
+        open_view()
+        agents_view.new_follow_up()
+        expect(launches[1].opts.cwd).to_be("/elsewhere")
+      end)
+
+      it("falls back to the view's directory when that one is gone", function()
+        package.loaded["claudecode.agents.model"].row = function(id)
+          return { session_id = id, title = "First", cwd = "/moved/away" }
+        end
+        open_view()
+        agents_view.new_follow_up()
+        expect(launches[1].opts.cwd).to_be("/proj")
+      end)
+
+      it("starts nothing for a session that has no name yet", function()
+        next_names.aaa = nil
+        open_view()
+        expect(agents_view.new_follow_up()).to_be(nil)
+        expect(#launches).to_be(0)
+        expect(vim._last_notify.msg:find("no name yet", 1, true) ~= nil).to_be_true()
+      end)
+
+      it("starts nothing with no session to follow", function()
+        rows = {}
+        open_view()
+        expect(agents_view.new_follow_up()).to_be(nil)
+        expect(#launches).to_be(0)
+      end)
+
+      it("leaves a plain new agent unnamed", function()
+        open_view()
+        agents_view.new_agent()
+        expect(#launches).to_be(1)
+        expect(launches[1].opts.name).to_be(nil)
+        expect(launches[1].opts.cwd).to_be("/proj")
+      end)
+
+      it("names the key, and what the new one would be called, where a stopped session is offered", function()
+        open_view()
+        expect(agents_view._state().notice_kind).to_be("offer")
+        expect(center_lines():find("start a new agent called First-2", 1, true) ~= nil).to_be_true()
+
+        local bound
+        for _, keymap in ipairs(vim.api.nvim_buf_get_keymap(agents_view._state().notice_buf, "n")) do
+          if keymap.lhs == "A" then
+            bound = keymap
+          end
+        end
+        expect(bound).not_to_be_nil()
+        bound.callback()
+        expect(launches[1].opts.name).to_be("First-2")
+      end)
+
+      it("does not offer it for a session with no name to carry on", function()
+        next_names.aaa = nil
+        open_view()
+        expect(center_lines():find("start a new agent called", 1, true)).to_be(nil)
+      end)
+    end)
+
     describe("after deleting the selected session", function()
       ---Delete rows the way `dd` does, from the sessions pane, answering yes.
       local function delete_rows(first, last)
@@ -1783,6 +1916,15 @@ describe("agents_view", function()
       )
     end)
 
+    it("offers the numbered new agent in every pane that is about one session", function()
+      setup_with({ enabled = true })
+      for _, pane in ipairs({ "sessions", "feed", "changes", "subagents", "center" }) do
+        expect(keys_for(pane)["A"]:find("plan-2", 1, true) ~= nil).to_be_true()
+      end
+      setup_with({ enabled = true, keymaps = { follow_up = false } })
+      expect(keys_for("sessions")["A"]).to_be(nil)
+    end)
+
     it("offers the subagent naming toggle in the Subagents pane alone", function()
       setup_with({ enabled = true })
       expect(keys_for("subagents")["g."]).to_be_string()
@@ -2137,15 +2279,21 @@ describe("agents_view", function()
 
   describe("an agent that ran /clear", function()
     local rekeyed, changed, selected, refreshed
+    local given -- what the stubbed model says the conversation being left was called: { name, known }
+    local named -- every name the registry was told, in order: { session id, name }
 
     before_each(function()
       rekeyed, changed, selected, refreshed = {}, {}, {}, 0
+      given, named = { nil, false }, {}
 
       package.loaded["claudecode.agents.registry"] = {
         -- The launch key is what stays put; the conversation is what moves.
         rekey = function(agent_key, session_id, opts)
           rekeyed[#rekeyed + 1] = { agent_key, session_id, opts and opts.reclaim }
           return agent_key == "1:old" and "old" or nil
+        end,
+        set_name = function(session_id, name)
+          named[#named + 1] = { session_id, name }
         end,
         is_live = function()
           return false
@@ -2161,6 +2309,9 @@ describe("agents_view", function()
         note_session_change = function(previous, session_id)
           changed[#changed + 1] = { previous, session_id }
           return previous == "old"
+        end,
+        given_name = function()
+          return given[1], given[2]
         end,
         refresh_list = function()
           refreshed = refreshed + 1
@@ -2201,6 +2352,62 @@ describe("agents_view", function()
     it("takes the selection with it when it was on the old conversation", function()
       agents_view.note({ hook_event_name = "SessionStart", session_id = "new" }, 1, "1:old")
       expect(selected[1]).to_be("new")
+    end)
+
+    describe("and what the new conversation is called", function()
+      -- Measured against CLI 2.1.295: a name goes through `/clear`, whether it
+      -- came from `--name` or from a `/rename` since, and the new conversation's
+      -- transcript is written at once — listed before anything has read it.
+      local function cleared()
+        agents_view.note({ hook_event_name = "SessionStart", source = "clear", session_id = "new" }, 1, "1:old")
+      end
+
+      it("tells the launch what the one it left was called", function()
+        given = { "renamed-here", true }
+        cleared()
+        expect(#named).to_be(1)
+        expect(named[1][1]).to_be("new")
+        expect(named[1][2]).to_be("renamed-here")
+      end)
+
+      it("tells it before the list is rebuilt, which is where the name is read", function()
+        given = { "renamed-here", true }
+        package.loaded["claudecode.agents.model"].refresh_list = function()
+          refreshed = #named
+        end
+        cleared()
+        expect(refreshed).to_be(1)
+      end)
+
+      it("tells it that the one it left had no name", function()
+        given = { nil, true }
+        cleared()
+        expect(#named).to_be(1)
+        expect(named[1][1]).to_be("new")
+        expect(named[1][2]).to_be(nil)
+      end)
+
+      it("leaves the launch's own name for a conversation left before it wrote anything", function()
+        given = { nil, false }
+        cleared()
+        expect(#named).to_be(0)
+      end)
+
+      it("forgets the name on any other switch", function()
+        -- A resume from inside the CLI is onto a conversation with a name of its
+        -- own, or none; the one the launch had describes neither.
+        given = { "renamed-here", true }
+        agents_view.note({ hook_event_name = "SessionStart", source = "resume", session_id = "new" }, 1, "1:old")
+        expect(#named).to_be(1)
+        expect(named[1][1]).to_be("new")
+        expect(named[1][2]).to_be(nil)
+      end)
+
+      it("says nothing when the agent did not move", function()
+        given = { "renamed-here", true }
+        agents_view.note({ hook_event_name = "SessionStart", source = "clear", session_id = "new" }, 1, "2:other")
+        expect(#named).to_be(0)
+      end)
     end)
 
     it("only lets a SessionStart claim a conversation the agent already left", function()

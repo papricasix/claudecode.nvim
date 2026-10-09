@@ -205,6 +205,7 @@ Configure the plugin with the detected path:
 - `:ClaudeCodeAgentsCheckpoint[!]` - Draw a line through the selected agent session's history, so what it does from now on is listed apart from what it did before; with `!`, drop its newest checkpoint
 - `:ClaudeCodeAgentsFlag[!] [note]` - Flag the selected agent session so it is not forgotten, or unflag it; your next reply to it takes the flag off. With a note, the flag stays until removed; with `!`, unflag
 - `:ClaudeCodeAgentNew` - Start a new agent in the agents view
+- `:ClaudeCodeAgentFollowUp` - Start a new agent named after the selected agent session, numbered on (`plan` → `plan-2` → `plan-3`), and select it
 - `:checkhealth claudecode` - Report the prerequisites (Neovim version, Claude CLI, terminal provider) and every running instance's port, lock file and connection
 
 ## Agents Mode
@@ -259,6 +260,7 @@ there too.
   rebound or turned off shows up rebound or not at all.
 - `a` starts a new agent, `x` stops the one under the cursor, `r` re-reads
   everything and re-sorts the list.
+- `A` starts a new agent **named after this session, numbered on**: from `plan` it is `plan-2`, from `plan-2` it is `plan-3`, and a number another session already has is stepped over. For work that outgrows its conversation — the new agent starts with an empty context, but the list reads as one piece of work in parts. "This session" is the row under the cursor in the sessions pane and the selected session everywhere else, including the centre's screen for a session that is not running, which names the key and what the new one would be called. The name is whatever the session is listed as: what you `/rename`d it to, else Claude's generated title, else its first prompt. It is passed to the CLI at launch (`claude --name`), so the new session is called that from the start, in Claude's own prompt box too, and `/rename` changes it like any other. A trailing number longer than three digits is taken for a date or a ticket rather than a counter (`issue-4521` → `issue-4521-2`). `:ClaudeCodeAgentFollowUp` does the same for the selected session, which is what to map if you want it from inside the agent's terminal.
 - **The list shows the last two weeks**, newest first, capped at 200 rows. A
   project you have worked in for months has an archive of conversations, not a
   list, and the ones worth resuming are almost always recent — but nothing you
@@ -535,6 +537,7 @@ opts = {
     },
     keymaps = {
       select = "<CR>", new = "a", stop = "x", delete = "dd", refresh = "r",
+      follow_up = "A",            -- new agent named after this session: plan -> plan-2
       search = "gf",              -- search the conversations (sessions pane)
       sort = "gs",                -- sessions pane: choose what the list is ordered by
       flag = "m",                 -- sessions pane: flag / unflag (your next reply unflags)

@@ -8,6 +8,7 @@ describe("agents.model", function()
   local summaries -- [path] = summary handed back by the stubbed transcript
   local scans -- paths passed to transcript.summary, in order
   local live -- conversations the stubbed registry reports as running
+  local launch_names -- [id] = what the stubbed registry says a launch named its conversation
   local git_calls
   local git_result -- what the stubbed `git status` answers
   local scheduled -- pending scheduler callbacks
@@ -38,6 +39,7 @@ describe("agents.model", function()
     summaries, scans, live, git_calls, scheduled, deleted, stale = {}, {}, {}, 0, {}, {}, {}
     git_result = {}
     elsewhere, locates, invalidated, git_roots, rehomed = {}, {}, {}, {}, {}
+    launch_names = {}
 
     package.loaded["claudecode.agents.transcript"] = {
       setup = function() end,
@@ -146,7 +148,7 @@ describe("agents.model", function()
         return ids
       end,
       get = function(id)
-        return live[id] and { session_id = id, cwd = "/proj" } or nil
+        return live[id] and { session_id = id, cwd = "/proj", name = launch_names[id] } or nil
       end,
     }
 
@@ -388,6 +390,77 @@ describe("agents.model", function()
       expect(model.rows()[1].title).to_be("New session")
     end)
 
+    it("calls such an agent what its launch named it", function()
+      -- The CLI shows a `--name` in its prompt box at once and writes it with the
+      -- first message; until then the launch is the only place that knows it.
+      live.ccc = true
+      launch_names.ccc = "plan-2"
+      model.refresh_list()
+      for _, row in ipairs(model.rows()) do
+        if row.session_id == "ccc" then
+          expect(row.title).to_be("plan-2")
+        end
+      end
+      expect(model.row("ccc").title).to_be("plan-2")
+    end)
+
+    describe("a running conversation whose transcript is there but unread", function()
+      -- What `/clear` leaves in a named session (measured against CLI 2.1.295):
+      -- the new conversation's transcript is written at once, so it is listed
+      -- from the directory with no fold and no row before it.
+      local function list_unread(id)
+        package.loaded["claudecode.agents.transcript"].list = function()
+          return { { id = id, path = "/p/" .. id .. ".jsonl", size = 1, mtime = os.time(), summary = nil } }
+        end
+      end
+
+      it("is called what its launch says, not by its id", function()
+        live.ccc = true
+        launch_names.ccc = "carried-over"
+        list_unread("ccc")
+        model.refresh_list()
+        expect(model.rows()[1].session_id).to_be("ccc")
+        expect(model.rows()[1].title).to_be("carried-over")
+      end)
+
+      it("is called what its transcript says once that has been read", function()
+        live.ccc = true
+        launch_names.ccc = "carried-over"
+        list_unread("ccc")
+        model.refresh_list()
+        summaries.ccc = summary_for("ccc", { name = "renamed since" })
+        model.fold_row(model.row("ccc"))
+        expect(model.rows()[1].title).to_be("renamed since")
+      end)
+
+      it("keeps the title it already had over the launch's", function()
+        summaries.ccc = summary_for("ccc", { name = "renamed since" })
+        model.refresh_list()
+        live.ccc = true
+        launch_names.ccc = "plan-2"
+        list_unread("ccc")
+        model.refresh_list()
+        expect(model.rows()[1].title).to_be("renamed since")
+      end)
+
+      it("still goes by its id when the launch has no name for it", function()
+        live.ccc = true
+        list_unread("ccc")
+        model.refresh_list()
+        expect(model.rows()[1].title).to_be("ccc")
+      end)
+
+      it("is called that wherever else in the store its transcript is", function()
+        -- `/cd` puts it where the project's enumeration does not look.
+        live.ccc = true
+        launch_names.ccc = "carried-over"
+        elsewhere.ccc = "/elsewhere/ccc.jsonl"
+        model.refresh_list()
+        expect(model.row("ccc").path).to_be("/elsewhere/ccc.jsonl")
+        expect(model.row("ccc").title).to_be("carried-over")
+      end)
+    end)
+
     it("drops the row when the agent stops before saying anything", function()
       live.ccc = true
       model.refresh_list()
@@ -426,6 +499,122 @@ describe("agents.model", function()
       model.attach(1, "/proj")
       expect(model.sort_mode().key).to_be("name")
       expect(model.sort_mode().desc).to_be(false)
+    end)
+  end)
+
+  describe("naming a new conversation after one", function()
+    it("numbers a name on", function()
+      expect(model._next_name("plan")).to_be("plan-2")
+      expect(model._next_name("plan-2")).to_be("plan-3")
+      expect(model._next_name("plan-9")).to_be("plan-10")
+      expect(model._next_name("Fix session restoration")).to_be("Fix session restoration-2")
+    end)
+
+    it("counts only the last number", function()
+      expect(model._next_name("v2-plan")).to_be("v2-plan-2")
+      expect(model._next_name("a-1-2")).to_be("a-1-3")
+      expect(model._next_name("plan2")).to_be("plan2-2")
+    end)
+
+    it("keeps a counter as wide as it was", function()
+      expect(model._next_name("part-01")).to_be("part-02")
+      expect(model._next_name("part-09")).to_be("part-10")
+      expect(model._next_name("part-99")).to_be("part-100")
+    end)
+
+    it("takes a long number for a date or a ticket, not a counter", function()
+      expect(model._next_name("notes-20261009")).to_be("notes-20261009-2")
+      expect(model._next_name("issue-4521")).to_be("issue-4521-2")
+      expect(model._next_name("issue-452")).to_be("issue-453")
+    end)
+
+    it("leaves a name that is only a number alone", function()
+      expect(model._next_name("-5")).to_be("-5-2")
+      expect(model._next_name("7")).to_be("7-2")
+    end)
+
+    it("steps over a name somebody already has", function()
+      expect(model._next_name("plan", { ["plan-2"] = true })).to_be("plan-3")
+      expect(model._next_name("plan-2", { ["plan-3"] = true, ["plan-4"] = true })).to_be("plan-5")
+    end)
+
+    it("puts a name on one line", function()
+      expect(model._next_name("  two\nlines\there ")).to_be("two lines here-2")
+    end)
+
+    describe("from a listed session", function()
+      before_each(function()
+        summaries.aaa = summary_for("aaa", { name = "plan" })
+        summaries.bbb = summary_for("bbb")
+        model.attach(1, "/proj")
+      end)
+
+      it("uses what the session is listed as", function()
+        expect(model.follow_up_name("aaa")).to_be("plan-2")
+        -- No rename: the generated title is the name it is read by.
+        expect(model.follow_up_name("bbb")).to_be("Title bbb-2")
+      end)
+
+      it("steps over the names of the other sessions in the list", function()
+        summaries.ccc = summary_for("ccc", { name = "plan-2" })
+        model.refresh_list()
+        expect(model.follow_up_name("aaa")).to_be("plan-3")
+        expect(model.follow_up_name("ccc")).to_be("plan-3")
+      end)
+
+      it("steps over one that was started and has said nothing yet", function()
+        -- Asked twice in a row: the first is running under its name and has no
+        -- transcript to be read from.
+        live.ccc = true
+        launch_names.ccc = "plan-2"
+        model.refresh_list()
+        expect(model.follow_up_name("aaa")).to_be("plan-3")
+        expect(model.follow_up_name("ccc")).to_be("plan-3")
+      end)
+
+      it("has no name to give for a session that has none yet", function()
+        live.ccc = true
+        model.refresh_list()
+        expect(model.follow_up_name("ccc")).to_be(nil)
+      end)
+
+      it("has none for a session that is not listed", function()
+        expect(model.follow_up_name("nobody")).to_be(nil)
+      end)
+    end)
+  end)
+
+  describe("the name a conversation was given", function()
+    before_each(function()
+      summaries.aaa = summary_for("aaa", { name = "plan" })
+      summaries.bbb = summary_for("bbb")
+      model.attach(1, "/proj")
+    end)
+
+    it("is the rename, not the generated title", function()
+      local name, known = model.given_name("aaa")
+      expect(name).to_be("plan")
+      expect(known).to_be_true()
+    end)
+
+    it("is known to be none for a conversation that was never named", function()
+      local name, known = model.given_name("bbb")
+      expect(name).to_be(nil)
+      expect(known).to_be_true()
+    end)
+
+    it("is not known for a conversation with nothing written", function()
+      live.ccc = true
+      model.refresh_list()
+      local name, known = model.given_name("ccc")
+      expect(name).to_be(nil)
+      expect(known).to_be(false)
+    end)
+
+    it("is not known for a conversation that is not listed", function()
+      local name, known = model.given_name("nobody")
+      expect(name).to_be(nil)
+      expect(known).to_be(false)
     end)
   end)
 

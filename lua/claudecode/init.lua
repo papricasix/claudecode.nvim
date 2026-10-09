@@ -1005,6 +1005,12 @@ function M._create_commands()
     desc = "Start a new Claude agent in the agents view",
   })
 
+  vim.api.nvim_create_user_command("ClaudeCodeAgentFollowUp", function()
+    require("claudecode.agents_view").new_follow_up()
+  end, {
+    desc = "Start a new Claude agent named after the selected agent session, numbered on (plan → plan-2 → plan-3)",
+  })
+
   vim.api.nvim_create_user_command("ClaudeCodeStatus", function()
     local inst = get_instance()
     if inst and inst.server and inst.port then

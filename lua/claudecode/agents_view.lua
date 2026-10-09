@@ -669,6 +669,18 @@ local KEY_SPECS = {
     end,
   },
   {
+    field = "follow_up",
+    -- Every pane that is about one session, the centre's notice screens
+    -- included: the work that outgrew its conversation is being read in any of
+    -- them when the next one is wanted.
+    panes = { "sessions", "feed", "changes", "subagents", "center" },
+    group = "Sessions",
+    desc = "Start a new agent named after this session, numbered on (plan → plan-2 → plan-3)",
+    run = function()
+      M.follow_up_under_cursor()
+    end,
+  },
+  {
     field = "stop",
     panes = { "sessions" },
     group = "Sessions",
@@ -1022,7 +1034,7 @@ end
 ---config, which always carries every key, so a missing one means the config was
 ---never applied — as in a test that hands the view a bare `agents` table.
 ---@param field string
----@param default string
+---@param default string|nil
 ---@return string|nil
 local function keymap_for(field, default)
   local lhs = keymaps()[field]
@@ -1153,6 +1165,13 @@ local function show_start_prompt(session_id)
   local new_key = keymap_for("new", "a")
   if new_key then
     hints[#hints + 1] = { new_key, "start a new agent" }
+  end
+  -- The third answer to a conversation that is not running: carry on under its
+  -- name in a new one. Named, because the name is the whole of what it does.
+  local follow_key = keymap_for("follow_up", nil)
+  local follow_name = follow_key and model.follow_up_name and model.follow_up_name(session_id)
+  if follow_name then
+    hints[#hints + 1] = { follow_key, "start a new agent called " .. render.truncate(follow_name, 48) }
   end
   hints[#hints + 1] = {
     tostring(keymaps().next_session or "<C-n>") .. "/" .. tostring(keymaps().prev_session or "<C-p>"),
@@ -2671,31 +2690,35 @@ function M.select(session_id)
   M.redraw()
 end
 
----Start a brand new conversation in the centre pane.
-function M.new_agent()
+---Start a conversation that does not exist yet in the centre pane, and select it.
+---@param launch { name: string|nil, cwd: string|nil }|nil What it is called and where it runs: unnamed, in the view's directory, unless told.
+---@return string|nil session_id nil when nothing was started.
+local function start_agent(launch)
+  launch = launch or {}
   if not M.is_open() then
-    return
+    return nil
   end
   local center = ensure_center()
   if not center then
-    return
+    return nil
   end
   local ok, session_state = pcall(require, "claudecode.session_state")
   if not ok then
-    return
+    return nil
   end
   local session_id = session_state.new_session_id()
 
   local term, err = registry.launch(session_id, {
     win = center,
     tab = state.tab,
-    cwd = model.cwd(),
+    cwd = launch.cwd or model.cwd(),
+    name = launch.name,
     resume = false,
     focus = true,
   })
   if not term then
     vim.notify("ClaudeCode: could not start a new agent: " .. tostring(err), vim.log.levels.ERROR)
-    return
+    return nil
   end
   clear_start_prompt()
   M.bind_terminal_keys(term.bufnr)
@@ -2705,6 +2728,56 @@ function M.new_agent()
   -- until then — and a row is the only way back to it once the selection moves.
   model.refresh_list()
   M.redraw()
+  return session_id
+end
+
+---Start a brand new conversation in the centre pane.
+function M.new_agent()
+  start_agent()
+end
+
+---Start a new conversation named after a session, numbered on: `plan` →
+---`plan-2`, and from `plan-2` → `plan-3`.
+---
+---For work that outgrows its conversation. The next one is a new agent in every
+---respect — nothing of the old context comes along — except that it is called
+---what the old one was, so the list reads as one piece of work in parts rather
+---than as a generated title per part. It starts where the session it follows is
+---resumed from, and it is selected: asking for it is asking to be in it.
+---
+---The name rides the launch (`claude --name`), which writes the entry `/rename`
+---writes, so nothing is typed into the new agent on the user's behalf.
+---@param session_id string|nil Defaults to the selected session.
+---@return string|nil name What the new conversation is called; nil when none was started.
+function M.new_follow_up(session_id)
+  if not M.is_open() then
+    vim.notify("ClaudeCode: the agents view is not open", vim.log.levels.WARN)
+    return nil
+  end
+  session_id = session_id or model.selected()
+  if not session_id then
+    vim.notify("ClaudeCode: no session selected to name a new agent after", vim.log.levels.WARN)
+    return nil
+  end
+  local name = model.follow_up_name(session_id)
+  if not name then
+    vim.notify("ClaudeCode: that session has no name yet to number on", vim.log.levels.INFO)
+    return nil
+  end
+  local row = model.row(session_id)
+  if not start_agent({ name = name, cwd = usable_dir(row and row.cwd) }) then
+    return nil
+  end
+  return name
+end
+
+---`keymaps.follow_up`. In the sessions pane it means the row under the cursor,
+---like `x` and `dd`; in every other pane the selected session, which is the one
+---that pane is showing.
+---@return string|nil name
+function M.follow_up_under_cursor()
+  local payload, pane = payload_under_cursor()
+  return M.new_follow_up(pane == "sessions" and payload and payload.session_id or nil)
 end
 
 function M.stop_under_cursor()
@@ -3691,8 +3764,10 @@ function M.note(event, source_tab, agent_id)
     -- `SessionStart` is the CLI stating which conversation it is having; every
     -- other event merely mentions one, and may well be a late report from the
     -- conversation this agent has just left.
+    local started = event.hook_event_name == "SessionStart"
     M.note_session_switch(agent_id, event.session_id, {
-      reclaim = event.hook_event_name == "SessionStart",
+      reclaim = started,
+      cleared = started and event.source == "clear",
     })
   end
   model.note(event, source_tab)
@@ -3713,14 +3788,33 @@ end
 ---describing the old chat while the terminal shows the new one is the same lie
 ---one level down. A selection parked on some other agent is the user's and is not
 ---moved.
+---
+---The new conversation's name moves with it, when it has one to move: the CLI
+---takes a name through `/clear` — measured against 2.1.295, for a `--name` and
+---for a `/rename` made since — and writes that conversation's transcript at
+---once, so its row is listed before anything has read what it is called. The
+---launch is told what the conversation it left was called, and the row reads
+---that (`model`'s `launch_name`) instead of the id prefix it used to wear for
+---one paint. A conversation left before it wrote anything keeps the name its
+---launch gave it. Any other switch — a resume from inside the CLI, a fork — is
+---onto a conversation with a name of its own, or none, so the launch forgets
+---the one it had.
 ---@param agent_id string|nil
 ---@param session_id string|nil
----@param switch_opts { reclaim: boolean? }|nil
+---@param switch_opts { reclaim: boolean?, cleared: boolean? }|nil `cleared`: the CLI said the new conversation came from `/clear`.
 ---@return boolean moved
 function M.note_session_switch(agent_id, session_id, switch_opts)
   local previous = registry.rekey(agent_id, session_id, switch_opts)
   if not previous then
     return false
+  end
+  if switch_opts and switch_opts.cleared then
+    local name, known = model.given_name(previous)
+    if known then
+      registry.set_name(session_id, name)
+    end
+  else
+    registry.set_name(session_id, nil)
   end
   local follow = model.note_session_change(previous, session_id)
   -- Straight away rather than on the next poll: the CLI writes no transcript for

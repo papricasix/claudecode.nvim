@@ -175,6 +175,11 @@ M.defaults = {
     keymaps = {
       select = "<CR>",
       new = "a",
+      -- Start a new agent named after this session, numbered on: `plan` →
+      -- `plan-2`, and from `plan-2` → `plan-3`. The row under the cursor in the
+      -- sessions pane, the selected session elsewhere.
+      -- `:ClaudeCodeAgentFollowUp` does the same for the selected session.
+      follow_up = "A",
       stop = "x", -- stop the running agent (keeps the conversation)
       delete = "dd", -- delete the conversation from disk, after a confirmation
       refresh = "r", -- re-read the sessions, and re-sort the list
@@ -718,6 +723,7 @@ function M.validate(config)
       local fields = {
         "select",
         "new",
+        "follow_up",
         "stop",
         "delete",
         "refresh",

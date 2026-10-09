@@ -132,6 +132,18 @@ function M.shell_split(cmd)
   return argv
 end
 
+---Quote one argument so `shell_split` hands it back as a single word, unchanged.
+---
+---The inverse of `shell_split`, not of anybody's shell: a launch command is a
+---string that this module splits itself and spawns without one, so the rules to
+---quote for are the ones above on every platform. `vim.fn.shellescape` follows
+---the user's `'shell'` instead, and escapes for a program that never runs.
+---@param arg string
+---@return string
+function M.shell_quote(arg)
+  return "'" .. arg:gsub("'", "'\\''") .. "'"
+end
+
 ---Expand a leading `~` or `~/` in a single argument to the user's home
 ---directory, matching shell tilde expansion at the start of a word. Embedded
 ---tildes (e.g. `--path=~/x`) and the `~user` form are intentionally left

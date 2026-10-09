@@ -420,6 +420,22 @@ local function display_title(summary)
   return summary.name or summary.title or summary.first_prompt
 end
 
+---What the launch running a conversation says it is called, for a row nothing
+---has been read for yet.
+---
+---The CLI writes a named conversation's transcript the moment `/clear` starts
+---it (measured against 2.1.295: the name is its first lines), so the row is
+---enumerated at once — a file with no fold and no row before it, which read as
+---the id prefix for the one paint before the fold landed. The launch was told
+---what the conversation it left was called (`registry.set_name`), and that is
+---what this one is called until its transcript says so itself.
+---@param session_id string
+---@return string|nil
+local function launch_name(session_id)
+  local term = require("claudecode.agents.registry").get(session_id)
+  return term and term.name or nil
+end
+
 ---Where a conversation is resumed from, and the worktree it works in.
 ---
 ---Two directories, because for a conversation in a worktree they are not the
@@ -860,14 +876,15 @@ function M.refresh_list()
       -- Kept across the rebuild so a title never goes backwards: a transcript that
       -- has just appeared is listed before it is folded, and dropping to the id
       -- prefix in between is a visible flicker on the row the user is watching —
-      -- the one they just started. `apply_summary` keeps it the same way.
+      -- the one they just started. `apply_summary` keeps it the same way. A row
+      -- with neither is called what its launch says (`launch_name`).
       local previous = state.by_id[entry.id]
       local summary = entry.summary or carried_fold(previous, entry.path)
       local cwd, worktree = place_of(summary)
       local row = {
         session_id = entry.id,
         path = entry.path,
-        title = display_title(summary) or (previous and previous.title) or nil,
+        title = display_title(summary) or (previous and previous.title) or launch_name(entry.id),
         cwd = cwd or state.cwd,
         -- Carried like the title while nothing has been read: a transcript the CLI
         -- has just moved is a path with no fold yet, and its row is still the
@@ -925,7 +942,7 @@ function M.refresh_list()
       located[session_id] = state.located[session_id]
       local row
       if path then
-        row = row_at(session_id, path, { cwd = launch_cwd })
+        row = row_at(session_id, path, { cwd = launch_cwd, title = term and term.name })
       else
         row = {
           session_id = session_id,
@@ -933,7 +950,10 @@ function M.refresh_list()
           -- there — a fold simply finds nothing — but naming it now is what lets
           -- the panes fill in the moment it appears, rather than on the next scan.
           path = transcript.session_path(launch_cwd, session_id),
-          title = NEW_SESSION_TITLE,
+          -- A launch that named its conversation (`--name`) is called that from
+          -- the start: the CLI shows the name in its prompt box at once, and
+          -- writes it with the first message like everything else.
+          title = (term and term.name) or NEW_SESSION_TITLE,
           cwd = launch_cwd,
           -- It has changed nothing yet, and that is a fact rather than a gap: the
           -- unknown-count placeholder would claim its counts are still being read.
@@ -1383,6 +1403,78 @@ end
 ---@return table|nil
 function M.row(session_id)
   return state.by_id[session_id]
+end
+
+---The name a conversation was given — by `/rename`, or by the launch that
+---started it — as its transcript records it. Not the generated title: that one
+---describes a conversation, and only a given name is taken into the next one
+---(see `registry.set_name`).
+---@param session_id string
+---@return string|nil name
+---@return boolean known false when nothing of the transcript has been read, so nil is not an answer.
+function M.given_name(session_id)
+  local row = state.by_id[session_id]
+  local summary = row and transcript.get(row.path)
+  if not summary then
+    return nil, false
+  end
+  return summary.name, true
+end
+
+--- The longest run of digits after a name's last dash that is still read as a
+--- counter. `plan-2` and `plan-12` are numbered; `notes-20261009` and
+--- `issue-4521` end in a date and a ticket, and counting those on names a day or
+--- a ticket that has nothing to do with the conversation.
+local COUNTER_DIGITS = 3
+
+---The next name in a numbered series: `plan` → `plan-2`, `plan-2` → `plan-3`.
+---
+---A name somebody already has is stepped over, so asking twice from `plan`
+---gives `plan-2` and then `plan-3` rather than two conversations called the
+---same thing. A counter keeps its width (`part-09` → `part-10`).
+---@param name string
+---@param taken table<string, boolean>|nil Names in use.
+---@return string
+function M._next_name(name, taken)
+  taken = taken or {}
+  name = name:gsub("%s+", " "):gsub("^ ", ""):gsub(" $", "")
+  local stem, digits = name:match("^(.+)%-(%d+)$")
+  local n, width = 1, 1
+  if stem and #digits <= COUNTER_DIGITS then
+    n, width = tonumber(digits) or 1, #digits
+  else
+    stem = name
+  end
+  local candidate
+  repeat
+    n = n + 1
+    candidate = ("%s-%0" .. width .. "d"):format(stem, n)
+  until not taken[candidate]
+  return candidate
+end
+
+---What a new conversation continuing this one would be called: the session's
+---name, numbered on.
+---
+---The name is whatever the row is titled — a `/rename`, else the generated
+---title, else the first prompt — since that is the name the user reads the
+---session by. A session that has said nothing yet is titled with our own
+---placeholder, which is no name to carry on.
+---@param session_id string
+---@return string|nil name nil when the session has no name yet, or is not listed.
+function M.follow_up_name(session_id)
+  local row = state.by_id[session_id]
+  local title = row and row.title
+  if type(title) ~= "string" or title == "" or title == NEW_SESSION_TITLE then
+    return nil
+  end
+  local taken = {}
+  for _, other in ipairs(state.rows) do
+    if other.title then
+      taken[other.title] = true
+    end
+  end
+  return M._next_name(title, taken)
 end
 
 ---Delete several conversations, and drop them from the list.

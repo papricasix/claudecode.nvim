@@ -92,6 +92,34 @@ describe("agents.registry", function()
       expect(registry.get("abc").resumed).to_be_true()
     end)
 
+    it("names the conversation it starts", function()
+      local term = registry.launch("abc", { win = 1000, tab = 1, name = "plan-2" })
+      local cmd = spawned[1].cmd
+      expect(cmd[#cmd]).to_be("--name=plan-2")
+      expect(term.name).to_be("plan-2")
+    end)
+
+    it("hands a name over as one word, whatever is in it", function()
+      -- A generated title has spaces, a prompt has quotes, and a name that
+      -- begins with a dash must not be read as an option.
+      registry.launch("abc", { win = 1000, tab = 1, name = "-fix it's parser-2" })
+      local cmd = spawned[1].cmd
+      expect(cmd[#cmd]).to_be("--name=-fix it's parser-2")
+    end)
+
+    it("does not name a conversation it resumes", function()
+      -- That one is called what its transcript says.
+      local term = registry.launch("abc", { win = 1000, tab = 1, resume = true, name = "plan-2" })
+      expect(table.concat(spawned[1].cmd, " "):find("--name", 1, true)).to_be(nil)
+      expect(term.name).to_be(nil)
+    end)
+
+    it("starts an unnamed conversation without the flag", function()
+      local term = registry.launch("abc", { win = 1000, tab = 1 })
+      expect(table.concat(spawned[1].cmd, " "):find("--name", 1, true)).to_be(nil)
+      expect(term.name).to_be(nil)
+    end)
+
     it("gives each agent its own server port", function()
       registry.launch("abc", { win = 1000, tab = 1 })
       registry.launch("def", { win = 1000, tab = 1 })
@@ -250,6 +278,31 @@ describe("agents.registry", function()
       expect(#retagged_floats).to_be(1)
       expect(retagged_floats[1][1]).to_be("abc")
       expect(retagged_floats[1][2]).to_be("def")
+    end)
+
+    it("is still called what its launch named it", function()
+      -- Measured against 2.1.295: the conversation `/clear` starts opens with
+      -- the `agent-name` the one before it had.
+      registry.launch("abc", { win = 1000, tab = 1, name = "plan-2" })
+      registry.rekey(key_of("abc"), "def")
+      expect(registry.get("def").name).to_be("plan-2")
+    end)
+
+    it("is called what it is told the conversation it left was called", function()
+      -- A `/rename` since the launch is taken through `/clear` like the launch's
+      -- own name; only somebody reading the transcript knows of it.
+      registry.launch("abc", { win = 1000, tab = 1, name = "plan-2" })
+      registry.rekey(key_of("abc"), "def")
+      registry.set_name("def", "renamed")
+      expect(registry.get("def").name).to_be("renamed")
+      -- A conversation known to have had no name hands none on.
+      registry.set_name("def", nil)
+      expect(registry.get("def").name).to_be(nil)
+      registry.set_name("def", "")
+      expect(registry.get("def").name).to_be(nil)
+      -- Nothing to record for a conversation that is not running.
+      registry.set_name("nobody", "x")
+      expect(registry.get("nobody")).to_be(nil)
     end)
 
     it("stops the right server once the moved agent ends", function()

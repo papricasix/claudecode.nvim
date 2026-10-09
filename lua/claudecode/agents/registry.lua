@@ -46,6 +46,7 @@ end
 ---@field cwd string|nil
 ---@field instance table|nil The server instance this agent talks to.
 ---@field resumed boolean Whether it was started with --resume.
+---@field name string|nil What its conversation is called, as far as the launch knows: `--name`, then whatever `set_name` was told.
 ---@field started_at number
 ---@field exited boolean
 ---@field exit_code integer|nil
@@ -156,7 +157,7 @@ end
 ---Start a Claude for one conversation in the given window.
 ---
 ---@param session_id string Conversation id to name (or resume) this agent with.
----@param opts { win: integer, tab: integer?, cwd: string?, resume: boolean?, focus: boolean? }
+---@param opts { win: integer, tab: integer?, cwd: string?, resume: boolean?, focus: boolean?, name: string? }
 ---@return ClaudeCodeAgentTerminal|nil term
 ---@return string|nil error
 function M.launch(session_id, opts)
@@ -197,6 +198,16 @@ function M.launch(session_id, opts)
   -- documented, validated and inert.
   local resume_flag = (agents_opts().resume_mode == "fork") and "--fork-session " or "--resume "
   local flag = opts.resume and (resume_flag .. session_id) or ("--session-id " .. session_id)
+  -- What the conversation is called from its first line on: the CLI writes the
+  -- same `agent-name` entry `/rename` does (measured against 2.1.295), so the
+  -- name needs no second way of reaching the list. As `--name=<value>`, one
+  -- word, because a name may begin with a dash and would otherwise be read as an
+  -- option. Only for a conversation being started: a resumed one is called what
+  -- its transcript says.
+  local name = (not opts.resume and type(opts.name) == "string" and opts.name ~= "") and opts.name or nil
+  if name then
+    flag = flag .. " --name=" .. utils.shell_quote(name)
+  end
   local ok_cmd, cmd_string, env_table, effective = pcall(terminal.build_launch, flag, {
     cwd = cwd,
     instance = instance,
@@ -281,6 +292,7 @@ function M.launch(session_id, opts)
     cwd = M._usable_cwd(effective and effective.cwd) or cwd,
     instance = instance,
     resumed = opts.resume == true,
+    name = name,
     started_at = vim.loop and vim.loop.now() or 0,
     exited = false,
   }
@@ -362,6 +374,22 @@ function M.rekey(agent_key, session_id, opts)
 
   logger.debug("agents", "agent", agent_key, "moved from", previous, "to", session_id)
   return previous
+end
+
+---Record what a running agent's conversation is called now.
+---
+---The name outlives the conversation it was given to: the CLI takes it along
+---through `/clear` (measured against 2.1.295 — the new conversation's transcript
+---opens with the same `agent-name`, whether that name came from `--name` or
+---from a `/rename` since). So it is kept per launch, and whoever watches the
+---conversation change says what it was called when it was left.
+---@param session_id string
+---@param name string|nil
+function M.set_name(session_id, name)
+  local term = terminals[session_id]
+  if term then
+    term.name = (type(name) == "string" and name ~= "") and name or nil
+  end
 end
 
 ---Record that an agent's process ended.
